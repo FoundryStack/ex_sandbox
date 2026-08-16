@@ -41,19 +41,53 @@ defmodule ExSandbox.Conformance.Group do
         rescue
           unavailable in ExSandbox.Conformance.CapabilityUnavailable ->
             reraise ExUnit.AssertionError,
-                    [
-                      message:
-                        "NOT DEMONSTRATED (host capability unavailable) -- this is the " <>
-                          "suite's third outcome, neither a pass nor a mechanism defect.\n\n" <>
-                          Exception.message(unavailable) <>
-                          "\nTo turn this into a pass, run the suite on a host providing " <>
-                          "the capability. It is reported as a failure because ExUnit has " <>
-                          "no runtime skip, and reporting it as a pass would claim a " <>
-                          "guarantee that was never demonstrated (FR-012b)."
-                    ],
+                    [message: ExSandbox.Conformance.Group.not_demonstrated(unavailable)],
                     __STACKTRACE__
         end
       end
     end
+  end
+
+  @doc """
+  Wraps a group's `setup` so an unavailable capability is framed as the third
+  outcome rather than as a bare exception (T043a).
+
+  ⚠️ `check/2`'s rescue covers the **test body only**. A `setup` block runs
+  before it, so a `CapabilityUnavailable` raised while provisioning escaped
+  unframed: the verdict was identical -- deliberately a failure, since ExUnit
+  has no runtime skip -- but it was reported without the explanation that it is
+  neither a pass nor a mechanism defect, which is precisely the distinction the
+  suite exists to keep visible.
+  """
+  defmacro guarded_setup(do: body) do
+    quote do
+      setup do
+        try do
+          unquote(body)
+        rescue
+          unavailable in ExSandbox.Conformance.CapabilityUnavailable ->
+            reraise ExUnit.AssertionError,
+                    [message: ExSandbox.Conformance.Group.not_demonstrated(unavailable)],
+                    __STACKTRACE__
+        end
+      end
+    end
+  end
+
+  @doc """
+  The shared framing for an undemonstrable check.
+
+  Public so `check/2` and `guarded_setup/1` cannot drift apart: the whole point
+  is that a capability gap reads the same however it was raised.
+  """
+  @spec not_demonstrated(Exception.t()) :: String.t()
+  def not_demonstrated(unavailable) do
+    "NOT DEMONSTRATED (host capability unavailable) -- this is the " <>
+      "suite's third outcome, neither a pass nor a mechanism defect.\n\n" <>
+      Exception.message(unavailable) <>
+      "\nTo turn this into a pass, run the suite on a host providing " <>
+      "the capability. It is reported as a failure because ExUnit has " <>
+      "no runtime skip, and reporting it as a pass would claim a " <>
+      "guarantee that was never demonstrated (FR-012b)."
   end
 end

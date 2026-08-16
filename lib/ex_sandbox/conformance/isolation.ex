@@ -40,7 +40,11 @@ defmodule ExSandbox.Conformance.Isolation do
         # nothing and reports success.
         @describetag conformance: :isolation
 
-        setup do
+        # ⚠️ `guarded_setup`, not a bare `setup` (T043a). `check/2`'s rescue wraps
+        # the test body only, so a capability gap raised while provisioning here
+        # escaped without the "third outcome" framing -- reported as a plain
+        # exception, indistinguishable at a glance from a mechanism defect.
+        ExSandbox.Conformance.Group.guarded_setup do
           sandbox = build_sandbox()
 
           case ExSandbox.provision(@mechanism, sandbox) do
