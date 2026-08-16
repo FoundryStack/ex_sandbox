@@ -51,6 +51,11 @@ defmodule ExSandbox.Conformance.ResourceLimits do
       import ExSandbox.Conformance.Group, only: [check: 2]
 
       describe "resource limits (012 FR-012a, SC-008, research R7a)" do
+        # Selects this group for `mix test --only conformance:resource_limits`, the
+        # invocation quickstart documents. Without it that command matches
+        # nothing and reports success.
+        @describetag conformance: :resource_limits
+
         check "allocating past the memory cap is stopped" do
           demonstrate_breach(:resource_limits, "003-FR-004", fn ->
             sandbox = build_sandbox(memory_limit_mb: 64)

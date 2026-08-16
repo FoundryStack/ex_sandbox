@@ -35,11 +35,12 @@ defmodule ExSandbox.SuiteRunner do
   outcome, which is reported as an ExUnit failure but is a distinct thing — the
   meta-tests need to tell them apart.
   """
-  @spec run(module()) :: result()
-  def run(mechanism) do
+  @spec run(module(), keyword()) :: result()
+  def run(mechanism, opts \\ []) do
     suite = compile_suite(mechanism)
 
     suite.__ex_unit__().tests
+    |> filter_describe(Keyword.get(opts, :describe))
     |> Enum.reduce(%{failures: [], passed: [], unavailable: [], total: 0}, fn test, acc ->
       acc
       |> Map.update!(:total, &(&1 + 1))
@@ -59,6 +60,18 @@ defmodule ExSandbox.SuiteRunner do
     |> run()
     |> Map.fetch!(:failures)
     |> Enum.map_join("\n\n", fn {name, message} -> "#{name}: #{message}" end)
+  end
+
+  # Lets a caller run one group. Without it, a meta-test about isolation also
+  # runs the resource-limits group, whose time-budget checks deliberately block
+  # for their full budget -- minutes of wall clock to assert nothing the caller
+  # asked about.
+  defp filter_describe(tests, nil), do: tests
+
+  defp filter_describe(tests, describe) do
+    Enum.filter(tests, fn test ->
+      test.tags[:describe] && String.contains?(test.tags[:describe], describe)
+    end)
   end
 
   defp record(acc, name, :passed), do: Map.update!(acc, :passed, &[name | &1])

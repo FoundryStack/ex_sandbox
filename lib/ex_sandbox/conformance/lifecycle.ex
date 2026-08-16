@@ -47,6 +47,11 @@ defmodule ExSandbox.Conformance.Lifecycle do
       import ExSandbox.Conformance.Group, only: [check: 2]
 
       describe "lifecycle (003-FR-010, 003-FR-013)" do
+        # Selects this group for `mix test --only conformance:lifecycle`, the
+        # invocation quickstart documents. Without it that command matches
+        # nothing and reports success.
+        @describetag conformance: :lifecycle
+
         check "provision, start, stop, destroy in sequence" do
           sandbox = build_sandbox()
 

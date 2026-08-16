@@ -50,6 +50,11 @@ defmodule ExSandbox.Conformance.Reachability do
       import ExSandbox.Conformance.Group, only: [check: 2]
 
       describe "reachability (003-FR-022 - FR-024, quickstart Scenario 5)" do
+        # Selects this group for `mix test --only conformance:reachability`, the
+        # invocation quickstart documents. Without it that command matches
+        # nothing and reports success.
+        @describetag conformance: :reachability
+
         check "a running sandbox reports :running and carries an address" do
           sandbox = build_sandbox()
           {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)

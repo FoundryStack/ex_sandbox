@@ -101,6 +101,11 @@ defmodule ExSandbox.Conformance.Credentials do
       import ExSandbox.Conformance.Group, only: [check: 2]
 
       describe "credentials (003-FR-018 - FR-021, quickstart Scenario 4)" do
+        # Selects this group for `mix test --only conformance:credentials`, the
+        # invocation quickstart documents. Without it that command matches
+        # nothing and reports success.
+        @describetag conformance: :credentials
+
         check "a sandbox can read its own credential" do
           # Scenario 4 step 1, and it must SUCCEED. Written the other way round
           # this asserts concealment, which is neither the guarantee nor

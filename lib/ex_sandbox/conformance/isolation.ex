@@ -35,6 +35,11 @@ defmodule ExSandbox.Conformance.Isolation do
       import ExSandbox.Conformance.Group, only: [check: 2]
 
       describe "isolation (003 quickstart Scenario 1, Constitution Isolation Review)" do
+        # Selects this group for `mix test --only conformance:isolation`, the
+        # invocation quickstart documents. Without it that command matches
+        # nothing and reports success.
+        @describetag conformance: :isolation
+
         setup do
           sandbox = build_sandbox()
 

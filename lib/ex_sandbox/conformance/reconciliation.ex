@@ -46,6 +46,11 @@ defmodule ExSandbox.Conformance.Reconciliation do
       import ExSandbox.Conformance.Group, only: [check: 2]
 
       describe "reconciliation (003-FR-015, SC-008, quickstart Scenario 6)" do
+        # Selects this group for `mix test --only conformance:reconciliation`, the
+        # invocation quickstart documents. Without it that command matches
+        # nothing and reports success.
+        @describetag conformance: :reconciliation
+
         check "list_running enumerates reality, not the mechanism's bookkeeping" do
           # Direction one, at the mechanism level: a sandbox that stopped
           # *without* the mechanism being asked to stop it must drop out of

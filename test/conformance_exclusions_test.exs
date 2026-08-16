@@ -37,6 +37,55 @@ defmodule ExSandbox.ConformanceExclusionsTest do
     end)
   end
 
+  describe "no timing assertions (003 T049, research R6)" do
+    # `005-SC-005` and `001-SC-103` reach the same 5-second target by mechanisms
+    # an order of magnitude apart in start cost. A conformance check that
+    # asserts how *fast* something happened bakes one of those mechanisms into
+    # the seam, and the other fails the suite for being itself rather than for
+    # failing a guarantee.
+
+    test "no check measures elapsed time" do
+      # Measuring elapsed time is the mechanism by which a timing assertion is
+      # written; forbidding the measurement forbids the assertion without
+      # having to recognise every shape it could take.
+      Enum.each(sources(), fn {path, body} ->
+        refute body =~ ~r/System\.monotonic_time/,
+               """
+               #{path} measures elapsed time.
+
+               A conformance check may enforce a time *cap* -- "this was stopped
+               at the budget" -- but must not assert how long an operation took.
+               The two mechanisms in scope differ by an order of magnitude in
+               start cost (research R6), so a speed assertion fails the slower
+               one for being itself.
+               """
+      end)
+    end
+
+    test "no check asserts on a duration" do
+      Enum.each(sources(), fn {path, body} ->
+        refute body =~ ~r/assert\s+.*(elapsed|duration).*[<>]/,
+               "#{path} asserts on a measured duration. See research R6."
+
+        refute body =~ ~r/(elapsed|duration)\w*\s*[<>]\s*\d/,
+               "#{path} compares a duration against a literal. See research R6."
+      end)
+    end
+
+    test "the only timeouts present are caps the suite enforces, not speeds it expects" do
+      # `timeout_ms` names a budget handed *to* the mechanism, which the suite
+      # then checks was enforced. That is the opposite of a timing assertion and
+      # must keep working -- so this test pins the distinction rather than
+      # banning the word.
+      {_path, body} =
+        Enum.find(sources(), fn {path, _} -> String.ends_with?(path, "resource_limits.ex") end)
+
+      assert body =~ "timeout_ms",
+             "the resource-limits group no longer names a time budget; if the cap check " <>
+               "was removed, 012-FR-012a is no longer enforced"
+    end
+  end
+
   describe "no exclusion mechanism (FR-011)" do
     test "no @tag :skip or @moduletag :skip anywhere in the suite" do
       Enum.each(sources(), fn {path, body} ->
