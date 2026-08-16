@@ -26,7 +26,13 @@ defmodule ExSandbox.Hardening.StorageProvisioningTest do
   the gateway read this one's storage, defeating the isolation the per-sandbox
   uid exists to create.
   """
-  use ExUnit.Case, async: true
+  # ⚠️ `async: false`. This test mutates `:ex_sandbox, :beam`'s `:storage_root`,
+  # which is global application config -- and `capability_build_parity_test.exs`
+  # reads it concurrently to check that the storage bind is present. Run async,
+  # the two race: the parity test occasionally composed a command against this
+  # test's temporary root and reported `disk_quota` unconstructed, failing about
+  # one run in three.
+  use ExUnit.Case, async: false
 
   alias ExSandbox.Hardening.Linux
 

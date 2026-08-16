@@ -294,25 +294,52 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  # ⚠️ `:peer.call/4`, **not** `:erpc.call/5`. The sandbox runs under
-  # `--unshare-net` with no network interfaces at all (FR-011), so Erlang
-  # distribution cannot reach it -- `:erpc` returns `{:erpc, :noconnection}` for
-  # every correctly confined sandbox. Using it meant the launch failed *because
-  # the isolation worked*.
-  #
-  # `:peer.call/4` rides the `connection: :standard_io` channel the peer was
-  # started with: stdin/stdout of the spawned process, needing no network, no
-  # epmd, and no distribution. Measured inside the namespace, `:peer.call`
-  # returned the pid while `:erpc` raised.
-  defp os_pid(peer) do
-    case :peer.call(peer, :os, :getpid, [], probe_timeout()) do
-      pid when is_list(pid) -> {:ok, List.to_integer(pid)}
-      other -> {:error, {:unexpected_pid, other}}
+  @doc """
+  The host's pid for a sandbox spawned through `port`.
+
+  ⚠️ Read from the **port**, never by asking the sandbox. The sandbox runs under
+  `--unshare-pid`, so `:os.getpid()` inside it returns the namespace-local pid
+  (`2`) while the host knows it by something else entirely (`1565` in the run
+  that found this). `verify_applied/1` reads `/proc/<pid>` on the host, so the
+  sandbox's own answer sends it to an unrelated process and it reports
+  `:unverifiable` for a perfectly confined sandbox.
+
+  Taking it from the port also means verification needs no cooperation from the
+  thing being verified: a compromised sandbox cannot misreport its pid to escape
+  the check.
+  """
+  @spec host_os_pid(port()) :: {:ok, pos_integer()} | {:error, term()}
+  def host_os_pid(port) when is_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} when is_integer(os_pid) -> {:ok, os_pid}
+      {:os_pid, :undefined} -> {:error, :no_os_pid}
+      nil -> {:error, :port_closed}
+    end
+  end
+
+  # `:peer` does not expose the port it spawned, so it comes out of the
+  # `gen_server` state. Fragile by nature -- it depends on OTP's internal record
+  # shape -- so it searches for *a port* rather than indexing a fixed position,
+  # and every caller treats failure as a failed launch rather than assuming.
+  defp peer_port(peer) do
+    peer
+    |> :sys.get_state()
+    |> Tuple.to_list()
+    |> Enum.find(&is_port/1)
+    |> case do
+      nil -> {:error, :no_port}
+      port -> {:ok, port}
     end
   rescue
     error -> {:error, error}
   catch
     :exit, reason -> {:error, reason}
+  end
+
+  defp os_pid(peer) do
+    with {:ok, port} <- peer_port(peer) do
+      host_os_pid(port)
+    end
   end
 
   defp beam_config, do: Application.get_env(:ex_sandbox, :beam, [])
