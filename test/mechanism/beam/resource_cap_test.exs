@@ -121,7 +121,13 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
     # `{:error, _}` as evidence the quota held, and `:undef` is an `{:error, _}`.
     # The test would pass on a sandbox with no disk quota whatsoever.
     result =
-      case eval(victim, :file, :write_file, [target, :binary.copy(<<0>>, 256 * 1024 * 1024)], 60_000) do
+      case eval(
+             victim,
+             :file,
+             :write_file,
+             [target, :binary.copy(<<0>>, 256 * 1024 * 1024)],
+             60_000
+           ) do
         {:ok, inner} -> inner
         error -> error
       end

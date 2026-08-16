@@ -73,7 +73,10 @@ defmodule ExSandbox.Mechanism.Beam.HardeningVerifiedTest do
       # `id` is not among them -- `:os.cmd/1` answers "sh: 1: id: not found",
       # which is a string, not a uid, and would fail this assertion for a reason
       # that has nothing to do with privilege separation.
-      assert {:ok, status} = Beam.call(provisioned, :file, :read_file, ["/proc/self/status"])
+      # Double-wrapped: `Beam.call/5` returns `{:ok, result}` and `:file.read_file/1`
+      # itself returns `{:ok, binary}`.
+      assert {:ok, {:ok, status}} =
+               Beam.call(provisioned, :file, :read_file, ["/proc/self/status"])
 
       assert [_, sandbox_uid] = Regex.run(~r/^Uid:\s+(\d+)/m, to_string(status))
       assert String.to_integer(sandbox_uid) == applied.uid

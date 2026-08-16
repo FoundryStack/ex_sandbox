@@ -59,7 +59,8 @@ defmodule ExSandbox.Mechanism.Beam.HostPidTest do
 
   describe "host_os_pid/1" do
     test "returns the pid of a port this VM spawned" do
-      port = Port.open({:spawn_executable, System.find_executable("sleep")}, [:binary, args: ["5"]])
+      port =
+        Port.open({:spawn_executable, System.find_executable("sleep")}, [:binary, args: ["5"]])
 
       on_exit(fn -> if Port.info(port), do: Port.close(port) end)
 

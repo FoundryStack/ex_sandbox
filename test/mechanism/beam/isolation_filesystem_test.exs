@@ -80,6 +80,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationFilesystemTest do
     # and tenant A's read failed for the same reason rather than for lack of
     # access. Both assertions passed against a path neither tenant could use.
     target = Path.join(ExSandbox.Hardening.Linux.storage_path(sb_b), "private.txt")
+
     assert :ok = eval(sb_b, :file, :write_file, [target, "tenant b data"]),
            "precondition failed: tenant B could not write its own storage"
 

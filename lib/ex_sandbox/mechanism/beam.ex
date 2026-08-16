@@ -51,6 +51,18 @@ defmodule ExSandbox.Mechanism.Beam do
       {:ok, launched} ->
         store(sandbox.id, launched)
 
+        # Announced rather than written: `012-FR-001` forbids this library from
+        # referencing a host module, so a host that tracks placements attaches a
+        # handler and one that does not pays nothing. `cookie_ref` rather than
+        # the cookie -- see `ExSandbox.Telemetry.sandbox_placed/3`.
+        ExSandbox.Telemetry.sandbox_placed(__MODULE__, sandbox, %{
+          gateway_id: gateway_id(),
+          # `nil` for an undistributed sandbox, which is the ordinary case.
+          node_name: launched[:node] && Atom.to_string(launched.node),
+          cookie_ref: cookie_ref(sandbox),
+          os_pid: launched[:os_pid]
+        })
+
         # The sandbox's **id**, not its node name. Two reasons, and the second
         # is a bug this fixes:
         #
@@ -321,6 +333,22 @@ defmodule ExSandbox.Mechanism.Beam do
       [] -> :error
     end
   end
+
+  # The gateway this mechanism runs on. Configured rather than discovered: a
+  # library cannot ask a host's schema which gateway it is, and `012-FR-001`
+  # forbids it from trying.
+  defp gateway_id do
+    :ex_sandbox
+    |> Application.get_env(:beam, [])
+    |> Keyword.get(:gateway_id)
+  end
+
+  # ⚠️ A **reference**, never the cookie. The cookie is defence in depth for
+  # `FR-003` and telemetry metadata reaches log aggregators and APM vendors;
+  # emitting it there would scatter it across systems chosen for searchability.
+  # Derived from the sandbox id so a host can correlate without this library
+  # knowing anything about the host's secret store.
+  defp cookie_ref(sandbox), do: "sandbox:" <> sandbox.id
 
   defp probe_timeout do
     :ex_sandbox

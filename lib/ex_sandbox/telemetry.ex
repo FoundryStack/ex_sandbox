@@ -75,6 +75,45 @@ defmodule ExSandbox.Telemetry do
   end
 
   @doc """
+  Records where a sandbox was placed, for a host that tracks placements
+  (`005` T041, `FR-016`).
+
+  ## Why an event rather than a call into the host
+
+  `012-FR-001` requires this library to reference no host module. Writing a
+  placement row directly — or taking a host module from config and calling it —
+  would put `Axonn.Sandbox.Beam.Placement` on this library's conscience, and
+  `ex_sandbox` would no longer be usable without Axonn's schema.
+
+  Telemetry inverts that: the mechanism announces what happened, and a host that
+  cares attaches a handler. A host that does not care attaches nothing and pays
+  nothing.
+
+  ## ⚠️ `cookie_ref`, never the cookie
+
+  The per-sandbox cookie is defence in depth for `FR-003`, and telemetry
+  metadata reaches log aggregators, error trackers, and APM vendors. Passing the
+  cookie here would scatter it across systems chosen for searchability. This
+  takes a **reference**; resolving it stays the host's business.
+  """
+  @spec sandbox_placed(module(), ExSandbox.Sandbox.t(), map()) :: :ok
+  def sandbox_placed(mechanism, sandbox, placement) when is_map(placement) do
+    :telemetry.execute(
+      [:ex_sandbox, :sandbox, :placed],
+      %{count: 1},
+      %{
+        owner_ref: sandbox.owner_ref,
+        mechanism: mechanism,
+        sandbox_id: sandbox.id,
+        gateway_id: Map.get(placement, :gateway_id),
+        node_name: Map.get(placement, :node_name),
+        cookie_ref: Map.get(placement, :cookie_ref),
+        os_pid: Map.get(placement, :os_pid)
+      }
+    )
+  end
+
+  @doc """
   Records that a host could not provide what a mechanism requires.
 
   Emitted where the refusal happens rather than left to the caller: a mechanism
