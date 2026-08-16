@@ -73,7 +73,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  defp start_peer(%Sandbox{} = _sandbox, exec) do
+  defp start_peer(%Sandbox{} = sandbox, exec) do
     cookie = generate_cookie()
 
     options = %{
@@ -123,7 +123,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     # expected outcome here -- the host was misconfigured, the image was
     # missing -- and it has to come back as a value.
     try do
-      do_start_peer(options, cookie)
+      do_start_peer(options, cookie, sandbox)
     catch
       :exit, reason ->
         Logger.error("sandbox node failed to boot: #{inspect(reason)}")
@@ -131,7 +131,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  defp do_start_peer(options, cookie) do
+  defp do_start_peer(options, cookie, sandbox) do
     case :peer.start_link(options) do
       {:ok, peer, node} ->
         case os_pid(peer) do
@@ -147,6 +147,11 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
                peer: peer,
                cookie: cookie,
                cgroup_path: read_cgroup_path(os_pid),
+               # The scope unit systemd created, recorded so the cause of death
+               # can be read after the sandbox is gone (R7e). Taken from the
+               # hardening module that built the launch command, so the name the
+               # reader queries cannot drift from the name systemd was given.
+               scope_unit: scope_unit_name(sandbox),
                # The parent slice's `oom_kill` count as of launch. The sandbox's
                # own scope is destroyed by systemd the instant it dies -- a 200ms
                # poll never once caught it -- but the parent slice persists and
@@ -187,10 +192,44 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # `io_lib:char_list/1`, so an Elixir string here raises `{:invalid_arg, ...}`
   # at launch rather than at compile time.
   defp args(cookie) do
-    Enum.map(
-      ["-setcookie", Atom.to_string(cookie), "-hidden", "-connect_all", "false"],
-      &String.to_charlist/1
-    )
+    ["-setcookie", Atom.to_string(cookie), "-hidden", "-connect_all", "false"]
+    |> Kernel.++(elixir_code_path())
+    |> Enum.map(&String.to_charlist/1)
+  end
+
+  # ⚠️ Elixir's stdlib, made loadable inside the sandbox (R7d).
+  #
+  # Without this a sandbox boots a bare `erl`: `:code.which(Enum)` answers
+  # `:non_existing`, and every call naming an Elixir module returns `:undef`.
+  # That failure is dangerous rather than inconvenient, because `{:error, :undef}`
+  # satisfies "the sandbox could not do this" exactly as convincingly as a real
+  # boundary -- three isolation tests were passing on it while attempting
+  # nothing.
+  #
+  # **This grants no new access.** `runtime_ro_binds/0` already ro-binds `/usr`,
+  # and Elixir lives under it, so the files were always in the sandbox's mount
+  # view; only the code path was empty. Read-only, and inside the existing
+  # confinement rather than a hole in it.
+  #
+  # ⚠️ It does **not** make arbitrary funs crossable. A fun is loadable iff its
+  # *defining module* is, so `&Enum.sum/1` crosses and a closure written in a
+  # test script never does -- its module exists only in the writer's VM. See
+  # `fun_loadable?/2`.
+  defp elixir_code_path do
+    case elixir_ebin() do
+      nil -> []
+      path -> ["-pa", path]
+    end
+  end
+
+  # Derived from the running VM rather than hardcoded: the path differs between
+  # a Debian image, a Homebrew install, and an asdf shim, and a wrong literal
+  # would silently leave the code path empty again.
+  defp elixir_ebin do
+    case :code.which(Enum) do
+      path when is_list(path) -> path |> to_string() |> Path.dirname()
+      _ -> nil
+    end
   end
 
   # `Hardening.build_command/2` returns binaries, as its spec says; `:peer`
@@ -507,6 +546,18 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   #
   # Read after `:peer.start_link/1` returns, so the BEAM has booted and is
   # present in the tree; a launch that never got that far has already failed.
+  # `nil` when the hardening implementation does not name its scopes -- an
+  # optional capability rather than part of the behaviour, for the same reason
+  # `prepare_storage/1` is: a mechanism confining by other means owes no scope.
+  defp scope_unit_name(sandbox) do
+    module = hardening()
+    Code.ensure_loaded(module)
+
+    if function_exported?(module, :scope_unit_name, 1) do
+      module.scope_unit_name(sandbox)
+    end
+  end
+
   # The `oom_kill` count on the **parent slice** of `cgroup_path`.
   #
   # ⚠️ The parent rather than the scope itself, and that is the whole trick.

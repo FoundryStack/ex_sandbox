@@ -204,7 +204,7 @@ defmodule ExSandbox.Hardening.Linux do
 
   defp compose(sandbox, limits, granted_env) do
     args =
-      systemd_run_args(limits) ++
+      systemd_run_args(limits, sandbox) ++
         setpriv_args(sandbox_uid(sandbox)) ++
         confinement_args(sandbox, limits) ++
         env_args(sandbox, granted_env) ++
@@ -238,10 +238,18 @@ defmodule ExSandbox.Hardening.Linux do
     System.find_executable("systemd-run") || @systemd_run_fallback
   end
 
-  defp systemd_run_args(limits) do
+  defp systemd_run_args(limits, sandbox) do
     [
       "--scope",
       "--quiet",
+      # ⚠️ A **named** unit, so the scope can be queried after the sandbox dies
+      # (R7e). Without it systemd auto-names `run-<hash>.scope`, and the cause of
+      # death is unrecoverable: the cgroup directory is removed the instant the
+      # last process exits, so `memory.events` is gone before anything observes
+      # it. The unit object survives in `failed` state and reports
+      # `Result=oom-kill`, which is what distinguishes a tenant's cap breach
+      # (`:resource_cap`) from a platform fault (`:mechanism_error`).
+      "--unit=#{scope_unit_name(sandbox)}",
       "-p",
       "MemoryMax=#{limits.memory_mb}M",
       "-p",
@@ -253,6 +261,16 @@ defmodule ExSandbox.Hardening.Linux do
       "MemorySwapMax=0"
     ]
   end
+
+  @doc """
+  The systemd scope unit a sandbox runs in.
+
+  Public because `provision_failure_reason/1` must name the same unit to read
+  its `Result` after death, and a mismatch between the two would silently report
+  every breach as a platform fault.
+  """
+  @spec scope_unit_name(ExSandbox.Sandbox.t()) :: String.t()
+  def scope_unit_name(sandbox), do: "sandbox-#{sandbox.id}.scope"
 
   defp setpriv_args(uid) do
     [

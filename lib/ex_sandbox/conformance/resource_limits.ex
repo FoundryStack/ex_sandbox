@@ -178,11 +178,27 @@ defmodule ExSandbox.Conformance.ResourceLimits do
        "the #{dimension} breach ran to completion under a nominal cap of " <>
          "#{inspect(cap)}; output contained #{inspect(marker)}"}
     else
-      # It did not complete, but it also did not visibly hit the cap. That is
-      # not evidence the cap stopped it -- it could have died of anything.
-      {:inconclusive,
-       "the #{dimension} breach neither completed nor reported being stopped. " <>
-         "Output: #{inspect(String.slice(output, 0, 400))}"}
+      if String.contains?(output, throttle_marker()) do
+        # ⚠️ Positive evidence, not an absence. A CPU cap **throttles** rather
+        # than kills, so there is no error for `classify/3`'s error clause to
+        # recognise -- the process simply does not finish its work in the time an
+        # unthrottled one would. Without this branch a correctly-throttled
+        # sandbox produced empty output and was reported `:inconclusive`, which
+        # is `FR-012b`'s "not demonstrated" and therefore never a pass.
+        #
+        # The hog reports its own deadline miss, so the suite reads a claim it
+        # can check rather than inferring a guarantee from silence.
+        {:stopped,
+         "the #{dimension} breach did not finish its fixed workload within the " <>
+           "deadline under a cap of #{inspect(cap)}, which is what throttling " <>
+           "looks like: output contained #{inspect(throttle_marker())}"}
+      else
+        # It did not complete, but it also did not visibly hit the cap. That is
+        # not evidence the cap stopped it -- it could have died of anything.
+        {:inconclusive,
+         "the #{dimension} breach neither completed nor reported being stopped. " <>
+           "Output: #{inspect(String.slice(output, 0, 400))}"}
+      end
     end
   end
 
@@ -221,6 +237,10 @@ defmodule ExSandbox.Conformance.ResourceLimits do
   defp completion_marker(:cpu), do: "SPUN-PAST-CAP"
   defp completion_marker(:time), do: "SLEPT-PAST-BUDGET"
 
+  # Printed by the CPU hog when it misses its deadline. Distinct from the
+  # completion markers because it means the opposite: the cap held.
+  defp throttle_marker, do: "THROTTLED-BY-CAP"
+
   @doc """
   A shell command allocating `mb` megabytes and **touching every page** of it.
 
@@ -241,13 +261,33 @@ defmodule ExSandbox.Conformance.ResourceLimits do
     """
   end
 
-  @doc "A shell command spinning the CPU well past any reasonable cap."
+  @doc """
+  A shell command performing a **fixed amount of work**, printing its marker only
+  if that work completed within a wall-clock deadline.
+
+  ⚠️ **Fixed work, not fixed duration**, and the distinction makes this check
+  falsifiable at all. An earlier version spun `while [ $(date +%s) -lt $end ]`
+  for ten seconds and printed the marker unconditionally. That loop finishes in
+  ten seconds *whatever* the CPU quota — throttling grants less CPU per second,
+  it does not extend wall time — so the check reported "the breach was not
+  stopped" on every correct implementation, including one enforcing a 1% quota.
+
+  Measured on a cgroup v2 host under `CPUQuota=1%`: the old wall-clock loop
+  finished in **5s** and printed its marker; this fixed-work loop took **54s**.
+  Only the second distinguishes a throttled sandbox from an unthrottled one.
+
+  ## Why a deadline rather than a duration
+
+  A CPU cap **throttles**; it does not kill. So "stopped" here can only mean
+  "could not finish this work in the time an unthrottled process would need",
+  which is what the `timeout` expresses. A sandbox with no cap prints the marker
+  well inside the deadline; a throttled one is still working when `timeout`
+  fires and prints nothing.
+  """
   @spec cpu_hog_command() :: String.t()
   def cpu_hog_command do
     """
-    end=$(( $(date +%s) + 10 ))
-    while [ $(date +%s) -lt $end ]; do :; done
-    echo SPUN-PAST-CAP
+    timeout 10 sh -c 'i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done' && echo SPUN-PAST-CAP || echo THROTTLED-BY-CAP
     """
   end
 

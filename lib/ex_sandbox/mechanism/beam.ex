@@ -128,7 +128,7 @@ defmodule ExSandbox.Mechanism.Beam do
         #      set to a node name, reconciliation compared node names against a
         #      list of ids, so a running sandbox never appeared in it -- every
         #      one looked like an orphan to be reclaimed.
-        {:ok, %{sandbox | mechanism_ref: sandbox.id}}
+        {:ok, %{sandbox | mechanism_ref: sandbox.id, context: build_context(sandbox)}}
 
       {:error, reason} ->
         {:error, reason}
@@ -138,6 +138,15 @@ defmodule ExSandbox.Mechanism.Beam do
   @impl true
   def start(%Sandbox{} = sandbox) do
     case lookup(sandbox.id) do
+      # ⚠️ Relaunch is permitted **only** for a row explicitly marked stopped.
+      # That marker is the entire safety property here: without it, `start/1` on
+      # a live sandbox would launch a second node for an id the caller believes
+      # is already placed, and two runtimes for one sandbox is worse than a
+      # failed start. A row with no marker is running, and running is what the
+      # caller asked for.
+      {:ok, %{stopped: true} = stopped} ->
+        relaunch(sandbox, stopped)
+
       {:ok, launched} ->
         case NodeLauncher.probe(launched.peer) do
           :ok -> {:ok, sandbox}
@@ -157,7 +166,14 @@ defmodule ExSandbox.Mechanism.Beam do
     case lookup(sandbox.id) do
       {:ok, launched} ->
         NodeLauncher.terminate(launched.peer)
-        forget(sandbox.id)
+
+        # ⚠️ The row is **retained**, marked stopped, rather than forgotten.
+        # `forget/1` here made stop a destroy: `status/1` answered `:absent`,
+        # `list_running/0` dropped the id, and `start/1` refused to bring it
+        # back -- so `003-FR-012` (stop preserves, start restores) was
+        # unreachable, and three `FR-024` checks plus one `FR-015` failed
+        # because a stopped sandbox is a *state*, not an absence.
+        store(sandbox.id, Map.merge(launched, %{stopped: true, peer: nil}))
         {:ok, sandbox}
 
       # Idempotent, per `003`: a sandbox that is already not running is in the
@@ -171,7 +187,10 @@ defmodule ExSandbox.Mechanism.Beam do
   def destroy(%Sandbox{} = sandbox) do
     case lookup(sandbox.id) do
       {:ok, launched} ->
-        NodeLauncher.terminate(launched.peer)
+        # A stopped sandbox has no peer to terminate -- `stop/1` cleared it --
+        # but its row must still go. Destroy is the only operation that forgets,
+        # which is what keeps `stop` recoverable and `destroy` final.
+        if launched[:peer], do: NodeLauncher.terminate(launched.peer)
         forget(sandbox.id)
         :ok
 
@@ -187,6 +206,13 @@ defmodule ExSandbox.Mechanism.Beam do
     # from stored state can never disagree with stored state, so it could never
     # detect drift.
     case lookup(sandbox.id) do
+      # Reported before probing, because there is nothing to probe: `stop/1`
+      # cleared the peer. `:stopped` is distinct from `:absent` -- the sandbox
+      # exists and can be started again, which is what `FR-024` asks the
+      # mechanism to distinguish.
+      {:ok, %{stopped: true}} ->
+        {:ok, :stopped}
+
       {:ok, launched} ->
         case NodeLauncher.probe(launched.peer) do
           :ok ->
@@ -214,46 +240,85 @@ defmodule ExSandbox.Mechanism.Beam do
   # `halt(1)` are both just a dead process to the parent.
   defp record_exit(id, launched) do
     reason =
-      case oom_kills(launched) do
-        n when is_integer(n) and n > 0 -> :resource_cap
-        _ -> :mechanism_error
+      if cap_breached?(launched) do
+        :resource_cap
+      else
+        :mechanism_error
       end
 
     store(id, Map.put(launched, :exit_reason, reason))
   end
 
-  # ⚠️ A **delta on the parent slice**, measured against a baseline taken at
-  # launch. Three earlier shapes of this were all wrong, each measured:
+  # ⚠️ Reads systemd's own verdict on the scope, not the cgroup (R7e).
   #
-  #   1. Deriving the cgroup from `/proc/<pid>/cgroup` at death. By the time a
-  #      sandbox is observed dead its `/proc` entry is gone, so this always
-  #      failed and every cap breach was reported as `:mechanism_error` -- the
-  #      operator sent to debug the platform for a tenant's memory leak.
-  #   2. Reading the sandbox's own scope. systemd destroys a transient scope the
-  #      instant its last process exits, taking `memory.events` with it. A poll
-  #      as tight as the runtime allows never once caught the file present.
-  #   3. Reading the parent's absolute count. It aggregates every sandbox on the
-  #      host, so any prior OOM anywhere would report this one as a cap breach.
+  # The cgroup directory is destroyed the instant the sandbox's last process
+  # exits, taking `memory.events` with it -- a poll as tight as the runtime
+  # allows never once caught it. But the **unit object survives in `failed`
+  # state**, and `Result` names the cause exactly, per sandbox, with no delta
+  # arithmetic and no cross-tenant pollution.
   #
-  # The delta is specific to this sandbox's lifetime, and the parent slice
-  # outlives the scope. It is still not perfect: a *different* sandbox under the
-  # same slice OOM-ing in the same window would also raise the counter. That
-  # narrows a wrong answer to a genuinely concurrent breach rather than any
-  # historical one, which is the best this cgroup layout allows.
-  defp oom_kills(launched) do
-    baseline = Map.get(launched, :oom_baseline)
-    current = NodeLauncher.read_parent_oom_kills(Map.get(launched, :cgroup_path))
-
-    if is_integer(baseline) and is_integer(current) do
-      current - baseline
-    else
-      nil
+  # Three earlier readings were all wrong, each measured: deriving the cgroup
+  # from `/proc/<pid>/cgroup` at death (the process is gone), reading the
+  # sandbox's own `memory.events` (the directory is gone), and a delta on the
+  # parent slice (which aggregates every sandbox, so a concurrent breach
+  # elsewhere misattributes).
+  defp cap_breached?(launched) do
+    case scope_result(launched) do
+      {:ok, "oom-kill"} -> true
+      _ -> false
     end
+  end
+
+  # ⚠️ The `LoadState` guard is **load-bearing**, not defensive.
+  #
+  # A unit that never existed reports `Result=success` -- identical to a clean
+  # exit. Reading `Result` alone would therefore report "no cap breach" for a
+  # sandbox that never launched, which is the same fail-open shape as an
+  # `:undef` that reads like a refused operation. `not-found` must be
+  # distinguished from a real verdict rather than defaulting to one.
+  defp scope_result(launched) do
+    with unit when is_binary(unit) <- Map.get(launched, :scope_unit),
+         {output, 0} <-
+           System.cmd("systemctl", systemctl_scope_args(unit), stderr_to_stdout: true),
+         %{"LoadState" => "loaded", "Result" => result} <- parse_properties(output) do
+      {:ok, result}
+    else
+      _ -> :unknown
+    end
+  rescue
+    _ -> :unknown
+  end
+
+  # `--user` because the scope is created with `systemd-run --user` (R9): a
+  # `--system` query would not find it.
+  defp systemctl_scope_args(unit),
+    do: ["--user", "show", unit, "-p", "LoadState", "-p", "Result"]
+
+  defp parse_properties(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Map.new(fn line ->
+      case String.split(line, "=", parts: 2) do
+        [key, value] -> {key, String.trim(value)}
+        [key] -> {key, ""}
+      end
+    end)
   end
 
   @impl true
   def list_running do
-    {:ok, table() |> :ets.tab2list() |> Enum.map(fn {id, _launched} -> id end)}
+    # ⚠️ **Running**, not "known". A stopped sandbox is recorded but is not
+    # running, and including it would make `list_running/0` disagree with
+    # `status/1` -- which is precisely the drift `003-FR-015`'s reconciliation
+    # check exists to catch, since it enumerates this list and asks `status/1`
+    # to confirm each entry.
+    ids =
+      table()
+      |> :ets.tab2list()
+      |> Enum.reject(fn {_id, launched} -> launched[:stopped] end)
+      |> Enum.map(fn {id, _launched} -> id end)
+
+    {:ok, ids}
   end
 
   @doc """
@@ -276,6 +341,90 @@ defmodule ExSandbox.Mechanism.Beam do
       {:ok, _launched} -> :ok
       :error -> {:error, :mechanism_error}
     end
+  end
+
+  # Brings a stopped sandbox back (`003-FR-012`).
+  #
+  # A **fresh launch**, not a resume: the OS process is gone, so there is nothing
+  # to resume. What survives is the sandbox's storage, which is bound by id and
+  # therefore reattaches to the new node -- which is exactly what `FR-012` asks
+  # for, since "start restores its data" is a claim about the *filesystem*, not
+  # about process state.
+  #
+  # The stopped row is replaced only on success. A failed relaunch leaves the
+  # sandbox stopped rather than absent, so a caller can retry instead of
+  # discovering the record has vanished under them.
+  defp relaunch(%Sandbox{} = sandbox, _stopped) do
+    case NodeLauncher.launch(sandbox) do
+      {:ok, launched} ->
+        store(sandbox.id, launched)
+        {:ok, %{sandbox | mechanism_ref: sandbox.id, context: build_context(sandbox)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # What `003`'s conformance suite needs to interrogate a sandbox (T048a, T048c).
+  #
+  # ## `exec` — without it, no isolation guarantee is ever *demonstrated*
+  #
+  # The suite establishes isolation by **attempting** each hostile act inside the
+  # sandbox and observing it refused. With no runner it reports `{:no_runner, _}`
+  # and attempts nothing — and `FR-012b` is explicit that a guarantee which
+  # cannot be attempted is unavailable, never satisfied. Four `FR-006` checks and
+  # three resource-limit checks were reporting exactly that.
+  #
+  # This grants **no new access**: `call/5` already reaches the sandbox over the
+  # stdio channel, and this only hands the suite the same door.
+  #
+  # ## `address` — a handle, not a network address
+  #
+  # `003-FR-022` asks that a started sandbox carry an address. A `005` sandbox
+  # runs undistributed under `--unshare-net` by design, so it has no network
+  # address at all — the better the isolation, the less it has one. The suite
+  # deliberately does not assert the address's *form* (Principle VI), only that
+  # one comes back, so a mechanism-shaped handle conforms.
+  #
+  # ⚠️ This must never become a reason to start distribution. That would trade
+  # `FR-003`'s cluster boundary for a string nobody parses.
+  defp build_context(sandbox) do
+    %{
+      address: "peer:" <> sandbox.id,
+      exec: fn command -> exec_in_sandbox(sandbox, command) end
+    }
+  end
+
+  # ⚠️ `PATH` is set explicitly. The sandbox's environment is built by `env -i`
+  # with an ERTS-only allowlist (`FR-004`), so `:os.cmd/1` there inherits no
+  # `PATH` and every bare command name fails `:enoent` — which reads exactly like
+  # the sandbox refusing the operation. That ambiguity is the failure mode this
+  # whole seam exists to avoid, so the runner names the directories rather than
+  # hoping.
+  defp exec_in_sandbox(sandbox, command) do
+    shell = "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin export PATH; " <> command
+
+    case call(sandbox, :os, :cmd, [String.to_charlist(shell)], exec_timeout()) do
+      {:ok, output} ->
+        {:ok, to_string(output)}
+
+      # ⚠️ A timeout is translated rather than passed through. A sandbox killed
+      # mid-command — which is precisely what a breached cap looks like — leaves
+      # `:peer.call/4` waiting, and reporting that as an unclassified error makes
+      # the suite read "stopped" as "could not be demonstrated". The whole point
+      # of the resource-limit checks is that a breach was *stopped*.
+      {:error, {:exit, {:timeout, _}}} ->
+        {:error, :sandbox_unresponsive}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp exec_timeout do
+    :ex_sandbox
+    |> Application.get_env(:beam, [])
+    |> Keyword.get(:exec_timeout_ms, 15_000)
   end
 
   @doc """
@@ -322,15 +471,55 @@ defmodule ExSandbox.Mechanism.Beam do
   def call(%Sandbox{} = sandbox, module, function, args, timeout \\ 10_000) do
     case lookup(sandbox.id) do
       {:ok, %{peer: peer}} ->
-        try do
-          {:ok, :peer.call(peer, module, function, args, timeout)}
-        catch
-          kind, reason -> {:error, {kind, reason}}
+        with :ok <- check_funs_loadable(peer, args, timeout) do
+          try do
+            {:ok, :peer.call(peer, module, function, args, timeout)}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
         end
 
       :error ->
         {:error, :unknown_sandbox}
     end
+  end
+
+  # ⚠️ Refuses a fun the sandbox cannot load, **before** running anything (R7d).
+  #
+  # Without this the call returns `{:error, {:error, :undef}}`, which is
+  # indistinguishable from the sandbox refusing the operation -- and that
+  # ambiguity fails toward a *passing* test. Measured: a memory hog shipped as a
+  # closure died with `:undef` having allocated nothing, so the sandbox survived
+  # and the cap test concluded "the cap is not in force", accusing the mechanism
+  # of the exact fail-open defect the suite exists to detect.
+  #
+  # A fun is loadable iff its **defining module** is loadable on the far side, so
+  # the question is asked *there* rather than here.
+  #
+  # ⚠️ `:erlang.fun_info(f, :type)` is **not** a valid check: `&Enum.sum/1`
+  # reports `:external` and still fails when its module is absent. Only
+  # `:code.which/1` on the sandbox answers the real question.
+  defp check_funs_loadable(peer, args, timeout) do
+    args
+    |> Enum.filter(&is_function/1)
+    |> Enum.reduce_while(:ok, fn fun, :ok ->
+      case fun_module_loadable?(peer, fun, timeout) do
+        {:ok, true} -> {:cont, :ok}
+        {:ok, {false, module}} -> {:halt, {:error, {:fun_not_loadable, module}}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp fun_module_loadable?(peer, fun, timeout) do
+    {:module, module} = :erlang.fun_info(fun, :module)
+
+    case :peer.call(peer, :code, :which, [module], timeout) do
+      :non_existing -> {:ok, {false, module}}
+      _path -> {:ok, true}
+    end
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   @doc """
