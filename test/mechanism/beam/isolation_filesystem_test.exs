@@ -29,11 +29,27 @@ defmodule ExSandbox.Mechanism.Beam.IsolationFilesystemTest do
   defp launch(tag) do
     {:ok, provisioned} = Beam.provision(sandbox(tag))
     on_exit(fn -> Beam.destroy(provisioned) end)
-    {provisioned, String.to_atom(provisioned.mechanism_ref)}
+    provisioned
+  end
+
+  # ⚠️ `Beam.call/5`, never `:erpc.call/5` -- a sandbox under `--unshare-net` has
+  # no network interfaces, so distribution-based RPC raises
+  # `{:erpc, :noconnection}` against a perfectly healthy sandbox. The stdio
+  # control channel is what survives the confinement being real.
+  #
+  # ⚠️ Erlang's `:file`, never Elixir's `File`. The sandbox boots a bare `erl`
+  # with only OTP on its code path -- `:code.which(File)` there answers
+  # `:non_existing` -- so every `File` call returns `:undef`. That is the
+  # dangerous kind of wrong: `{:error, :undef}` and `{:error, :eacces}` both
+  # satisfy "the sandbox could not read it", so these tests would have passed
+  # against a sandbox with no filesystem confinement at all.
+  defp eval(sb, module, function, args) do
+    assert {:ok, result} = Beam.call(sb, module, function, args)
+    result
   end
 
   test "platform configuration files are unreachable" do
-    {_sb, node} = launch("a")
+    sb = launch("a")
 
     # A real file with real content, created outside the sandbox's storage.
     # Probing a path that does not exist would report `:enoent` and pass whether
@@ -45,36 +61,45 @@ defmodule ExSandbox.Mechanism.Beam.IsolationFilesystemTest do
     assert File.read!(path) =~ "must-not-be-readable",
            "precondition failed: the platform cannot read its own file"
 
-    assert {:error, reason} = :erpc.call(node, File, :read, [path], 10_000),
+    assert {:error, reason} = eval(sb, :file, :read_file, [path]),
            "sandbox read a platform file at #{path} -- the mount namespace is not confining it"
 
     assert reason in [:enoent, :eacces, :eperm]
   end
 
   test "another sandbox's storage is unreachable" do
-    {sb_a, node_a} = launch("a")
-    {_sb_b, node_b} = launch("b")
+    sb_a = launch("a")
+    sb_b = launch("b")
 
-    # Written by tenant B into its own storage, so the path is one that really
-    # exists for somebody -- the strongest form of this test.
-    target = "/sandbox/#{sb_a.id}/private.txt"
-    _ = :erpc.call(node_b, File, :write, [target, "tenant b data"], 10_000)
+    # Written by tenant B into **B's own** storage, so the path really exists for
+    # somebody -- the strongest form of this test. An earlier version wrote to
+    # `sb_a.id`'s path and discarded the result, so a silently failed write left
+    # nothing to read and the assertion passed for the wrong reason.
+    # The real bind path from the hardening module. `/sandbox/<id>` -- what an
+    # earlier version guessed -- exists nowhere, so the write failed `:enoent`
+    # and tenant A's read failed for the same reason rather than for lack of
+    # access. Both assertions passed against a path neither tenant could use.
+    target = Path.join(ExSandbox.Hardening.Linux.storage_path(sb_b), "private.txt")
+    assert :ok = eval(sb_b, :file, :write_file, [target, "tenant b data"]),
+           "precondition failed: tenant B could not write its own storage"
 
-    assert {:error, _} = :erpc.call(node_a, File, :read, [target], 10_000),
+    assert {:ok, "tenant b data"} = eval(sb_b, :file, :read_file, [target]),
+           "precondition failed: tenant B cannot read back what it just wrote"
+
+    assert {:error, _} = eval(sb_a, :file, :read_file, [target]),
            "tenant A read tenant B's storage"
   end
 
   test "privilege escalation to another OS user is refused" do
-    {_sb, node} = launch("a")
+    sb = launch("a")
 
-    uid = :erpc.call(node, :os, :cmd, [~c"id -u"], 10_000) |> to_string() |> String.trim()
+    uid = sb |> eval(:os, :cmd, [~c"id -u"]) |> to_string() |> String.trim()
 
     refute uid == "0",
            "sandbox is running as root -- `setpriv` did not drop privileges (FR-010)"
 
     # Attempting to become root is refused rather than merely unattempted.
-    output =
-      :erpc.call(node, :os, :cmd, [~c"setpriv --reuid 0 id -u 2>&1"], 10_000) |> to_string()
+    output = sb |> eval(:os, :cmd, [~c"setpriv --reuid 0 id -u 2>&1"]) |> to_string()
 
     refute String.trim(output) == "0",
            "sandbox escalated to uid 0: #{output}"

@@ -50,8 +50,6 @@ defmodule ExSandbox.Mechanism.Beam.StdioControlTest do
   """
   use ExUnit.Case, async: true
 
-  alias ExSandbox.Mechanism.Beam.NodeLauncher
-
   describe "the control channel" do
     test "is stdio, so confinement does not sever it" do
       source = File.read!("lib/ex_sandbox/mechanism/beam/node_launcher.ex")

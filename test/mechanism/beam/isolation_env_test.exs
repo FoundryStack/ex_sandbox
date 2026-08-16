@@ -58,12 +58,12 @@ defmodule ExSandbox.Mechanism.Beam.IsolationEnvTest do
     assert {:ok, provisioned} = Beam.provision(sb)
     on_exit(fn -> Beam.destroy(provisioned) end)
 
-    node = String.to_atom(provisioned.mechanism_ref)
-
     # The sandbox reports its *entire* environment. Asking it for specific keys
     # would only prove those keys are absent; the whole environment is what
     # shows nothing else leaked either.
-    environment = :erpc.call(node, :os, :getenv, [], 10_000)
+    #
+    # ⚠️ Stdio, not `:erpc`: the sandbox has no network interfaces.
+    assert {:ok, environment} = Beam.call(provisioned, :os, :getenv, [])
     rendered = Enum.map_join(environment, "\n", &to_string/1)
 
     for {key, value} <- @platform_secrets do
@@ -80,8 +80,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationEnvTest do
     assert {:ok, provisioned} = Beam.provision(sb)
     on_exit(fn -> Beam.destroy(provisioned) end)
 
-    node = String.to_atom(provisioned.mechanism_ref)
-    environment = :erpc.call(node, :os, :getenv, [], 10_000)
+    assert {:ok, environment} = Beam.call(provisioned, :os, :getenv, [])
 
     # Asserted as a bound rather than exact equality: the ERTS startup adds a
     # handful of its own (`HOME`, `PATH`, `ROOTDIR`) and pinning the exact set

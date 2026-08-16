@@ -50,7 +50,18 @@ defmodule ExSandbox.Mechanism.Beam do
     case NodeLauncher.launch(sandbox) do
       {:ok, launched} ->
         store(sandbox.id, launched)
-        {:ok, %{sandbox | mechanism_ref: Atom.to_string(launched.node)}}
+
+        # The sandbox's **id**, not its node name. Two reasons, and the second
+        # is a bug this fixes:
+        #
+        #   1. A sandbox has no node name to speak of -- it boots undistributed
+        #      (`:nonode@nohost`), because distribution cannot start without a
+        #      network and a sandbox has none. See `NodeLauncher.start_peer/2`.
+        #   2. `list_running/0` has always returned ids. With `mechanism_ref`
+        #      set to a node name, reconciliation compared node names against a
+        #      list of ids, so a running sandbox never appeared in it -- every
+        #      one looked like an orphan to be reclaimed.
+        {:ok, %{sandbox | mechanism_ref: sandbox.id}}
 
       {:error, reason} ->
         {:error, reason}
@@ -61,7 +72,7 @@ defmodule ExSandbox.Mechanism.Beam do
   def start(%Sandbox{} = sandbox) do
     case lookup(sandbox.id) do
       {:ok, launched} ->
-        case NodeLauncher.probe(launched.node) do
+        case NodeLauncher.probe(launched.peer) do
           :ok -> {:ok, sandbox}
           {:error, reason} -> {:error, translate(reason)}
         end
@@ -110,7 +121,7 @@ defmodule ExSandbox.Mechanism.Beam do
     # detect drift.
     case lookup(sandbox.id) do
       {:ok, launched} ->
-        case NodeLauncher.probe(launched.node) do
+        case NodeLauncher.probe(launched.peer) do
           :ok ->
             {:ok, :running}
 
@@ -182,6 +193,84 @@ defmodule ExSandbox.Mechanism.Beam do
       {:ok, %{exit_reason: reason}} when not is_nil(reason) -> {:error, reason}
       {:ok, _launched} -> :ok
       :error -> {:error, :mechanism_error}
+    end
+  end
+
+  @doc """
+  The **host's** OS pid for a running sandbox.
+
+  ⚠️ Not what the sandbox reports about itself. Under `--unshare-pid` a sandbox's
+  `:os.getpid()` returns its namespace-local pid — `2` — while the host knows it
+  by an unrelated number. Anything that reads `/proc/<pid>` on the host and takes
+  the sandbox's own answer is inspecting a different process entirely, and will
+  happily report on one that is not confined.
+
+  Exposed so that verification does not have to ask the thing being verified: a
+  compromised sandbox cannot misreport this.
+  """
+  @spec host_pid(Sandbox.t()) :: {:ok, pos_integer()} | {:error, term()}
+  def host_pid(%Sandbox{} = sandbox) do
+    case lookup(sandbox.id) do
+      {:ok, %{os_pid: os_pid}} when is_integer(os_pid) -> {:ok, os_pid}
+      {:ok, _launched} -> {:error, :no_os_pid}
+      :error -> {:error, :unknown_sandbox}
+    end
+  end
+
+  @doc """
+  Evaluates `{module, function, args}` inside a sandbox and returns the result.
+
+  ⚠️ Routed over `:peer`'s **stdio** control channel, never Erlang distribution.
+  A sandbox runs under `--unshare-net` and therefore has no network interfaces at
+  all, so `:erpc.call/5` raises `{:erpc, :noconnection}` against a perfectly
+  healthy sandbox — measured, not inferred. The failure is doubly misleading: it
+  is indistinguishable from a crashed node, and it gets *more* likely the better
+  the confinement works.
+
+  Like `provision_failure_reason/1`, this is deliberately **not** an
+  `ExSandbox.Mechanism` callback: "evaluate this in the sandbox's runtime" is
+  meaningful for a BEAM node and meaningless for a mechanism whose tenant is a
+  container running arbitrary code.
+
+  Returns `{:error, :unknown_sandbox}` for an id this mechanism never launched
+  rather than raising, since a caller racing `destroy/1` is an ordinary outcome.
+  """
+  @spec call(Sandbox.t(), module(), atom(), [term()], timeout()) ::
+          {:ok, term()} | {:error, term()}
+  def call(%Sandbox{} = sandbox, module, function, args, timeout \\ 10_000) do
+    case lookup(sandbox.id) do
+      {:ok, %{peer: peer}} ->
+        try do
+          {:ok, :peer.call(peer, module, function, args, timeout)}
+        catch
+          kind, reason -> {:error, {kind, reason}}
+        end
+
+      :error ->
+        {:error, :unknown_sandbox}
+    end
+  end
+
+  @doc """
+  Evaluates `{module, function, args}` in a sandbox without waiting for a result.
+
+  For work whose *effect* is the point and whose reply will never arrive —
+  halting the node being the motivating case. A blocking `call/5` there waits out
+  its full timeout on a node that is already gone, turning a fast assertion into
+  a slow one and reporting a timeout for an operation that did exactly what was
+  asked.
+
+  Same stdio routing, and the same reason, as `call/5`.
+  """
+  @spec cast(Sandbox.t(), module(), atom(), [term()]) :: :ok | {:error, term()}
+  def cast(%Sandbox{} = sandbox, module, function, args) do
+    case lookup(sandbox.id) do
+      {:ok, %{peer: peer}} ->
+        _ = :peer.cast(peer, module, function, args)
+        :ok
+
+      :error ->
+        {:error, :unknown_sandbox}
     end
   end
 

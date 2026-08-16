@@ -54,11 +54,10 @@ defmodule ExSandbox.Mechanism.Beam.IsolationHaltTest do
     # origin, and this is where it would be killed.
     test_pid = self()
 
-    victim_node = String.to_atom(victim.mechanism_ref)
-
-    # Fire-and-forget: the node dies mid-call, so a synchronous call would
-    # simply error and tell us nothing about the survivors.
-    _ = :erpc.cast(victim_node, :erlang, :halt, [1])
+    # Fire-and-forget over stdio: the node dies mid-call, so a synchronous call
+    # would simply error and tell us nothing about the survivors. `:erpc.cast`
+    # would not reach it at all -- the sandbox has no network interfaces.
+    :ok = Beam.cast(victim, :erlang, :halt, [1])
 
     # The victim really did go. Without this the survival assertions below could
     # pass because nothing ever halted.
@@ -79,9 +78,8 @@ defmodule ExSandbox.Mechanism.Beam.IsolationHaltTest do
 
   test "the halt is reported distinguishably rather than as an unexplained crash" do
     victim = launch("tenant-one", "reported")
-    node = String.to_atom(victim.mechanism_ref)
 
-    _ = :erpc.cast(node, :erlang, :halt, [1])
+    :ok = Beam.cast(victim, :erlang, :halt, [1])
 
     assert eventually(fn -> match?({:ok, s} when s != :running, Beam.status(victim)) end)
 

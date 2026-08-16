@@ -39,24 +39,20 @@ defmodule ExSandbox.Mechanism.Beam.AtomReclamationTest do
         }
 
         {:ok, provisioned} = Beam.provision(sb)
-        node = String.to_atom(provisioned.mechanism_ref)
 
         # Created inside the sandbox, from strings unique to this cycle, so the
         # atoms genuinely cannot be interned anywhere they already exist.
-        :erpc.call(
-          node,
+        #
+        # ⚠️ Stdio, not `:erpc`: the sandbox has no network interfaces.
+        Beam.call(
+          provisioned,
           :erlang,
           :apply,
-          [
-            fn ->
-              for i <- 1..unquote(@atoms_per_cycle) do
-                String.to_atom("sandbox_atom_#{:erlang.unique_integer([:positive])}_#{i}")
-              end
-
-              :ok
-            end,
-            []
-          ],
+          # ⚠️ Pure Erlang -- `String.to_atom/1` is `:undef` inside the sandbox,
+          # so the fun would die before interning anything and the host's atom
+          # count would stay flat for the wrong reason: this test would report
+          # "no monotonic growth" having created no atoms at all.
+          [create_atoms(@atoms_per_cycle), []],
           60_000
         )
 
@@ -90,4 +86,33 @@ defmodule ExSandbox.Mechanism.Beam.AtomReclamationTest do
   end
 
   defp average(values), do: Enum.sum(values) / length(values)
+
+  # ⚠️ A **self-contained** fun: a capture would reference this test module,
+  # which the sandbox cannot load, so it would die with `:undef` having interned
+  # nothing -- and the host's atom count would stay flat for the wrong reason,
+  # reporting "no monotonic growth" from a test that created no atoms.
+  #
+  # `:erlang.list_to_atom/1` is the OTP primitive behind `String.to_atom/1`
+  # (itself `:undef` there). The uniqueness of each string is what makes the
+  # atoms genuinely new rather than interned copies of existing ones.
+  defp create_atoms(count) do
+    fn ->
+      make = fn
+        _make, 0 ->
+          :ok
+
+        make, n ->
+          _ =
+            :erlang.list_to_atom(
+              ~c"sandbox_atom_" ++
+                :erlang.integer_to_list(:erlang.unique_integer([:positive])) ++
+                ~c"_" ++ :erlang.integer_to_list(n)
+            )
+
+          make.(make, n - 1)
+      end
+
+      make.(make, count)
+    end
+  end
 end

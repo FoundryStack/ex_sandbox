@@ -28,11 +28,22 @@ defmodule ExSandbox.Mechanism.Beam.IsolationProcessesTest do
   defp launch(tag) do
     {:ok, provisioned} = Beam.provision(sandbox(tag))
     on_exit(fn -> Beam.destroy(provisioned) end)
-    {provisioned, String.to_atom(provisioned.mechanism_ref)}
+    provisioned
+  end
+
+  # ⚠️ `Beam.call/5`, never `:erpc.call/5`. The sandbox runs under
+  # `--unshare-net` and has no network interfaces, so distribution-based RPC
+  # raises `{:erpc, :noconnection}` against a healthy sandbox -- a failure that
+  # looks exactly like a crashed node and grows *more* likely as the confinement
+  # gets stronger. `Beam.call/5` goes over the stdio control channel, which
+  # survives network isolation by construction.
+  defp eval(sb, module, function, args) do
+    assert {:ok, result} = Beam.call(sb, module, function, args)
+    result
   end
 
   test "a sandbox cannot see the platform's processes" do
-    {_sb, node} = launch("a")
+    sb = launch("a")
 
     # A process on the platform, registered under a name the sandbox could find
     # if it shared a process table.
@@ -41,39 +52,53 @@ defmodule ExSandbox.Mechanism.Beam.IsolationProcessesTest do
     Process.register(pid, marker)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
 
-    registered = :erpc.call(node, :erlang, :registered, [], 10_000)
+    registered = eval(sb, :erlang, :registered, [])
 
     refute marker in registered,
            "sandbox can see the platform's registered process #{marker} -- not a separate runtime"
 
     # Count as well as name: a shared table would show the platform's hundreds,
     # while a fresh node runs a few dozen.
-    count = :erpc.call(node, :erlang, :system_info, [:process_count], 10_000)
+    count = eval(sb, :erlang, :system_info, [:process_count])
 
     assert count < 200,
            "sandbox reports #{count} processes, which is platform-sized rather than sandbox-sized"
   end
 
   test "one sandbox cannot see another tenant's processes" do
-    {_a, node_a} = launch("a")
-    {_b, node_b} = launch("b")
+    sb_a = launch("a")
+    sb_b = launch("b")
 
-    # Registered inside tenant B, so the name exists on a real runtime rather
-    # than only in this test's imagination.
-    :erpc.call(
-      node_b,
-      Process,
-      :register,
-      [:erlang.spawn(fn -> Process.sleep(:infinity) end), :tenant_b_marker],
-      10_000
-    )
+    # Spawned *inside* tenant B. An earlier version evaluated `:erlang.spawn/1`
+    # in this test process and shipped the resulting pid, which registers a
+    # **local** pid under a remote name -- the marker would exist on B without B
+    # ever hosting the process, and the test would still pass. Passing the fun
+    # to `:erlang.spawn/1` on the far side is what makes the precondition real.
+    # ⚠️ Pure Erlang: `Process.*` is `:undef` inside the sandbox, so this fun
+    # would die on its first line and register nothing. The precondition assert
+    # below catches that, but only because it exists -- without it, "tenant A
+    # cannot see the marker" would be satisfied by a marker that was never
+    # created.
+    eval(sb_b, :erlang, :spawn, [register_marker()])
 
-    assert :tenant_b_marker in :erpc.call(node_b, :erlang, :registered, [], 10_000),
+    assert :tenant_b_marker in eval(sb_b, :erlang, :registered, []),
            "precondition failed: the marker was never registered on tenant B"
 
-    registered_in_a = :erpc.call(node_a, :erlang, :registered, [], 10_000)
+    registered_in_a = eval(sb_a, :erlang, :registered, [])
 
     refute :tenant_b_marker in registered_in_a,
            "tenant A can see tenant B's process -- the sandboxes share a runtime"
+  end
+
+  # ⚠️ A **self-contained** fun, not `&register_marker/0`. A capture references
+  # this test module, which is absent from the sandbox's code path, so the fun
+  # would die with `:undef` before registering anything -- and "tenant A cannot
+  # see the marker" would then be satisfied by a marker that never existed.
+  # `Process.*` is `:undef` there for the same reason, hence the OTP calls.
+  defp register_marker do
+    fn ->
+      :erlang.register(:tenant_b_marker, self())
+      :timer.sleep(:infinity)
+    end
   end
 end

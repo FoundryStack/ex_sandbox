@@ -659,7 +659,17 @@ defmodule ExSandbox.Hardening.Linux do
     |> Keyword.get(:storage_root, "/var/lib/axonn/sandboxes")
   end
 
-  defp storage_path(sandbox), do: Path.join(sandbox_storage_root(), sandbox.id)
+  @doc """
+  Where a sandbox's writable storage is bound, on the host and inside the
+  sandbox alike — `bwrap` binds it at the same path on both sides.
+
+  Public so callers and tests name the real location rather than assuming one. A
+  test writing to a made-up path gets `:enoent`, which satisfies "the sandbox
+  could not write here" just as well as a quota would — so the assertion passes
+  while measuring nothing.
+  """
+  @spec storage_path(ExSandbox.Sandbox.t()) :: String.t()
+  def storage_path(sandbox), do: Path.join(sandbox_storage_root(), sandbox.id)
 
   defp bindir do
     # Where `peer.erl` looks for `erlexec`. Read from the running system rather

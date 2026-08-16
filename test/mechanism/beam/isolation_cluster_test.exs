@@ -2,18 +2,28 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
   @moduledoc """
   A sandbox cannot join the platform's cluster (005 T030, `FR-003`, R4).
 
-  ## The contrast is the test
+  ## What actually enforces this, as measured
 
-  Asserting `Node.list/0` is empty proves almost nothing on its own: `-hidden`
-  makes a node invisible to discovery whether or not the cookie differs, so that
-  assertion passes on a sandbox sharing the platform's cookie — the exact
-  configuration where any sandbox could `Node.connect/1` to the platform and
-  call `:erlang.halt/0` on it.
+  Not the cookie, and not `-hidden`. A sandbox runs under `--unshare-net` with no
+  network interfaces at all, so `net_kernel` cannot start: an earlier version
+  passed `name:` to `:peer`, and every such sandbox died at boot with
+  "Can't set long node name!" and `nodistribution` before running an
+  instruction. The sandbox now boots **undistributed** (`:nonode@nohost`) and is
+  reached over the stdio control channel instead.
 
-  The final test therefore deliberately gives a sandbox the platform's cookie
-  and asserts it **can** connect. That contrast is what establishes the cookie
-  as the control and `-hidden` as cosmetic. Without it, this file would be a
-  test of nothing.
+  That is a stronger guarantee than the cookie was. A node with no distribution
+  cannot connect to the platform or to another sandbox whatever cookie it holds,
+  so `FR-003` no longer rests on cookie secrecy — it rests on the absence of a
+  network stack, which tenant code cannot talk its way past.
+
+  ## The contrast is still the test
+
+  Asserting "the sandbox is not connected" proves nothing unless something in
+  this file shows a connection *could* have been observed. The final test
+  therefore starts distribution **on the platform side**, confirms the platform
+  is genuinely reachable by a node that is allowed to reach it, and only then
+  asserts the sandbox cannot. Without that control, every assertion here would
+  pass on a machine where clustering was broken for unrelated reasons.
   """
   use ExUnit.Case, async: false
 
@@ -47,55 +57,84 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
   defp launch(tag) do
     {:ok, provisioned} = Beam.provision(sandbox(tag))
     on_exit(fn -> Beam.destroy(provisioned) end)
-    {provisioned, String.to_atom(provisioned.mechanism_ref)}
+    provisioned
+  end
+
+  # ⚠️ The **transport** is stdio; the **subject** is distribution. This file
+  # asks whether a sandbox can reach other nodes, so it must not use the thing it
+  # is testing to ask the question: with `:erpc` as the transport, a refuted
+  # connect and an unreachable sandbox both surface as `:noconnection`, and the
+  # suite cannot tell "the boundary held" from "the test never ran".
+  defp eval(sb, module, function, args) do
+    assert {:ok, result} = Beam.call(sb, module, function, args)
+    result
   end
 
   test "a sandbox sees an empty cluster" do
-    {_sb, node} = launch("a")
+    sb = launch("a")
 
-    assert :erpc.call(node, Node, :list, [], 10_000) == [],
+    assert eval(sb, Node, :list, []) == [],
            "sandbox is connected to other nodes"
   end
 
   test "an explicit connect to the platform is refused" do
-    {_sb, node} = launch("a")
+    sb = launch("a")
 
     # Explicit, not discovery. `-connect_all false` stops automatic meshing;
     # this asks whether a *deliberate* attempt is stopped, which is what hostile
     # tenant code would actually do.
-    refute :erpc.call(node, Node, :connect, [Node.self()], 10_000),
+    refute eval(sb, Node, :connect, [Node.self()]),
            "sandbox connected to the platform node -- the cookie is not isolating it"
 
-    refute Node.self() in :erpc.call(node, Node, :list, [], 10_000)
+    refute Node.self() in eval(sb, Node, :list, [])
   end
 
   test "an explicit connect to another sandbox is refused" do
-    {_a, node_a} = launch("a")
-    {_b, node_b} = launch("b")
+    sb_a = launch("a")
+    sb_b = launch("b")
 
-    refute :erpc.call(node_a, Node, :connect, [node_b], 10_000),
+    # `mechanism_ref` is the sandbox id now, not a node name -- an undistributed
+    # sandbox has no node name to connect to. Constructing the name a *named*
+    # sandbox would have had is the strongest form of the attempt: it is what
+    # hostile tenant code would guess.
+    node_b = :"sandbox-#{sb_b.id}@127.0.0.1"
+
+    refute eval(sb_a, Node, :connect, [node_b]),
            "one sandbox connected to another -- cookies are shared between sandboxes"
   end
 
-  test "with the platform's cookie a sandbox CAN connect (proving the cookie is the control)" do
-    {_sb, node} = launch("a")
+  test "the platform IS reachable by a node that has a network (the positive control)" do
+    # Without this, every refutation above could be passing because clustering is
+    # broken on this host for reasons having nothing to do with sandboxing --
+    # and the suite would report isolation it never established.
+    #
+    # A `:peer` node started WITHOUT the hardening wrapper: same OTP, same
+    # cookie, same platform, but with a network stack. It must connect.
+    {:ok, peer, node} =
+      :peer.start_link(%{
+        name: :"control_#{System.unique_integer([:positive])}",
+        host: ~c"127.0.0.1",
+        args: [~c"-setcookie", Atom.to_string(Node.get_cookie()) |> String.to_charlist()],
+        connection: :standard_io,
+        wait_boot: 20_000,
+        peer_down: :continue
+      })
 
-    # Deliberately weakening the boundary, in-process and reverted immediately.
-    # If this connect fails, the earlier refutations were passing because of
-    # `-hidden` or some unrelated cause, and this file's guarantees would be
-    # unproven.
-    :erpc.call(node, :erlang, :set_cookie, [Node.self(), Node.get_cookie()], 10_000)
+    on_exit(fn -> if Process.alive?(peer), do: :peer.stop(peer) end)
 
-    assert :erpc.call(node, Node, :connect, [Node.self()], 10_000),
+    assert :peer.call(peer, Node, :connect, [Node.self()], 10_000),
            """
-           a sandbox holding the platform's cookie could NOT connect.
+           an UNCONFINED node could not connect to the platform either.
 
            That sounds like good news and is not: it means the refutations above
-           pass for some reason other than the cookie, so `FR-003` is unproven
-           and this suite cannot tell a real boundary from a cosmetic one.
+           pass for some reason other than confinement, so `FR-003` is unproven
+           and this suite cannot tell a real boundary from a broken host.
            """
 
-    # Left disconnected: a connected sandbox would leak into later tests.
-    :erpc.call(node, Node, :disconnect, [Node.self()], 10_000)
+    assert Node.self() in :peer.call(peer, Node, :list, [], 10_000)
+
+    # Left disconnected: a connected node would leak into later tests.
+    :peer.call(peer, Node, :disconnect, [Node.self()], 10_000)
+    assert node != Node.self()
   end
 end

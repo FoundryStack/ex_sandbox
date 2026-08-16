@@ -19,9 +19,23 @@
 #
 # That container is a real Linux host with systemd as PID 1, cgroup v2
 # delegation, `setpriv`, and `bwrap` -- all five capabilities genuinely
-# constructed, not stubbed. It was worth building: the first run found seven
-# defects in code that had passed every test on this machine, including a launch
-# path that failed on *every* Linux host. Prefer it to a CI round-trip.
+# constructed, not stubbed. It has found more than a dozen defects in code that
+# passed every test on this machine, including a launch path that failed on
+# *every* Linux host. Prefer it to a CI round-trip.
+#
+# ## The defects share one shape, and it is worth knowing before you debug here
+#
+# Most of them were **caused by the confinement working**. `:erpc` cannot reach a
+# sandbox that has no network interfaces. `:os.getpid()` inside a pid namespace
+# answers `2`. Distribution cannot start without a network, so a *named* peer
+# aborts at boot. Elixir's stdlib is `:undef` inside a bare `erl`. In each case
+# the stronger the isolation, the more reliably the code broke -- and several
+# failed toward a *passing* test: `{:error, :undef}` and `:enoent` both satisfy
+# "the sandbox could not do this" just as convincingly as a real boundary does.
+#
+# So when something here fails, ask first whether the test is reaching the
+# sandbox the way the sandbox can actually be reached, and whether a passing
+# assertion is measuring the boundary or measuring its own mistake.
 linux? = match?({:unix, :linux}, :os.type())
 
 excluded = if linux?, do: [], else: [:isolation, :reclamation]

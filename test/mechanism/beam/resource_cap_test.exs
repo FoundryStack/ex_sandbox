@@ -38,25 +38,23 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
   defp launch(tag, overrides \\ %{}) do
     {:ok, provisioned} = Beam.provision(sandbox(tag, overrides))
     on_exit(fn -> Beam.destroy(provisioned) end)
-    {provisioned, String.to_atom(provisioned.mechanism_ref)}
+    provisioned
+  end
+
+  # ⚠️ Stdio, not `:erpc` -- a sandbox under `--unshare-net` has no network
+  # interfaces, so distribution-based RPC cannot reach it however healthy it is.
+  defp eval(sb, module, function, args, timeout \\ 10_000) do
+    Beam.call(sb, module, function, args, timeout)
   end
 
   test "allocating past the memory cap terminates that sandbox and no other" do
-    {victim, victim_node} = launch("victim", %{memory_limit_mb: 128})
-    {bystander, _} = launch("bystander")
+    victim = launch("victim", %{memory_limit_mb: 128})
+    bystander = launch("bystander")
 
     # Allocate well past the cap. Binaries rather than lists: they are allocated
     # outside the process heap, so the OS sees the growth even if the BEAM's own
     # GC would have reclaimed a list.
-    _ =
-      :erpc.cast(victim_node, :erlang, :apply, [
-        fn ->
-          Enum.reduce(1..10_000, [], fn _, acc ->
-            [:binary.copy(<<0>>, 1024 * 1024) | acc]
-          end)
-        end,
-        []
-      ])
+    :ok = Beam.cast(victim, :erlang, :apply, [hog_memory(), []])
 
     assert eventually(fn -> match?({:ok, s} when s != :running, Beam.status(victim)) end),
            """
@@ -71,15 +69,9 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
   end
 
   test "a sandbox that breaches its cap is reported as :resource_cap, not an unexplained crash" do
-    {victim, victim_node} = launch("reported", %{memory_limit_mb: 128})
+    victim = launch("reported", %{memory_limit_mb: 128})
 
-    _ =
-      :erpc.cast(victim_node, :erlang, :apply, [
-        fn ->
-          Enum.reduce(1..10_000, [], fn _, acc -> [:binary.copy(<<0>>, 1024 * 1024) | acc] end)
-        end,
-        []
-      ])
+    :ok = Beam.cast(victim, :erlang, :apply, [hog_memory(), []])
 
     assert eventually(fn -> match?({:ok, s} when s != :running, Beam.status(victim)) end)
 
@@ -90,24 +82,25 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
   end
 
   test "spinning all cores does not starve other sandboxes" do
-    {_spinner, spinner_node} = launch("spinner", %{cpu_limit: 100})
-    {bystander, bystander_node} = launch("bystander", %{cpu_limit: 500})
+    spinner = launch("spinner", %{cpu_limit: 100})
+    bystander = launch("bystander", %{cpu_limit: 500})
 
-    cores = :erpc.call(spinner_node, :erlang, :system_info, [:logical_processors], 10_000)
+    {:ok, cores} = eval(spinner, :erlang, :system_info, [:logical_processors])
 
     for _ <- 1..max(cores, 4) do
-      :erpc.cast(spinner_node, :erlang, :apply, [
-        fn ->
-          Stream.repeatedly(fn -> :erlang.phash2(:os.timestamp()) end) |> Enum.take(10_000_000)
-        end,
-        []
-      ])
+      Beam.cast(spinner, :erlang, :apply, [spin_cpu(), []])
     end
 
     # The bystander stays responsive within its probe deadline. A shared,
     # uncapped CPU would make this call miss its window.
+    # ⚠️ Not `:erlang.is_alive/0` -- a sandbox is deliberately undistributed, so
+    # that answers `false` on a perfectly healthy one. What is being measured is
+    # *responsiveness under contention*, and the evidence for that is the call
+    # returning promptly at all. `:erlang.now_time/0`-style work would do; the
+    # node's own uptime is a real computation with a real answer.
     started = System.monotonic_time(:millisecond)
-    assert :erpc.call(bystander_node, :erlang, :is_alive, [], 15_000)
+    assert {:ok, {uptime, _}} = eval(bystander, :erlang, :statistics, [:wall_clock], 15_000)
+    assert is_integer(uptime)
     elapsed = System.monotonic_time(:millisecond) - started
 
     assert elapsed < 5_000,
@@ -117,19 +110,21 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
   end
 
   test "filling the disk constrains that sandbox alone" do
-    {victim, victim_node} = launch("disk", %{disk_quota_mb: 64})
-    {bystander, _} = launch("bystander")
+    victim = launch("disk", %{disk_quota_mb: 64})
+    bystander = launch("bystander")
 
-    target = "/sandbox/#{victim.id}/fill.bin"
+    target = Path.join(ExSandbox.Hardening.Linux.storage_path(victim), "fill.bin")
 
+    # ⚠️ Erlang's `:file`, never Elixir's `File`: the sandbox boots a bare `erl`
+    # with only OTP on its code path, so `File.write/2` there returns `:undef`.
+    # Here that would be actively misleading -- the assertion below accepts any
+    # `{:error, _}` as evidence the quota held, and `:undef` is an `{:error, _}`.
+    # The test would pass on a sandbox with no disk quota whatsoever.
     result =
-      :erpc.call(
-        victim_node,
-        File,
-        :write,
-        [target, :binary.copy(<<0>>, 256 * 1024 * 1024)],
-        60_000
-      )
+      case eval(victim, :file, :write_file, [target, :binary.copy(<<0>>, 256 * 1024 * 1024)], 60_000) do
+        {:ok, inner} -> inner
+        error -> error
+      end
 
     assert match?({:error, _}, result) or
              match?({:ok, s} when s != :running, Beam.status(victim)),
@@ -144,6 +139,48 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
       fun.() -> true
       remaining == 0 -> false
       true -> Process.sleep(500) && eventually(fun, remaining - 1)
+    end
+  end
+
+  # ⚠️ These build **self-contained** funs to run inside the sandbox, and both
+  # constraints are load-bearing.
+  #
+  # Self-contained: a capture like `&hog_memory/0` carries a reference to *this
+  # test module*, which does not exist on the sandbox's code path -- the fun dies
+  # with `:undef` the moment it is applied. Nothing allocates, the sandbox stays
+  # up, and the memory-cap test fails claiming the cap is not in force. A
+  # recursive anonymous fun (passed to itself) closes over nothing but itself.
+  #
+  # OTP only: `Enum`, `Stream`, and `String` are all `:undef` there too, for the
+  # same reason -- the sandbox boots a bare `erl` with no Elixir on its path.
+  defp hog_memory do
+    fn ->
+      grow = fn
+        _grow, 0, acc ->
+          acc
+
+        grow, n, acc ->
+          # Binaries rather than lists: allocated outside the process heap, so
+          # the OS sees the growth even where the BEAM's GC would reclaim a list.
+          grow.(grow, n - 1, [:binary.copy(<<0>>, 1024 * 1024) | acc])
+      end
+
+      grow.(grow, 10_000, [])
+    end
+  end
+
+  defp spin_cpu do
+    fn ->
+      spin = fn
+        _spin, 0 ->
+          :ok
+
+        spin, n ->
+          _ = :erlang.phash2(:os.timestamp())
+          spin.(spin, n - 1)
+      end
+
+      spin.(spin, 10_000_000)
     end
   end
 end

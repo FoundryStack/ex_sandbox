@@ -73,11 +73,25 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  defp start_peer(%Sandbox{} = sandbox, exec) do
+  defp start_peer(%Sandbox{} = _sandbox, exec) do
     cookie = generate_cookie()
 
     options = %{
-      name: node_name(sandbox),
+      # ⚠️ **No `name:`**, deliberately. Naming a peer makes `:peer` start it
+      # distributed, and distribution cannot start inside `--unshare-net`: with
+      # no interfaces there is no host to resolve, so `net_kernel` fails with
+      # "Can't set long node name!" and the kernel aborts with `nodistribution`
+      # before the sandbox runs a single instruction. The launch failed *because*
+      # the network isolation worked -- the same shape as the `:erpc` bug, one
+      # layer deeper.
+      #
+      # Unnamed, the sandbox boots as `:nonode@nohost` and `:peer.call/4` still
+      # works, because the control channel is stdio rather than distribution.
+      # This is also the stronger position for `FR-003`: a node that never starts
+      # distribution cannot connect to the platform or to another sandbox
+      # whatever cookie it holds, so cluster isolation no longer rests on the
+      # cookie alone.
+      #
       # THE security boundary (R2). `:peer` runs whatever this names; the
       # hardening wrapper is what makes that something confined.
       #
@@ -169,8 +183,6 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     {String.to_charlist(prog), Enum.map(args, &String.to_charlist/1)}
   end
 
-  defp node_name(%Sandbox{id: id}), do: :"sandbox-#{id}"
-
   # The storage the command is about to bind read-write must exist first: `bwrap`
   # refuses a bind whose source is missing ("Can't find source path ..."), so
   # every launch exited 1 while `build_command/2` was producing a correct
@@ -200,6 +212,22 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # replacing the whole check with `:ok` kept every test green.
   def verify_or_terminate(%{os_pid: os_pid, node: node, peer: peer}) do
     case hardening().verify_applied(os_pid) do
+      # `{:ok, applied}` carries the limits actually in force -- the uid, the
+      # cgroup's effective `memory.max` and `cpu.max`, the namespace comparisons.
+      # A bare `:ok` is accepted too because the substitutable fakes return it,
+      # and widening here is safer than requiring every fake to build a map it
+      # has no way to populate.
+      #
+      # ⚠️ This clause went unreached for the whole life of the module: the pid
+      # being checked was `bwrap`'s outer supervisor, so `verify_applied/1`
+      # always answered `{:error, :not_applied}` and the success path was dead
+      # code. Matching only `:ok` therefore crashed the first launch that
+      # actually verified. Confinement failing closed is what kept that
+      # invisible -- and is also why it was never a security hole.
+      {:ok, applied} ->
+        Logger.debug("#{node} verified confined: #{inspect(applied)}")
+        :ok
+
       :ok ->
         :ok
 
@@ -218,20 +246,60 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   Application-level liveness (`FR-021`).
 
   Separate from process monitoring because `:unresponsive` — process alive,
-  distribution up, application wedged — is invisible to `:peer` (R6). A hung
+  control channel up, application wedged — is invisible to `:peer` (R6). A hung
   sandbox reported healthy is worse than a crashed one: it holds memory, blocks
   placement, and serves nothing.
+
+  ⚠️ Takes the **peer pid**, not the node name, because the probe rides the stdio
+  control channel. An earlier version called `:erpc.call(node, ...)`, which
+  cannot reach a sandbox running under `--unshare-net` — it has no network
+  interfaces — so every healthy sandbox answered `{:error, :down}` and
+  `status/1` reported `:absent`.
+
+  That was the most dangerous form of this bug: reconciliation treats `:absent`
+  as "reclaim it", so the better the network isolation worked, the more certainly
+  a live tenant would be torn down as an orphan. Measured: two sandboxes that had
+  just provisioned successfully, with nothing else running, both reported
+  `:absent` immediately.
   """
-  @spec probe(node()) :: :ok | {:error, :unresponsive | :down}
-  def probe(node) do
-    :erpc.call(node, :erlang, :is_alive, [], probe_timeout())
+  @spec probe(pid()) :: :ok | {:error, :unresponsive | :down}
+  def probe(peer) when is_pid(peer) do
+    # Both checks, in this order. `Process.alive?/1` alone is not enough: after
+    # the sandbox halts, the `:peer` gen_server can still be alive while its port
+    # is closed, and `:peer.call/4` then raises `ArgumentError` from
+    # `:erlang.port_command/2` **inside the gen_server**. That kills the peer
+    # process, and the EXIT reaches anything linked to it -- so the crash lands
+    # on the caller rather than in a `rescue` here, which is why the guard has to
+    # come first rather than being caught after the fact.
+    cond do
+      not Process.alive?(peer) -> {:error, :down}
+      not peer_port_open?(peer) -> {:error, :down}
+      true -> do_probe(peer)
+    end
+  end
+
+  defp do_probe(peer) do
+    # The **return value is deliberately discarded**. A sandbox is undistributed,
+    # so `is_alive/0` answers `false` on a perfectly healthy one; what this
+    # probes is whether the call comes back at all, which is exactly the
+    # application-level liveness `FR-021` asks for. Asserting on the result here
+    # would report every healthy sandbox as dead.
+    _ = :peer.call(peer, :erlang, :is_alive, [], probe_timeout())
     :ok
   rescue
     # Distinguished deliberately: `:down` is reclaimable, `:unresponsive` needs
     # terminating. Collapsing them would let wedged sandboxes accumulate.
-    _ in ErlangError -> {:error, :down}
+    #
+    # `ArgumentError` belongs here with the rest: once the sandbox halts, its
+    # port closes, and `:peer.call/4` fails inside `:erlang.port_command/2`
+    # rather than exiting. Probing a dead sandbox is an ordinary thing to do --
+    # it is what `status/1` does on every reconciliation pass -- so it has to
+    # come back as a value. Letting it raise would crash the caller for asking a
+    # question with a perfectly good answer.
+    _ in [ErlangError, ArgumentError] -> {:error, :down}
   catch
-    :exit, {:erpc, :timeout} -> {:error, :unresponsive}
+    :exit, {:timeout, _} -> {:error, :unresponsive}
+    :exit, :timeout -> {:error, :unresponsive}
     :exit, _ -> {:error, :down}
   end
 
@@ -317,6 +385,64 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
+  @doc """
+  The host pid of the confined BEAM below `root_pid`.
+
+  ⚠️ The port's own pid is **not** the thing to verify. The command is a chain --
+  `systemd-run` execs `setpriv` execs `bwrap` -- and `bwrap` *forks*: an outer
+  process stays in the origin's namespaces to supervise, and only its child
+  enters the new ones. So the pid the port reports is the outer supervisor, whose
+  `/proc/<pid>/ns/mnt` and `ns/net` are identical to ours.
+
+  That made `verify_applied/1` return `:not_applied` for a sandbox that was in
+  fact fully confined -- measured: the port's pid reported the origin's
+  namespaces, while its grandchild `beam.smp` reported `mnt:[4026533087]`,
+  `net:[4026533091]`, uid 117068, `memory.max` 268435456, and `cpu.max`
+  `50000 100000`, all correct.
+
+  This is the same class of mistake as reading `:os.getpid()` from inside the
+  sandbox, one level out: a pid that is correct in one frame of reference used in
+  another.
+
+  ## Why `beam.smp` specifically, and not "a confined descendant"
+
+  Selecting the first descendant that *looks* confined would accept a short-lived
+  helper while the actual sandbox ran unconfined -- the check would pass for a
+  process nobody cares about. The sandbox **is** the BEAM, so that is what must
+  be named. Exactly one `beam.smp` exists in the chain; more than one means the
+  tree is not the shape this reasoning assumes, and guessing between them is
+  precisely what must not happen, so it is an error rather than a choice.
+  """
+  @spec confined_beam_pid(pos_integer()) :: {:ok, pos_integer()} | {:error, term()}
+  def confined_beam_pid(root_pid) when is_integer(root_pid) do
+    case Enum.filter(process_tree(root_pid), &beam?/1) do
+      [pid] -> {:ok, pid}
+      [] -> {:error, :no_beam_process}
+      many -> {:error, {:ambiguous_beam_processes, many}}
+    end
+  end
+
+  # Walks `/proc/<pid>/task/<pid>/children`, which lists direct children only.
+  # Depth is bounded by the wrapper chain rather than by a guess, and a pid that
+  # exits mid-walk simply contributes no children.
+  defp process_tree(pid) do
+    [pid | pid |> child_pids() |> Enum.flat_map(&process_tree/1)]
+  end
+
+  defp child_pids(pid) do
+    case File.read("/proc/#{pid}/task/#{pid}/children") do
+      {:ok, contents} -> contents |> String.split() |> Enum.map(&String.to_integer/1)
+      {:error, _} -> []
+    end
+  end
+
+  defp beam?(pid) do
+    case File.read("/proc/#{pid}/comm") do
+      {:ok, comm} -> String.trim(comm) == "beam.smp"
+      {:error, _} -> false
+    end
+  end
+
   # `:peer` does not expose the port it spawned, so it comes out of the
   # `gen_server` state. Fragile by nature -- it depends on OTP's internal record
   # shape -- so it searches for *a port* rather than indexing a fixed position,
@@ -336,9 +462,27 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     :exit, reason -> {:error, reason}
   end
 
+  # Two steps, and both are load-bearing. The port names the head of the wrapper
+  # chain on the host; `confined_beam_pid/1` walks down to the BEAM that actually
+  # entered the namespaces. Neither the sandbox's own view nor the port's pid
+  # alone identifies the process whose confinement must be verified -- see
+  # `host_os_pid/1` and `confined_beam_pid/1`.
+  #
+  # Read after `:peer.start_link/1` returns, so the BEAM has booted and is
+  # present in the tree; a launch that never got that far has already failed.
+  # A `:peer` gen_server outlives its port when the sandbox halts, so liveness of
+  # the process says nothing about whether the control channel still exists.
+  defp peer_port_open?(peer) do
+    case peer_port(peer) do
+      {:ok, port} -> Port.info(port) != nil
+      {:error, _} -> false
+    end
+  end
+
   defp os_pid(peer) do
-    with {:ok, port} <- peer_port(peer) do
-      host_os_pid(port)
+    with {:ok, port} <- peer_port(peer),
+         {:ok, root_pid} <- host_os_pid(port) do
+      confined_beam_pid(root_pid)
     end
   end
 

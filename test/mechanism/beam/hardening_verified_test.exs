@@ -39,17 +39,44 @@ defmodule ExSandbox.Mechanism.Beam.HardeningVerifiedTest do
       assert {:ok, provisioned} = Beam.provision(sb)
       on_exit(fn -> Beam.destroy(provisioned) end)
 
-      node = String.to_atom(provisioned.mechanism_ref)
-      os_pid = :erpc.call(node, :os, :getpid, [], 10_000) |> to_string() |> String.to_integer()
+      # ⚠️ The host's pid, from the mechanism -- **never** `:os.getpid()` asked of
+      # the sandbox. Under `--unshare-pid` the sandbox reports its
+      # namespace-local pid (`2`) while the host knows it by something else
+      # entirely, so verification would read `/proc/2` and report on an unrelated
+      # process. The same mistake, in production code, is what
+      # `NodeLauncher.host_os_pid/1` exists to prevent.
+      assert {:ok, os_pid} = Beam.host_pid(provisioned)
 
       # Read from the OS, not from the launch configuration. What was requested
       # and what is in force are different questions, and only the second one
       # is a guarantee (R9b: `taskpolicy -m` requests a cap and silently loses
       # it across an exec).
-      assert :ok = ExSandbox.Hardening.Linux.verify_applied(os_pid)
+      #
+      # `{:ok, applied}` carries the limits actually in force. Asserting a bare
+      # `:ok` here would not compile against the real return value -- and did
+      # not, until the pid above was corrected and this assertion was reached
+      # for the first time.
+      assert {:ok, applied} = ExSandbox.Hardening.Linux.verify_applied(os_pid)
 
-      uid = :erpc.call(node, :os, :cmd, [~c"id -u"], 10_000) |> to_string() |> String.trim()
-      refute uid == "0", "sandbox is running as root"
+      assert applied.uid != 0, "sandbox is running as root"
+      assert applied.mount_confined, "sandbox shares the platform's mount namespace"
+      assert applied.egress_restricted, "sandbox shares the platform's network namespace"
+
+      assert applied.memory_limit_mb == 128,
+             "cgroup reports #{inspect(applied.memory_limit_mb)} rather than the requested 128 MB"
+
+      # Asked of the sandbox as well, so the uid is confirmed from both sides:
+      # the host's `/proc` view and the tenant's own.
+      #
+      # ⚠️ Read from `/proc/self/status` rather than by shelling out to `id`.
+      # The sandbox's filesystem is confined to a handful of read-only binds and
+      # `id` is not among them -- `:os.cmd/1` answers "sh: 1: id: not found",
+      # which is a string, not a uid, and would fail this assertion for a reason
+      # that has nothing to do with privilege separation.
+      assert {:ok, status} = Beam.call(provisioned, :file, :read_file, ["/proc/self/status"])
+
+      assert [_, sandbox_uid] = Regex.run(~r/^Uid:\s+(\d+)/m, to_string(status))
+      assert String.to_integer(sandbox_uid) == applied.uid
 
       cgroup = File.read!("/proc/#{os_pid}/cgroup")
 
