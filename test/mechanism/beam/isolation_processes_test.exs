@@ -96,5 +96,4 @@ defmodule ExSandbox.Mechanism.Beam.IsolationProcessesTest do
     refute :tenant_b_marker in registered_in_a,
            "tenant A can see tenant B's process -- the sandboxes share a runtime"
   end
-
 end

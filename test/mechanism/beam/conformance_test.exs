@@ -48,9 +48,8 @@ defmodule ExSandbox.Mechanism.Beam.ConformanceTest do
   # this project has (local `mix test`, and the container, which compiles
   # inside itself), but a precompiled-artefact workflow would need this
   # revisited.
-  @host_can_run ExSandbox.Capability.missing(
-                  ExSandbox.Mechanism.Beam.required_capabilities()
-                ) == []
+  @host_can_run ExSandbox.Capability.missing(ExSandbox.Mechanism.Beam.required_capabilities()) ==
+                  []
 
   if @host_can_run do
     use ExSandbox.Conformance, mechanism: ExSandbox.Mechanism.Beam
