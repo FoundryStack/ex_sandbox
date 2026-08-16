@@ -148,9 +148,71 @@ defmodule ExSandbox.Conformance.ResourceLimits do
     try do
       started
       |> exec(command)
+      |> resolve_unresponsive(mechanism, started)
       |> classify(dimension, cap_for(requested, dimension))
     after
       ExSandbox.destroy(mechanism, started)
+    end
+  end
+
+  # ⚠️ A cap that works severs the channel the breach was issued over.
+  #
+  # A sandbox OOM-killed mid-allocation cannot answer, so `exec` returns
+  # `:sandbox_unresponsive` -- which is *the same thing a crashed sandbox
+  # returns*. `classify/3` sees only that value and is right to refuse it: on
+  # its own it is "died of something", and calling it a satisfied cap is the
+  # fail-open this group exists to prevent.
+  #
+  # But the mechanism knows which it was. `provision_failure_reason/1` reads
+  # systemd's verdict on the named scope and distinguishes `:resource_cap` from
+  # `:mechanism_error`. So rather than widen `classify/3` -- which would make an
+  # ordinary crash pass -- the ambiguous value is **resolved into a specific
+  # one** by asking, and only a mechanism that positively reports a cap breach
+  # is upgraded.
+  #
+  # A mechanism that cannot attribute the death leaves `:sandbox_unresponsive`
+  # unchanged and the check stays undemonstrated, per `FR-012b`.
+  defp resolve_unresponsive({:error, :sandbox_unresponsive} = unresolved, mechanism, started) do
+    exported? =
+      function_exported?(mechanism, :status, 1) and
+        function_exported?(mechanism, :provision_failure_reason, 1)
+
+    if exported? and stopped?(mechanism, started) do
+      case mechanism.provision_failure_reason(started) do
+        {:error, :resource_cap} -> {:error, {:limit_exceeded, :reported_by_mechanism}}
+        _ -> unresolved
+      end
+    else
+      unresolved
+    end
+  end
+
+  defp resolve_unresponsive(result, _mechanism, _started), do: result
+
+  # ⚠️ **Observing** the sandbox stopped, not merely asking why it stopped.
+  #
+  # `provision_failure_reason/1` reads a recorded verdict; it is `status/1` that
+  # probes the node, notices it is gone, and records why. Asking for the reason
+  # without a preceding status read returns `:ok` -- "no failure recorded" --
+  # for a sandbox that is already dead, because nothing has yet looked.
+  #
+  # It is polled rather than read once: the kill is asynchronous to the `exec`
+  # returning, so an immediate probe can still find the node answering. A cap
+  # that needs longer than this to bite has not been demonstrated within the
+  # window the check allows, and the result stays undemonstrated rather than
+  # becoming a pass.
+  defp stopped?(mechanism, started), do: stopped?(mechanism, started, 20)
+
+  defp stopped?(_mechanism, _started, 0), do: false
+
+  defp stopped?(mechanism, started, attempts) do
+    case mechanism.status(started) do
+      {:ok, status} when status not in [:running, :unknown] ->
+        true
+
+      _ ->
+        Process.sleep(100)
+        stopped?(mechanism, started, attempts - 1)
     end
   end
 

@@ -93,17 +93,33 @@ defmodule ExSandbox.Conformance.Reachability do
 
           {:ok, status} = ExSandbox.status(@mechanism, provisioned)
 
+          # ⚠️ `:running` is accepted, and this is not a loosened bar.
+          #
+          # `FR-024` requires distinguishing states **"for a request to a
+          # sandbox that is not serving"**. A mechanism may legitimately launch
+          # during `provision/1` -- `005` does exactly that, because a host that
+          # cannot confine must be refused before anything believes the sandbox
+          # exists (`005` R9) -- and such a sandbox *is* serving. Reporting
+          # `:running` for it is truthful.
+          #
+          # Requiring `:provisioned` here asserted that provisioning does not
+          # start the sandbox, which is a **mechanism assumption leaking into
+          # the contract**: it fails every mechanism that front-loads the launch,
+          # for doing something the contract permits.
+          #
+          # What must never happen is the inverse -- a sandbox that is *not*
+          # serving reporting `:running`, since `006` would then proxy traffic to
+          # something that is not listening. That is what the checks below
+          # establish, by stopping a sandbox and requiring the state change.
           assert_guarantee(
-            status == :provisioned,
+            status in [:provisioned, :running],
             "003-FR-024",
             """
-            A sandbox that was provisioned but never started reported
-            #{inspect(status)} rather than `:provisioned`.
+            A sandbox that was provisioned reported #{inspect(status)}.
 
-            `006` distinguishes this from `:stopped` to decide whether to start
-            on demand: a stopped sandbox should be started, one still being
-            built should be waited for. Reporting `:running` is worse still --
-            traffic is proxied to something that is not listening.
+            `006` needs to know whether to wait for it, start it, or route to
+            it. `:provisioned` (still being built -- wait) and `:running`
+            (serving -- route) are both actionable; #{inspect(status)} is not.
             """
           )
         end
@@ -188,16 +204,24 @@ defmodule ExSandbox.Conformance.Reachability do
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
           {:ok, s2} = ExSandbox.status(@mechanism, started)
 
-          :ok = ExSandbox.destroy(@mechanism, started)
+          # ⚠️ A **stop** is included, not just provision→start→destroy. A
+          # mechanism that launches during `provision/1` -- which the contract
+          # permits, and `005` does -- answers the same thing for `s1` and `s2`,
+          # so that sequence tops out at two states however well the mechanism
+          # discriminates. Stopping is what makes the lifecycle traverse a third.
+          {:ok, _} = ExSandbox.stop(@mechanism, started)
           {:ok, s3} = ExSandbox.status(@mechanism, started)
 
-          observed = Enum.uniq([s1, s2, s3])
+          :ok = ExSandbox.destroy(@mechanism, started)
+          {:ok, s4} = ExSandbox.status(@mechanism, started)
+
+          observed = Enum.uniq([s1, s2, s3, s4])
 
           assert_guarantee(
             length(observed) >= 3,
             "003-FR-024",
             """
-            Provisioned, running, and destroyed produced #{length(observed)}
+            Provisioned, running, stopped, and destroyed produced #{length(observed)}
             distinct status value(s): #{inspect(observed)}
 
             FR-024 requires six outcomes stay distinguishable. A mechanism whose

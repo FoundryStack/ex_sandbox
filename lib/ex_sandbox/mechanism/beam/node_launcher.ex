@@ -50,11 +50,47 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
     with :ok <- require_hardening(),
          :ok <- prepare_storage(sandbox),
+         :ok <- clear_stale_scope(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
          {:ok, launched} <- start_peer(sandbox, exec),
          :ok <- verify_or_terminate(launched, sandbox) do
       {:ok, launched}
     end
+  end
+
+  # ⚠️ The same property that makes a cap breach attributable makes a sandbox id
+  # unreusable, and this is the price of R7e.
+  #
+  # A named scope's unit object **survives the death of its processes** in
+  # `failed` state -- that is precisely why `Result=oom-kill` can still be read
+  # after the cgroup directory is gone. But systemd then refuses to create a new
+  # scope under that name:
+  #
+  #     Failed to start transient scope unit: Unit sandbox-<id>.scope
+  #     was already loaded or has a fragment file.
+  #
+  # so the *next* sandbox with that id fails to boot, reported as
+  # `:mechanism_error` — a platform fault raised by a previous tenant's breach.
+  # Ids collide in practice: `System.unique_integer/1` restarts per VM, so a
+  # rerun of a suite reuses them.
+  #
+  # `reset-failed` discards the spent unit. It runs before launch rather than
+  # after death deliberately: a reset at teardown would erase the verdict
+  # `provision_failure_reason/1` exists to read, and would be skipped entirely
+  # whenever the host that created the scope crashed.
+  #
+  # Failure is not propagated. `reset-failed` on a name that was never used is a
+  # no-op, and on a host without systemd there is no scope to clear; letting
+  # either abort a launch would break hosts that this never concerned.
+  defp clear_stale_scope(sandbox) do
+    if function_exported?(hardening(), :scope_unit_name, 1) do
+      unit = hardening().scope_unit_name(sandbox)
+      _ = System.cmd("systemctl", ["reset-failed", unit], stderr_to_stdout: true)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
   end
 
   defp require_hardening do

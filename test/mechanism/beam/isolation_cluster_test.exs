@@ -91,6 +91,21 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
   # which in a test asserting "the sandbox is not connected to anything" is
   # indistinguishable from success. `:erlang.nodes/0` and
   # `:net_kernel.connect_node/1` are the primitives behind them.
+  #
+  # ⚠️ `connect_node/1` has **three** returns, and only two are booleans:
+  # `true`, `false`, and `:ignored` -- the last meaning distribution is not
+  # running at all. A sandbox launched without a network never starts
+  # distribution (`:erlang.is_alive/0` is `false` there), so `:ignored` is what
+  # a correctly isolated sandbox actually returns. Measured:
+  #
+  #     connect_node(platform) => {:ok, :ignored}
+  #     erlang:nodes           => {:ok, []}
+  #     is_alive               => {:ok, false}
+  #
+  # `refute` therefore reported the **strongest** refusal as a breach, because
+  # `:ignored` is truthy -- the isolation working is what made the check fail.
+  # The checks below name the accepted values instead of relying on
+  # truthiness, so a real connection (`true`) still fails them.
   defp eval(sb, module, function, args) do
     assert {:ok, result} = Beam.call(sb, module, function, args)
     result
@@ -109,7 +124,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
     # Explicit, not discovery. `-connect_all false` stops automatic meshing;
     # this asks whether a *deliberate* attempt is stopped, which is what hostile
     # tenant code would actually do.
-    refute eval(sb, :net_kernel, :connect_node, [Node.self()]),
+    assert eval(sb, :net_kernel, :connect_node, [Node.self()]) in [false, :ignored],
            "sandbox connected to the platform node -- the cookie is not isolating it"
 
     refute Node.self() in eval(sb, :erlang, :nodes, [])
@@ -125,7 +140,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
     # hostile tenant code would guess.
     node_b = :"sandbox-#{sb_b.id}@127.0.0.1"
 
-    refute eval(sb_a, :net_kernel, :connect_node, [node_b]),
+    assert eval(sb_a, :net_kernel, :connect_node, [node_b]) in [false, :ignored],
            "one sandbox connected to another -- cookies are shared between sandboxes"
   end
 
@@ -146,9 +161,24 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
         peer_down: :continue
       })
 
-    on_exit(fn -> if Process.alive?(peer), do: :peer.stop(peer) end)
+    # ⚠️ `Process.alive?/1` is checked and then *ignored on failure*: the peer can
+    # exit between the check and the stop, and `:peer.stop/1` on a dead peer
+    # exits with `:noproc`. Raising from `on_exit` fails a test whose assertions
+    # all passed, which is a teardown race reported as a defect.
+    on_exit(fn ->
+      try do
+        if Process.alive?(peer), do: :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
 
-    assert :peer.call(peer, Node, :connect, [Node.self()], 10_000),
+    # ⚠️ `:net_kernel`, not `Node` -- the same rule the sandbox checks follow.
+    # This peer is unconfined but still a bare `erl` with no Elixir on its code
+    # path, so `Node.connect/1` raises `:undef` here. The control then failed
+    # while reporting "an unconfined node could not connect", i.e. it accused
+    # the host of broken clustering when the real cause was a missing module.
+    assert :peer.call(peer, :net_kernel, :connect_node, [Node.self()], 10_000) == true,
            """
            an UNCONFINED node could not connect to the platform either.
 
@@ -157,10 +187,10 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
            and this suite cannot tell a real boundary from a broken host.
            """
 
-    assert Node.self() in :peer.call(peer, Node, :list, [], 10_000)
+    assert Node.self() in :peer.call(peer, :erlang, :nodes, [], 10_000)
 
     # Left disconnected: a connected node would leak into later tests.
-    :peer.call(peer, Node, :disconnect, [Node.self()], 10_000)
+    :peer.call(peer, :net_kernel, :disconnect, [Node.self()], 10_000)
     assert node != Node.self()
   end
 end

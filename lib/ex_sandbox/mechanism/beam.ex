@@ -137,7 +137,7 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @impl true
   def start(%Sandbox{} = sandbox) do
-    case lookup(sandbox.id) do
+    case lookup_sandbox(sandbox) do
       # ⚠️ Relaunch is permitted **only** for a row explicitly marked stopped.
       # That marker is the entire safety property here: without it, `start/1` on
       # a live sandbox would launch a second node for an id the caller believes
@@ -163,7 +163,7 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @impl true
   def stop(%Sandbox{} = sandbox) do
-    case lookup(sandbox.id) do
+    case lookup_sandbox(sandbox) do
       {:ok, launched} ->
         NodeLauncher.terminate(launched.peer)
 
@@ -173,7 +173,12 @@ defmodule ExSandbox.Mechanism.Beam do
         # back -- so `003-FR-012` (stop preserves, start restores) was
         # unreachable, and three `FR-024` checks plus one `FR-015` failed
         # because a stopped sandbox is a *state*, not an absence.
-        store(sandbox.id, Map.merge(launched, %{stopped: true, peer: nil}))
+        # ⚠️ Keyed by the row's **own** key, not `sandbox.id`. Since
+        # `lookup_sandbox/1` also resolves by `mechanism_ref`, a reconciler can
+        # reach this with a struct whose `id` was never stored -- and writing
+        # under that id would leave the original row running while creating a
+        # second, stopped one for the same sandbox.
+        store(registry_key(sandbox), Map.merge(launched, %{stopped: true, peer: nil}))
         {:ok, sandbox}
 
       # Idempotent, per `003`: a sandbox that is already not running is in the
@@ -185,13 +190,17 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @impl true
   def destroy(%Sandbox{} = sandbox) do
-    case lookup(sandbox.id) do
+    case lookup_sandbox(sandbox) do
       {:ok, launched} ->
         # A stopped sandbox has no peer to terminate -- `stop/1` cleared it --
         # but its row must still go. Destroy is the only operation that forgets,
         # which is what keeps `stop` recoverable and `destroy` final.
         if launched[:peer], do: NodeLauncher.terminate(launched.peer)
-        forget(sandbox.id)
+        # The key the row was found under -- see `stop/1`. Forgetting
+        # `sandbox.id` for a ref-resolved struct would terminate the node and
+        # leave its row behind, which reconciliation would then see as an orphan
+        # forever.
+        forget(registry_key(sandbox))
         :ok
 
       :error ->
@@ -205,7 +214,7 @@ defmodule ExSandbox.Mechanism.Beam do
     # which is what makes `003`'s reconciliation possible: a status derived
     # from stored state can never disagree with stored state, so it could never
     # detect drift.
-    case lookup(sandbox.id) do
+    case lookup_sandbox(sandbox) do
       # Reported before probing, because there is nothing to probe: `stop/1`
       # cleared the peer. `:stopped` is distinct from `:absent` -- the sandbox
       # exists and can be started again, which is what `FR-024` asks the
@@ -222,10 +231,34 @@ defmodule ExSandbox.Mechanism.Beam do
             # Classified on the way past rather than later: once the OS process
             # is reaped the evidence distinguishing a cap breach from a crash is
             # gone, and `provision_failure_reason/1` would have nothing to read.
-            record_exit(sandbox.id, launched)
+            record_exit(registry_key(sandbox), launched)
             {:ok, :absent}
 
+          # ⚠️ Classified here too, for the same reason as `:down`.
+          #
+          # A sandbox OOM-killed mid-allocation does not always present as
+          # `:down`: the peer process can survive its BEAM long enough to be
+          # probed, answering nothing, which is `:unresponsive`. Measured on a
+          # 128 MB sandbox allocating 2 GB -- status settled at `:unknown` while
+          # systemd already held `Result=oom-kill`, and because only the `:down`
+          # branch recorded anything, `provision_failure_reason/1` reported `:ok`
+          # for a sandbox killed by its own cap.
+          #
+          # `:unknown` is still the honest status -- the mechanism genuinely
+          # cannot say whether the node is coming back -- but the *cause* is
+          # legible right now and unrecoverable once the unit is reset, so a cap
+          # verdict is recorded on the way past rather than inferred later.
+          #
+          # ⚠️ Only a **positive** verdict is recorded. Unlike `:down`, an
+          # unresponsive sandbox may simply be busy and answer the next probe;
+          # writing `:mechanism_error` here would permanently mark a healthy
+          # sandbox as failed -- and because a recorded reason takes precedence,
+          # nothing would ever correct it.
           {:error, :unresponsive} ->
+            if cap_breached?(launched) do
+              record_exit(registry_key(sandbox), launched)
+            end
+
             {:ok, :unknown}
         end
 
@@ -238,6 +271,19 @@ defmodule ExSandbox.Mechanism.Beam do
   # `memory.events`. Reading the counter is what separates `:resource_cap` from
   # a generic crash -- the exit status alone cannot, because an OOM kill and a
   # `halt(1)` are both just a dead process to the parent.
+  # ⚠️ An already-recorded reason **wins**. This runs on every status probe of a
+  # dead sandbox, and it infers the cause from systemd's verdict on the scope --
+  # which only ever names an OOM kill. A reason recorded by whoever actually did
+  # the stopping is strictly better evidence than that inference.
+  #
+  # Without this precedence, a sandbox terminated for exceeding its **time**
+  # budget was immediately relabelled `:mechanism_error` by the next status
+  # read: systemd reports no `oom-kill`, quite correctly, because memory was
+  # never the reason. A deliberate stop was thereby reported as a platform
+  # fault, which is the same ambiguity `record_exit/2` exists to remove, just
+  # pointing the other way.
+  defp record_exit(_id, %{exit_reason: reason}) when not is_nil(reason), do: :ok
+
   defp record_exit(id, launched) do
     reason =
       if cap_breached?(launched) do
@@ -289,10 +335,29 @@ defmodule ExSandbox.Mechanism.Beam do
     _ -> :unknown
   end
 
-  # `--user` because the scope is created with `systemd-run --user` (R9): a
-  # `--system` query would not find it.
+  # ⚠️ A **system** query, matching the scope the launcher actually creates.
+  #
+  # `systemd_run_args/2` passes no `--user`, so the scope is a system unit. This
+  # read was `--user` and therefore asked the wrong manager: it returned
+  # `LoadState=not-found` with `Result=success` for every sandbox, live or dead.
+  #
+  # That pairing is the whole reason `scope_result/1` guards on `LoadState`. A
+  # missing unit reports `Result=success` -- indistinguishable from a clean exit
+  # -- so without the guard this mismatch would have silently reported "no cap
+  # breach" for every OOM kill, and the memory cap would have looked enforced on
+  # a host where nothing was ever attributed. Measured against a live breach:
+  #
+  #     systemctl --user show sandbox-<id>.scope   =>  LoadState=not-found
+  #                                                    Result=success
+  #     systemctl        show sandbox-<id>.scope   =>  LoadState=loaded
+  #                                                    Result=oom-kill
+  #                                                    ActiveState=failed
+  #
+  # If the launcher ever moves to `--user`, this must move with it; the guard
+  # will turn the disagreement into `:mechanism_error` rather than a false pass,
+  # but a cap that cannot be attributed is still a cap that is not demonstrated.
   defp systemctl_scope_args(unit),
-    do: ["--user", "show", unit, "-p", "LoadState", "-p", "Result"]
+    do: ["show", unit, "-p", "LoadState", "-p", "Result"]
 
   defp parse_properties(output) do
     output
@@ -336,7 +401,7 @@ defmodule ExSandbox.Mechanism.Beam do
   """
   @spec provision_failure_reason(Sandbox.t()) :: {:error, atom()} | :ok
   def provision_failure_reason(%Sandbox{} = sandbox) do
-    case lookup(sandbox.id) do
+    case lookup_sandbox(sandbox) do
       {:ok, %{exit_reason: reason}} when not is_nil(reason) -> {:error, reason}
       {:ok, _launched} -> :ok
       :error -> {:error, :mechanism_error}
@@ -404,7 +469,7 @@ defmodule ExSandbox.Mechanism.Beam do
   defp exec_in_sandbox(sandbox, command) do
     shell = "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin export PATH; " <> command
 
-    case call(sandbox, :os, :cmd, [String.to_charlist(shell)], exec_timeout()) do
+    case call(sandbox, :os, :cmd, [String.to_charlist(shell)], exec_timeout(sandbox)) do
       {:ok, output} ->
         {:ok, to_string(output)}
 
@@ -413,7 +478,15 @@ defmodule ExSandbox.Mechanism.Beam do
       # `:peer.call/4` waiting, and reporting that as an unclassified error makes
       # the suite read "stopped" as "could not be demonstrated". The whole point
       # of the resource-limit checks is that a breach was *stopped*.
+      #
+      # ⚠️ A sandbox that overran its **own** budget is *stopped*, not merely
+      # reported slow. Leaving it running would satisfy every inspection of the
+      # configuration while the work continued indefinitely — the `005` R9b shape
+      # again, where the limiter is invoked with the right number and silently
+      # does nothing. Measured before this: a sandbox given `timeout_ms: 2_000`
+      # ran a 60s sleep for the full global 15s timeout and was still `:running`.
       {:error, {:exit, {:timeout, _}}} ->
+        enforce_time_budget(sandbox)
         {:error, :sandbox_unresponsive}
 
       {:error, reason} ->
@@ -421,7 +494,39 @@ defmodule ExSandbox.Mechanism.Beam do
     end
   end
 
-  defp exec_timeout do
+  # Stops a sandbox that exceeded a budget **it asked for**, leaving one that
+  # merely hit the global ceiling alone.
+  #
+  # The distinction matters: the global timeout is this library's own guard
+  # against waiting forever on a call, and tripping it says nothing about the
+  # tenant. A per-sandbox `timeout_ms` is a declared limit on the tenant's work,
+  # and a declared limit that does not stop anything is not a limit.
+  #
+  # ⚠️ The reason is recorded **before** the node is torn down, and the row is
+  # kept. `destroy/1` forgets the row, which erases the very verdict
+  # `provision_failure_reason/1` exists to report -- a caller would then see the
+  # sandbox stopped with no way to learn it was a budget breach rather than a
+  # platform fault, which is the ambiguity `record_exit/2` was written to close.
+  defp enforce_time_budget(sandbox) do
+    with ms when is_integer(ms) <- time_budget(sandbox),
+         {:ok, launched} <- lookup_sandbox(sandbox) do
+      store(registry_key(sandbox), Map.put(launched, :exit_reason, :resource_cap))
+      if launched[:peer], do: NodeLauncher.terminate(launched.peer)
+    end
+
+    :ok
+  end
+
+  # The sandbox's own budget takes precedence; the configured value is a
+  # fallback ceiling, never a cap on what a caller may request.
+  defp exec_timeout(sandbox) do
+    time_budget(sandbox) || configured_exec_timeout()
+  end
+
+  defp time_budget(%Sandbox{context: %{timeout_ms: ms}}) when is_integer(ms) and ms > 0, do: ms
+  defp time_budget(_sandbox), do: nil
+
+  defp configured_exec_timeout do
     :ex_sandbox
     |> Application.get_env(:beam, [])
     |> Keyword.get(:exec_timeout_ms, 15_000)
@@ -547,23 +652,38 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @impl true
   def usage(%Sandbox{} = sandbox) do
-    case lookup(sandbox.id) do
-      {:ok, launched} ->
-        read_usage(launched.node)
+    case lookup_sandbox(sandbox) do
+      {:ok, _launched} ->
+        read_usage(sandbox)
 
       :error ->
         {:error, :mechanism_error}
     end
   end
 
-  defp read_usage(node) do
-    memory = :erpc.call(node, :erlang, :memory, [:total], probe_timeout())
-    {:ok, %{memory_mb: div(memory, 1024 * 1024)}}
-  rescue
-    _ -> {:error, :host_unreachable}
-  catch
-    :exit, {:erpc, :timeout} -> {:error, :timeout}
-    :exit, _ -> {:error, :host_unreachable}
+  # ⚠️ Over the **peer's stdio channel**, never `:erpc`.
+  #
+  # This called `:erpc.call(node, ...)` -- the same defect already fixed in
+  # `probe/1`, left behind here. A sandbox launched under `--unshare-net` has no
+  # network interfaces and never starts distribution, so `:erpc` cannot reach a
+  # perfectly healthy node and every call fell into the `:exit` clause as
+  # `:host_unreachable`. `FR-026` asks that usage be reported for a running
+  # sandbox, and it could not be, for any of them.
+  #
+  # It surfaced only as flakiness because it fails toward an *error* rather than
+  # a false pass -- the safe direction, but the guarantee was still unmet.
+  # `:peer.call/5` is the one channel that survives the network namespace.
+  defp read_usage(sandbox) do
+    case call(sandbox, :erlang, :memory, [:total], probe_timeout()) do
+      {:ok, memory} when is_integer(memory) ->
+        {:ok, %{memory_mb: div(memory, 1024 * 1024)}}
+
+      {:error, {:exit, {:timeout, _}}} ->
+        {:error, :timeout}
+
+      {:error, _reason} ->
+        {:error, :host_unreachable}
+    end
   end
 
   # `:unresponsive` folds into `:timeout` rather than becoming a sixth atom.
@@ -590,6 +710,34 @@ defmodule ExSandbox.Mechanism.Beam do
     case :ets.lookup(table(), id) do
       [{^id, launched}] -> {:ok, launched}
       [] -> :error
+    end
+  end
+
+  # The key a sandbox's row is actually stored under. Mirrors
+  # `lookup_sandbox/1`'s resolution order, so a write lands on the row the
+  # matching read found.
+  defp registry_key(%Sandbox{} = sandbox) do
+    case lookup(sandbox.id) do
+      {:ok, _} -> sandbox.id
+      :error -> sandbox.mechanism_ref || sandbox.id
+    end
+  end
+
+  # ⚠️ Resolves by **`mechanism_ref` as well as `id`**, and the second path is
+  # what makes reconciliation implementable (`003-FR-015`).
+  #
+  # A reconciler examining an unrecorded orphan has **only the ref** this
+  # mechanism handed out -- there is no registry row to look an id up in. Keying
+  # solely on `sandbox.id` meant a sandbox reconstructed from its own ref missed
+  # the table and reported `:absent`, so the reconciler could not confirm what it
+  # had found. Terminating on that guess is worse than the leak it fixes.
+  #
+  # For this mechanism the two are the same string, so the second clause is
+  # reached only for a struct built from a ref alone. Both are tried rather than
+  # assuming they always agree.
+  defp lookup_sandbox(%Sandbox{} = sandbox) do
+    with :error <- lookup(sandbox.id) do
+      if sandbox.mechanism_ref, do: lookup(sandbox.mechanism_ref), else: :error
     end
   end
 

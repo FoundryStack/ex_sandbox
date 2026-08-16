@@ -134,7 +134,19 @@ defmodule ExSandbox.TelemetryTest do
     defmodule NeedsEverything do
       @moduledoc false
       @behaviour ExSandbox.Mechanism
-      # Declares nothing, so it is treated as requiring every capability.
+
+      # ⚠️ Requires a capability **no host provides**, rather than relying on the
+      # host lacking one of the real ones.
+      #
+      # This previously declared nothing, which the caller treats as "requires
+      # every capability" -- a refusal on any host missing one. That made the
+      # test pass on macOS and fail in the isolation container, because the
+      # container genuinely provides all five: provision succeeded, correctly,
+      # and the assertion of a refusal had nothing to catch. The check was
+      # measuring the host's poverty rather than the refusal path.
+      @impl true
+      def required_capabilities, do: [:no_host_provides_this]
+
       @impl true
       def provision(s), do: {:ok, s}
       @impl true
