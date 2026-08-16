@@ -56,6 +56,48 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @impl true
   def provision(%Sandbox{} = sandbox) do
+    # ⚠️ The template is resolved **before** anything is launched. Without this
+    # the mechanism ignored `template_ref` entirely, so a caller who typo'd a
+    # template name got a running sandbox built from something they did not
+    # choose -- and `provision_failure_reason/1` could never report
+    # `:template_missing`, because nothing had ever noticed. Caught by `003`'s
+    # conformance suite (`FR-027`), which is exactly what it is for.
+    with {:ok, _template} <- resolve_template(sandbox.template_ref) do
+      do_provision(sandbox)
+    end
+  end
+
+  # Templates name the runtime a sandbox launches with (`FR-022`). The registry
+  # is configuration rather than a resource: `012-FR-009` keeps Ash resources out
+  # of this library, and a host that manages templates in its own schema
+  # supplies the list.
+  #
+  # An empty registry accepts nothing. That is the safe direction -- a mechanism
+  # that accepts every name when unconfigured is the fail-open shape this check
+  # exists to catch -- but it means a host must configure templates before
+  # provisioning succeeds.
+  defp resolve_template(template_ref) do
+    known =
+      :ex_sandbox
+      |> Application.get_env(:beam, [])
+      |> Keyword.get(:templates, [])
+
+    cond do
+      template_ref in known ->
+        {:ok, template_ref}
+
+      # A wildcard for hosts that manage template existence themselves and do
+      # not want this library second-guessing them. Explicit, so it cannot
+      # happen by forgetting to configure anything.
+      known == :any ->
+        {:ok, template_ref}
+
+      true ->
+        {:error, {:template_missing, template_ref}}
+    end
+  end
+
+  defp do_provision(%Sandbox{} = sandbox) do
     # Provision launches the node. `003` allows a mechanism to defer work to
     # `start/1`, but deferring here would mean reporting `:provisioned` for a
     # sandbox whose host may be unable to confine it -- and `R9` requires that
