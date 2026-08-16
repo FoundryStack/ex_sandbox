@@ -10,9 +10,18 @@
 # So the `:isolation` and `:reclamation` tags are excluded off Linux. This makes
 # `mix test` green locally, and that greenness is exactly the thing to be
 # careful about: **a green local run says nothing about whether tenant code is
-# contained.** The suite that answers that question runs only in Linux CI. If
-# you are reading this while deciding whether a change is safe to ship, the
-# local run is not the evidence you want.
+# contained.** If you are reading this while deciding whether a change is safe
+# to ship, the local run is not the evidence you want.
+#
+# ## Run them here, without waiting for CI
+#
+#     docker compose -f docker/compose.isolation.yml run --rm --build isolation
+#
+# That container is a real Linux host with systemd as PID 1, cgroup v2
+# delegation, `setpriv`, and `bwrap` -- all five capabilities genuinely
+# constructed, not stubbed. It was worth building: the first run found seven
+# defects in code that had passed every test on this machine, including a launch
+# path that failed on *every* Linux host. Prefer it to a CI round-trip.
 linux? = match?({:unix, :linux}, :os.type())
 
 excluded = if linux?, do: [], else: [:isolation, :reclamation]

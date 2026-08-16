@@ -49,6 +49,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     granted_env = Keyword.get(opts, :granted_env, [])
 
     with :ok <- require_hardening(),
+         :ok <- prepare_storage(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
          {:ok, launched} <- start_peer(sandbox, exec),
          :ok <- verify_or_terminate(launched) do
@@ -119,7 +120,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   defp do_start_peer(options, cookie) do
     case :peer.start_link(options) do
       {:ok, peer, node} ->
-        case os_pid(node) do
+        case os_pid(peer) do
           {:ok, os_pid} ->
             {:ok, %{node: node, os_pid: os_pid, peer: peer, cookie: cookie}}
 
@@ -169,6 +170,28 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   end
 
   defp node_name(%Sandbox{id: id}), do: :"sandbox-#{id}"
+
+  # The storage the command is about to bind read-write must exist first: `bwrap`
+  # refuses a bind whose source is missing ("Can't find source path ..."), so
+  # every launch exited 1 while `build_command/2` was producing a correct
+  # command.
+  #
+  # Guarded by `function_exported?/3` rather than called outright, because
+  # `prepare_storage/1` is **not** part of the `ExSandbox.Hardening` behaviour --
+  # it is specific to how the Linux implementation constructs confinement. A
+  # mechanism whose hardening needs no pre-created directory should not be
+  # obliged to define a no-op, and the substitutable fakes that make this launch
+  # path testable off Linux implement only the three behaviour functions.
+  defp prepare_storage(sandbox) do
+    module = hardening()
+    Code.ensure_loaded(module)
+
+    if function_exported?(module, :prepare_storage, 1) do
+      module.prepare_storage(sandbox)
+    else
+      :ok
+    end
+  end
 
   @doc false
   # Public only so it can be tested without a bootable hardened node. On a
@@ -271,8 +294,18 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  defp os_pid(node) do
-    case :erpc.call(node, :os, :getpid, [], probe_timeout()) do
+  # ⚠️ `:peer.call/4`, **not** `:erpc.call/5`. The sandbox runs under
+  # `--unshare-net` with no network interfaces at all (FR-011), so Erlang
+  # distribution cannot reach it -- `:erpc` returns `{:erpc, :noconnection}` for
+  # every correctly confined sandbox. Using it meant the launch failed *because
+  # the isolation worked*.
+  #
+  # `:peer.call/4` rides the `connection: :standard_io` channel the peer was
+  # started with: stdin/stdout of the spawned process, needing no network, no
+  # epmd, and no distribution. Measured inside the namespace, `:peer.call`
+  # returned the pid while `:erpc` raised.
+  defp os_pid(peer) do
+    case :peer.call(peer, :os, :getpid, [], probe_timeout()) do
       pid when is_list(pid) -> {:ok, List.to_integer(pid)}
       other -> {:error, {:unexpected_pid, other}}
     end

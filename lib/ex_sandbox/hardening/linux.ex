@@ -203,16 +203,39 @@ defmodule ExSandbox.Hardening.Linux do
   def validate_limits_for_inspection(sandbox), do: validate_limits(sandbox)
 
   defp compose(sandbox, limits, granted_env) do
-    user = "sandbox-#{sandbox.id}"
-
     args =
       systemd_run_args(limits) ++
-        setpriv_args(user) ++
+        setpriv_args(sandbox_uid(sandbox)) ++
         confinement_args(sandbox, limits) ++
-        env_args(granted_env) ++
+        env_args(sandbox, granted_env) ++
         [erlexec_path()]
 
-    {"systemd-run", args}
+    # ⚠️ An **absolute path**, never the bare name. The probes above resolve
+    # binaries with `System.cmd/3`, which searches `PATH` -- but the launcher
+    # does not: `:peer` spawns via `open_port({:spawn_executable, prog}, ...)`,
+    # and `:spawn_executable` requires a path it can `exec` directly.
+    #
+    # Returning `"systemd-run"` here made every launch raise `:enoent` with
+    # "invalid port name" from inside `:peer.init/1` -- while all five
+    # capabilities still probed true, because the probes and the launcher
+    # resolve programs differently. Found by running the isolation suite in a
+    # container with the facilities genuinely present.
+    {systemd_run_path(), args}
+  end
+
+  # Resolved at compose time rather than hardcoded: distributions disagree
+  # (`/usr/bin` on Debian, `/bin` on some others).
+  #
+  # The fallback is the **canonical absolute path**, never the bare name. A bare
+  # name is the defect this function exists to fix, so falling back to one would
+  # reintroduce it on exactly the hosts where resolution failed -- and it would
+  # fail at `:peer.init/1` with `:enoent` rather than here, where the cause is
+  # still legible. On a host without `systemd-run` the launch must fail; this
+  # ensures it fails naming a path that was looked for.
+  @systemd_run_fallback "/usr/bin/systemd-run"
+
+  defp systemd_run_path do
+    System.find_executable("systemd-run") || @systemd_run_fallback
   end
 
   defp systemd_run_args(limits) do
@@ -231,11 +254,11 @@ defmodule ExSandbox.Hardening.Linux do
     ]
   end
 
-  defp setpriv_args(user) do
+  defp setpriv_args(uid) do
     [
       "setpriv",
-      "--reuid=#{user}",
-      "--regid=#{user}",
+      "--reuid=#{uid}",
+      "--regid=#{uid}",
       "--clear-groups",
       # Without this a process that drops to an unprivileged uid can still
       # regain privilege through a setuid binary, which makes the uid drop
@@ -249,46 +272,153 @@ defmodule ExSandbox.Hardening.Linux do
   # while `build_command/2` constructs two of them -- so a correctly configured
   # host probes green, launches, and reports a fully hardened sandbox with
   # three boundaries absent.
-  defp confinement_args(sandbox, limits) do
+  defp confinement_args(sandbox, _limits) do
     storage = storage_path(sandbox)
 
     [
-      "bwrap",
+      "bwrap"
       # FR-010: the sandbox sees the runtime read-only and its own storage
       # read-write. Everything else -- including every other sandbox's storage
       # and the platform's own files -- is simply not in its mount view.
-      "--ro-bind",
-      "/usr",
-      "/usr",
-      "--ro-bind",
-      "/lib",
-      "/lib",
-      "--ro-bind",
-      "/lib64",
-      "/lib64",
-      "--bind",
-      storage,
-      storage,
-      "--proc",
-      "/proc",
-      "--dev",
-      "/dev",
-      # FR-011: a private network namespace with no interfaces. Denies reaching
-      # other sandboxes' runtimes and platform-internal services by construction
-      # rather than by rule, so there is no policy to misconfigure.
-      "--unshare-net",
-      "--unshare-pid",
-      "--unshare-ipc",
-      "--unshare-uts",
-      "--die-with-parent",
-      # FR-009: the quota on that storage. Applied as a bind of an already
-      # quota-limited filesystem -- see `storage_path/1`.
-      "--size",
-      "#{limits.disk_mb}M"
-    ]
+    ] ++
+      runtime_ro_binds() ++
+      [
+        "--bind",
+        storage,
+        storage,
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        # FR-011: a private network namespace with no interfaces. Denies reaching
+        # other sandboxes' runtimes and platform-internal services by construction
+        # rather than by rule, so there is no policy to misconfigure.
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent"
+        # FR-009's quota is **not** an argument here, deliberately. It comes from
+        # the bind above: `storage_path/1` points into a filesystem that
+        # `probe_disk_quota/0` has already confirmed can carry a quota, and the
+        # bind carries that enforcement into the sandbox.
+        #
+        # A trailing `--size #{limits.disk_mb}M` used to sit here. `bwrap` rejected
+        # the whole command -- "--size takes a non-zero number of bytes" -- because
+        # `--size` takes raw bytes and, per `bwrap --help`, "Set[s] size of next
+        # argument (only for --tmpfs)". Last in the list, it modified nothing even
+        # when spelled correctly. Both malformed and redundant, and because it was
+        # last, its failure read as a broken launch rather than a broken quota.
+      ]
   end
 
-  defp env_args(granted_env) do
+  # The read-only binds that give the sandbox a runtime, derived from **this
+  # host** rather than assumed.
+  #
+  # Two bugs came from assuming a layout. `/lib64` was bound unconditionally and
+  # does not exist on arm64 Debian, where the loader lives in
+  # `/lib/aarch64-linux-gnu` -- `bwrap` then refuses to start at all ("Can't find
+  # source path /lib64"), failing every launch on every such host. And the
+  # Erlang installation itself was never bound: `erlexec` sits under
+  # `/usr/local/lib/erlang` (or Homebrew's Cellar), which `/usr` and `/lib` do
+  # not cover, so the sandbox could not see the runtime it was about to exec.
+  #
+  # Candidates are filtered by existence, and the runtime root is added
+  # explicitly. `--ro-bind-try` is deliberately not used instead: it would let a
+  # missing *runtime* path pass silently, turning a launch failure that names its
+  # cause into a sandbox that boots without the libraries it needs.
+  defp runtime_ro_binds do
+    [erlang_root() | ["/usr", "/lib", "/lib64", "/bin", "/sbin"]]
+    |> Enum.uniq()
+    |> Enum.filter(&File.exists?/1)
+    |> Enum.reject(&nested_in_other?(&1, ["/usr", "/lib"]))
+    |> Enum.flat_map(&["--ro-bind", &1, &1])
+  end
+
+  # `/usr/local/lib/erlang` is already covered by the `/usr` bind; binding it
+  # again makes `bwrap` mount over its own mount, which it rejects.
+  defp nested_in_other?(path, parents) do
+    Enum.any?(parents, fn parent ->
+      path != parent and String.starts_with?(path, parent <> "/")
+    end)
+  end
+
+  defp erlang_root, do: to_string(:code.root_dir())
+
+  @doc """
+  Create this sandbox's writable storage, owned by the uid it will drop to
+  (FR-009, FR-010).
+
+  Called before `build_command/2`'s output is spawned. `bwrap` refuses a bind
+  whose source does not exist -- "Can't find source path ..." -- so without this
+  every launch exits 1 having constructed a perfectly correct command.
+
+  Ownership matters as much as existence. Created as root and left that way, the
+  sandbox drops privilege and cannot write to its own storage: the launch
+  succeeds and every write fails, which is harder to diagnose than an outright
+  refusal. Mode `0o700` keeps it to the owning uid, since every sandbox on a
+  gateway shares this root under a different uid.
+  """
+  @spec prepare_storage(ExSandbox.Sandbox.t()) :: :ok | {:error, term()}
+  def prepare_storage(sandbox) do
+    path = storage_path(sandbox)
+    uid = sandbox_uid(sandbox)
+
+    with :ok <- File.mkdir_p(path),
+         :ok <- File.chmod(path, 0o700) do
+      chown(path, uid)
+    end
+  end
+
+  # `File.chown/2` is a no-op for an unprivileged process, and that is the
+  # common case in tests. Failure is reported rather than raised: on a host
+  # where the caller cannot chown, the launch should fail at
+  # `verify_applied/1` naming the uid, not here naming a permission.
+  defp chown(path, uid) do
+    case File.chown(path, uid) do
+      :ok -> :ok
+      {:error, :eperm} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The unprivileged uid this sandbox runs as (FR-007).
+  #
+  # ⚠️ A **number**, not a name. This built `"sandbox-<id>"` and passed
+  # it to `--reuid`, which resolves a name only if it has a passwd entry --
+  # nothing creates one, so every launch died with "failed to parse reuid" before
+  # Erlang started. `probe_setpriv/0` missed it by attempting the drop against
+  # the hardcoded `65534`, which resolves everywhere: the probe and the launch
+  # were testing different uids.
+  #
+  # Derived from the sandbox id rather than allocated, which buys two properties
+  # the alternative does not. It is **stable** -- `verify_applied/1` and
+  # reclamation compute the same uid without shared state -- and it needs no
+  # mutation of the host passwd database, which would require root, outlive the
+  # sandbox, and turn cleanup into user-database gardening.
+  #
+  # The range is configurable because the safe span is a deployment fact: it must
+  # avoid the host's real accounts and any other tenant of the same machine.
+  defp sandbox_uid(sandbox) do
+    {min, max} = uid_range()
+    span = max - min + 1
+
+    # ⚠️ Collision is possible and is a real limitation: two sandbox ids can hash
+    # into one uid, and two sandboxes sharing a uid can read each other's files.
+    # `:erlang.phash2` is used for stability across nodes and restarts, not for
+    # uniqueness. With the default 60,000-wide range the birthday bound puts
+    # ~1% collision odds around 35 concurrent sandboxes -- acceptable for the
+    # slice, and the reason `FR-013`'s per-gateway allocator should replace this
+    # with a real reservation before scale-out.
+    min + :erlang.phash2(sandbox.id, span)
+  end
+
+  defp uid_range do
+    Application.get_env(:ex_sandbox, :beam, [])
+    |> Keyword.get(:sandbox_uid_range, {70_000, 129_999})
+  end
+
+  defp env_args(sandbox, granted_env) do
     # `env -i` clears the environment; `:peer`'s `env` option does not.
     # Research R3 measured a child spawned with one granted variable seeing 76,
     # including PLATFORM_SECRET, because that option *merges* rather than
@@ -298,7 +428,21 @@ defmodule ExSandbox.Hardening.Linux do
 
     # BINDIR is not optional: `peer.erl:1214-1221` uses it to locate `erlexec`,
     # and a fully empty environment prevents the node from booting at all.
-    ["env", "-i" | pairs] ++ ["BINDIR=#{bindir()}"]
+    #
+    # HOME is not optional either, for a less obvious reason. Under `env -i` the
+    # sandbox's `auth` module cannot resolve a cookie directory and the kernel
+    # refuses to start outright:
+    #
+    #     failed_to_start_child,auth,{{badmatch,error},
+    #       [{filename,basedir_join_home,1,...
+    #
+    # It points at the sandbox's **own storage**, which it already owns and no
+    # other sandbox can reach. A shared HOME would put every sandbox's cookie in
+    # one directory -- handing tenant code the credential `FR-003` relies on.
+    #
+    # Neither is a hole in the allowlist. Both are entries in it: an allowlist
+    # with nothing in it does not boot, and the question is only what goes in.
+    ["env", "-i" | pairs] ++ ["BINDIR=#{bindir()}", "HOME=#{storage_path(sandbox)}"]
   end
 
   # -- Guards ---------------------------------------------------------------

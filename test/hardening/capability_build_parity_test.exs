@@ -55,7 +55,30 @@ defmodule ExSandbox.Hardening.CapabilityBuildParityTest do
 
   def has_network_restriction?(args), do: "--unshare-net" in args
 
-  def has_disk_quota?(args), do: "--size" in args
+  # ⚠️ The evidence is the **bind of the sandbox's storage**, not a `--size`
+  # argument. This test previously accepted `"--size" in args`, and that was
+  # wrong twice over: `bwrap`'s `--size` takes raw bytes and only modifies a
+  # following `--tmpfs`, so the trailing `--size 1024M` it was matching modified
+  # nothing *and* made `bwrap` reject the entire command. The parity check passed
+  # against an argument that broke every launch.
+  #
+  # What actually enforces `FR-009` is the bind: `storage_path/1` points into a
+  # filesystem `probe_disk_quota/0` has confirmed can carry a quota, and binding
+  # it carries that enforcement in. So parity means "the storage is bound",
+  # which is checkable here, rather than "a quota is in force", which is not --
+  # establishing that is the resource-cap suite's job.
+  def has_disk_quota?(args) do
+    # Scans **every** `--bind`, not just the first. An earlier version took only
+    # `Enum.find_index/2`'s first hit, which passed until `HOME=` was added to
+    # the environment layer and shifted what that index pointed at -- a check
+    # that depended on argument order rather than on the bind being present.
+    args
+    |> Enum.with_index()
+    |> Enum.filter(fn {arg, _i} -> arg == "--bind" end)
+    |> Enum.any?(fn {_arg, i} ->
+      args |> Enum.at(i + 1) |> to_string() |> String.contains?("sandboxes/")
+    end)
+  end
 
   defp built_args do
     sandbox = %ExSandbox.Sandbox{
