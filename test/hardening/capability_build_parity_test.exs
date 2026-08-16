@@ -1,0 +1,130 @@
+defmodule ExSandbox.Hardening.CapabilityBuildParityTest do
+  @moduledoc """
+  Every capability the probe reports is actually constructed by the command
+  (005 T012).
+
+  ## The seam this closes
+
+  `capabilities/0` probes five things and `available?/0` requires all five.
+  `contracts/hardening.md` then relegates three of them — filesystem
+  confinement, disk quota, network restriction — to "deployment", outside the
+  code.
+
+  Taken literally that ships a silent failure. On a correctly configured Linux
+  host every probe passes, `build_command/2` emits a command constructing only
+  cgroups, the uid drop, and `env -i`, and the sandbox launches **reported
+  fully hardened with three of five boundaries absent**. `verify_applied/1` as
+  the contract originally scoped it inspects only uid, cgroup, and memory/CPU,
+  so it cannot catch this either.
+
+  Every other test in this suite passes in that state. This one does not.
+
+  ## Why parity rather than a list of expected flags
+
+  Asserting "the command contains `--unshare-net`" pins today's construction and
+  would need editing whenever the mechanism changes. What must hold is the
+  *relationship*: a capability that is probed is a capability that is built. A
+  sixth capability added to the probe with no matching construction fails here
+  automatically, which is the case a fixed list would miss.
+  """
+  use ExUnit.Case, async: true
+
+  alias ExSandbox.Hardening.Linux
+
+  # What counts as "constructed" for each probed capability: evidence that must
+  # appear in the built command. Keyed by capability so a new probe key with no
+  # entry fails the completeness test below rather than being silently ignored.
+  @construction %{
+    resource_limits: {"cgroup caps", &__MODULE__.has_resource_limits?/1},
+    privilege_separation: {"uid/gid drop", &__MODULE__.has_privilege_drop?/1},
+    filesystem_confinement: {"mount confinement", &__MODULE__.has_filesystem_confinement?/1},
+    network_restriction: {"egress denial", &__MODULE__.has_network_restriction?/1},
+    disk_quota: {"storage quota", &__MODULE__.has_disk_quota?/1}
+  }
+
+  def has_resource_limits?(args) do
+    Enum.any?(args, &String.starts_with?(&1, "MemoryMax=")) and
+      Enum.any?(args, &String.starts_with?(&1, "CPUQuota="))
+  end
+
+  def has_privilege_drop?(args) do
+    "setpriv" in args and Enum.any?(args, &String.starts_with?(&1, "--reuid="))
+  end
+
+  def has_filesystem_confinement?(args), do: "--ro-bind" in args or "--bind" in args
+
+  def has_network_restriction?(args), do: "--unshare-net" in args
+
+  def has_disk_quota?(args), do: "--size" in args
+
+  defp built_args do
+    sandbox = %ExSandbox.Sandbox{
+      id: "parity-#{System.unique_integer([:positive])}",
+      owner_ref: "owner",
+      template_ref: "tpl",
+      memory_limit_mb: 256,
+      cpu_limit: 500,
+      disk_quota_mb: 1024
+    }
+
+    {:ok, {_cmd, args}} = Linux.compose_for_inspection(sandbox, [])
+    args
+  end
+
+  test "every probed capability has a construction entry" do
+    # Guards the map above. Without this, adding a sixth probe and forgetting to
+    # describe its construction would make the parity test below silently skip
+    # it -- the exact hole this file exists to close, reopened one level up.
+    probed = Linux.capabilities() |> Map.keys() |> MapSet.new()
+    described = @construction |> Map.keys() |> MapSet.new()
+
+    assert MapSet.equal?(probed, described),
+           """
+           `capabilities/0` and this test's construction map disagree.
+
+           Probed but not described: #{inspect(MapSet.difference(probed, described) |> MapSet.to_list())}
+           Described but not probed: #{inspect(MapSet.difference(described, probed) |> MapSet.to_list())}
+
+           A probed capability with no described construction cannot be checked
+           for parity, so `available?/0` could require it while nothing builds it.
+           """
+  end
+
+  test "every probed capability is actually constructed" do
+    args = built_args()
+
+    missing =
+      for {capability, {description, present?}} <- @construction,
+          not present?.(args),
+          do: "#{capability} (#{description})"
+
+    assert missing == [],
+           """
+           These capabilities are probed by `capabilities/0` -- and therefore
+           required by `available?/0` -- but are not constructed by the launch
+           command:
+
+             #{Enum.join(missing, "\n  ")}
+
+           A host satisfying every probe would launch a sandbox reported fully
+           hardened with these boundaries absent. Either construct them or stop
+           probing them; there is no third option that is not a silent failure.
+           """
+  end
+
+  test "verification covers the constructed boundaries" do
+    # One level down, the same seam: a boundary that is built but never verified
+    # is a boundary that can silently fail to apply. `verify_applied/1` returns
+    # the mount and egress checks, so their absence would show here.
+    verified = Linux.__info__(:functions) |> Keyword.keys()
+
+    assert :verify_applied in verified
+
+    source = File.read!("lib/ex_sandbox/hardening/linux.ex")
+
+    for evidence <- ["mount_confined", "egress_restricted", "disk_quota_mb"] do
+      assert source =~ evidence,
+             "verify_applied/1 does not report #{evidence}; a boundary is built but unchecked"
+    end
+  end
+end
