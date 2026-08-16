@@ -54,7 +54,7 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
     # Allocate well past the cap. Binaries rather than lists: they are allocated
     # outside the process heap, so the OS sees the growth even if the BEAM's own
     # GC would have reclaimed a list.
-    :ok = Beam.cast(victim, :erlang, :apply, [hog_memory(), []])
+    :ok = hog_memory(victim)
 
     assert eventually(fn -> match?({:ok, s} when s != :running, Beam.status(victim)) end),
            """
@@ -71,7 +71,7 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
   test "a sandbox that breaches its cap is reported as :resource_cap, not an unexplained crash" do
     victim = launch("reported", %{memory_limit_mb: 128})
 
-    :ok = Beam.cast(victim, :erlang, :apply, [hog_memory(), []])
+    :ok = hog_memory(victim)
 
     assert eventually(fn -> match?({:ok, s} when s != :running, Beam.status(victim)) end)
 
@@ -88,7 +88,7 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
     {:ok, cores} = eval(spinner, :erlang, :system_info, [:logical_processors])
 
     for _ <- 1..max(cores, 4) do
-      Beam.cast(spinner, :erlang, :apply, [spin_cpu(), []])
+      spin_cpu(spinner)
     end
 
     # The bystander stays responsive within its probe deadline. A shared,
@@ -148,45 +148,41 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
     end
   end
 
-  # ⚠️ These build **self-contained** funs to run inside the sandbox, and both
-  # constraints are load-bearing.
+  # ⚠️ **MFAs over OTP modules only — a fun cannot cross this boundary at all.**
   #
-  # Self-contained: a capture like `&hog_memory/0` carries a reference to *this
-  # test module*, which does not exist on the sandbox's code path -- the fun dies
-  # with `:undef` the moment it is applied. Nothing allocates, the sandbox stays
-  # up, and the memory-cap test fails claiming the cap is not in force. A
-  # recursive anonymous fun (passed to itself) closes over nothing but itself.
+  # Measured in the container: `Beam.call(sb, :erlang, :apply, [fn -> ... end, []])`
+  # returns `{:error, {:error, :undef}}` however self-contained the fun looks.
+  # Every anonymous fun carries the module that defined it, and the sandbox
+  # cannot load this test module -- or any Elixir module, since it boots a bare
+  # `erl`. Named captures fail identically.
   #
-  # OTP only: `Enum`, `Stream`, and `String` are all `:undef` there too, for the
-  # same reason -- the sandbox boots a bare `erl` with no Elixir on its path.
-  defp hog_memory do
-    fn ->
-      grow = fn
-        _grow, 0, acc ->
-          acc
-
-        grow, n, acc ->
-          # Binaries rather than lists: allocated outside the process heap, so
-          # the OS sees the growth even where the BEAM's GC would reclaim a list.
-          grow.(grow, n - 1, [:binary.copy(<<0>>, 1024 * 1024) | acc])
-      end
-
-      grow.(grow, 10_000, [])
-    end
+  # That failure is dangerous rather than merely inconvenient: a hog that dies
+  # instantly with `:undef` allocates nothing, the sandbox stays up, and the test
+  # reports "the cap was requested but is not in force" -- accusing the mechanism
+  # of the exact fail-open defect (R9b) this suite exists to detect, when nothing
+  # was ever allocated.
+  #
+  # ⚠️ One binary, not many. `:lists.duplicate/2` was tried first and does not
+  # work: it stores 10,000 references to *one* shared 1MB binary, allocating
+  # ~1MB rather than 10GB, so a 128MB cap is never breached. A single
+  # `:binary.copy/2` of 2GB is unambiguous.
+  defp hog_memory(sandbox) do
+    Beam.cast(sandbox, :erlang, :spawn, [:binary, :copy, [<<0>>, 2_000_000_000]])
   end
 
-  defp spin_cpu do
-    fn ->
-      spin = fn
-        _spin, 0 ->
-          :ok
-
-        spin, n ->
-          _ = :erlang.phash2(:os.timestamp())
-          spin.(spin, n - 1)
-      end
-
-      spin.(spin, 10_000_000)
-    end
+  defp spin_cpu(sandbox) do
+    # ⚠️ Work **generated inside** the sandbox, not shipped to it. Passing
+    # `:lists.seq(1, 20_000_000)` was tried and is wrong twice over: the list
+    # crosses as data and allocates enough to trip the *memory* cap, so the
+    # sandbox dies of the wrong limit and the CPU test reports a starved
+    # bystander that was never starved.
+    #
+    # `pbkdf2_hmac` with a high iteration count burns CPU for seconds with
+    # bounded allocation -- verified: the sandbox stays `:running` throughout.
+    Beam.cast(sandbox, :erlang, :spawn, [
+      :crypto,
+      :pbkdf2_hmac,
+      [:sha512, "spin", "salt", 20_000_000, 64]
+    ])
   end
 end

@@ -114,6 +114,49 @@ defmodule ExSandbox.Telemetry do
   end
 
   @doc """
+  Records the outcome of verifying that confinement actually applied
+  (`005` T045, `010` Emission Review).
+
+  ## Why this event exists separately from the lifecycle span
+
+  A provision span reports whether provisioning *succeeded*. This reports
+  whether the sandbox that resulted is **confined**, and the two are not the
+  same question: `005` R9b measured a limiter invoked with correct arguments,
+  present in the process tree, named in configuration, and silently not applied.
+  A span would have called that a success.
+
+  Emitted on **both** outcomes deliberately. A failure event alone gives an
+  operator no way to distinguish "confinement is being verified and holding"
+  from "verification stopped running" — and those look identical in a dashboard
+  that only ever plots failures.
+  """
+  @spec hardening_verified(module(), ExSandbox.Sandbox.t(), :ok | {:error, atom()}, map()) :: :ok
+  def hardening_verified(mechanism, sandbox, outcome, applied \\ %{}) do
+    :telemetry.execute(
+      [:ex_sandbox, :hardening, :verified],
+      %{count: 1},
+      %{
+        owner_ref: sandbox.owner_ref,
+        mechanism: mechanism,
+        sandbox_id: sandbox.id,
+        result: verification_result(outcome),
+        reason: verification_reason(outcome),
+        # What was actually in force, for the success case: uid, cgroup,
+        # effective memory and CPU. An operator reading a confinement event
+        # wants the values, not just the verdict.
+        applied: applied
+      }
+    )
+  end
+
+  defp verification_result(:ok), do: :ok
+  defp verification_result({:ok, _}), do: :ok
+  defp verification_result({:error, _}), do: :error
+
+  defp verification_reason({:error, reason}), do: reason
+  defp verification_reason(_), do: nil
+
+  @doc """
   Records that a host could not provide what a mechanism requires.
 
   Emitted where the refusal happens rather than left to the caller: a mechanism

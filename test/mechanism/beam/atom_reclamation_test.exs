@@ -46,13 +46,14 @@ defmodule ExSandbox.Mechanism.Beam.AtomReclamationTest do
         # ⚠️ Stdio, not `:erpc`: the sandbox has no network interfaces.
         Beam.call(
           provisioned,
-          :erlang,
-          :apply,
-          # ⚠️ Pure Erlang -- `String.to_atom/1` is `:undef` inside the sandbox,
-          # so the fun would die before interning anything and the host's atom
-          # count would stay flat for the wrong reason: this test would report
-          # "no monotonic growth" having created no atoms at all.
-          [create_atoms(@atoms_per_cycle), []],
+          :lists,
+          :foreach,
+          # ⚠️ An MFA over OTP, with the names built here and interned there.
+          # A fun cannot cross this boundary at all -- it carries the module that
+          # defined it, which the sandbox cannot load -- so a closure would die
+          # with `:undef` having interned nothing, and this test would report
+          # "no monotonic growth" from a run that created no atoms.
+          [:erlang.make_fun(:erlang, :list_to_atom, 1), atom_names(@atoms_per_cycle)],
           60_000
         )
 
@@ -87,32 +88,15 @@ defmodule ExSandbox.Mechanism.Beam.AtomReclamationTest do
 
   defp average(values), do: Enum.sum(values) / length(values)
 
-  # ⚠️ A **self-contained** fun: a capture would reference this test module,
-  # which the sandbox cannot load, so it would die with `:undef` having interned
-  # nothing -- and the host's atom count would stay flat for the wrong reason,
-  # reporting "no monotonic growth" from a test that created no atoms.
-  #
-  # `:erlang.list_to_atom/1` is the OTP primitive behind `String.to_atom/1`
-  # (itself `:undef` there). The uniqueness of each string is what makes the
-  # atoms genuinely new rather than interned copies of existing ones.
-  defp create_atoms(count) do
-    fn ->
-      make = fn
-        _make, 0 ->
-          :ok
-
-        make, n ->
-          _ =
-            :erlang.list_to_atom(
-              ~c"sandbox_atom_" ++
-                :erlang.integer_to_list(:erlang.unique_integer([:positive])) ++
-                ~c"_" ++ :erlang.integer_to_list(n)
-            )
-
-          make.(make, n - 1)
-      end
-
-      make.(make, count)
+  # Charlists, built on this side and interned on the far side by
+  # `:erlang.list_to_atom/1` (the OTP primitive behind `String.to_atom/1`, itself
+  # `:undef` in the sandbox). Each name is unique, so the atoms are genuinely new
+  # rather than interned copies of ones that already exist.
+  defp atom_names(count) do
+    for i <- 1..count do
+      ~c"sandbox_atom_" ++
+        :erlang.integer_to_list(:erlang.unique_integer([:positive])) ++
+        ~c"_" ++ :erlang.integer_to_list(i)
     end
   end
 end

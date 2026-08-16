@@ -57,7 +57,7 @@ defmodule ExSandbox.Conformance.Reachability do
 
         check "a running sandbox reports :running and carries an address" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
           on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
 
@@ -88,7 +88,7 @@ defmodule ExSandbox.Conformance.Reachability do
 
         check "a provisioned-but-never-started sandbox does not report :running" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           on_exit(fn -> ExSandbox.destroy(@mechanism, provisioned) end)
 
           {:ok, status} = ExSandbox.status(@mechanism, provisioned)
@@ -110,7 +110,7 @@ defmodule ExSandbox.Conformance.Reachability do
 
         check "a stopped sandbox is distinguishable from one still provisioning" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, before_start} = ExSandbox.status(@mechanism, provisioned)
 
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
@@ -182,7 +182,7 @@ defmodule ExSandbox.Conformance.Reachability do
           # unconditionally could be argued into "never determinable". This
           # says: then it has told `006` nothing, on every call.
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, s1} = ExSandbox.status(@mechanism, provisioned)
 
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)

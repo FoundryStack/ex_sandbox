@@ -62,6 +62,42 @@ defmodule ExSandbox.Conformance.Helpers do
   end
 
   @doc """
+  Provisions a sandbox, converting a host's inability to confine into the
+  **third outcome** rather than a failure.
+
+  ## Why this is a helper rather than a pattern each check repeats
+
+  A mechanism that refuses to provision because the host cannot confine is
+  behaving **correctly** — `005` R9 and Principle II require exactly that. A
+  check that reports it as a conformance failure is blaming the mechanism for
+  obeying the contract, and a run full of those failures is indistinguishable
+  from a mechanism that is genuinely broken.
+
+  Two checks in `lifecycle` already did this translation and the rest did not,
+  so the same host produced "capability unavailable" or a `MatchError` depending
+  on which check ran. Measured on macOS: 29 of 33 checks reported failures for a
+  mechanism doing the right thing.
+
+  ⚠️ **Not an exclusion** (`FR-011`). The consumer cannot request this: it
+  triggers only on the mechanism's own runtime refusal, carries the capability
+  the host is missing, and is reported rather than silently passed. A mechanism
+  that provisions successfully gets no benefit from it whatsoever.
+  """
+  @spec provision_or_report(module(), ExSandbox.Sandbox.t()) :: ExSandbox.Sandbox.t()
+  def provision_or_report(mechanism, sandbox) do
+    case ExSandbox.provision(mechanism, sandbox) do
+      {:ok, provisioned} ->
+        provisioned
+
+      {:error, {:capability_unavailable, [missing | _]}} ->
+        capability_unavailable(missing.name, missing.detail)
+
+      other ->
+        guarantee_failure("003-FR-010", "provision/2 returned #{inspect(other)}")
+    end
+  end
+
+  @doc """
   Reports whether `capability` is available, as `ExSandbox.Capability` sees it.
   """
   @spec host_capability(ExSandbox.Capability.name()) :: ExSandbox.Capability.t()

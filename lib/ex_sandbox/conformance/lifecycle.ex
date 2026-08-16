@@ -102,7 +102,7 @@ defmodule ExSandbox.Conformance.Lifecycle do
 
         check "a destroyed sandbox reports :absent, not :unknown" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           :ok = ExSandbox.destroy(@mechanism, provisioned)
 
           # `:absent` and `:unknown` are distinct on purpose (003-FR-024): "it
@@ -119,7 +119,7 @@ defmodule ExSandbox.Conformance.Lifecycle do
 
         check "a second destroy returns :ok rather than an error" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
 
           :ok = ExSandbox.destroy(@mechanism, provisioned)
 
@@ -179,7 +179,7 @@ defmodule ExSandbox.Conformance.Lifecycle do
 
         check "list_running reports a started sandbox and forgets a destroyed one" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
 
           {:ok, running} = ExSandbox.list_running(@mechanism)
@@ -204,7 +204,7 @@ defmodule ExSandbox.Conformance.Lifecycle do
 
         check "usage is reported for a running sandbox" do
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
           on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
 
@@ -323,7 +323,7 @@ defmodule ExSandbox.Conformance.Lifecycle do
           # `mechanism_ref` identifies *this* sandbox, and a mechanism that
           # rebuilds from the template on `start/1` has a different one.
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
           on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
 

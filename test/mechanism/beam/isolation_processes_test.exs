@@ -79,7 +79,14 @@ defmodule ExSandbox.Mechanism.Beam.IsolationProcessesTest do
     # below catches that, but only because it exists -- without it, "tenant A
     # cannot see the marker" would be satisfied by a marker that was never
     # created.
-    eval(sb_b, :erlang, :spawn, [register_marker()])
+    # ⚠️ Registered by an MFA the sandbox resolves itself. A fun -- anonymous or
+    # captured -- cannot cross this boundary at all: it carries the module that
+    # defined it, which the sandbox cannot load, so it dies with `:undef` and
+    # registers nothing. The precondition below is what catches that; without it
+    # "tenant A cannot see the marker" would be satisfied by a marker that never
+    # existed.
+    pid = eval(sb_b, :erlang, :spawn, [:timer, :sleep, [60_000]])
+    true = eval(sb_b, :erlang, :register, [:tenant_b_marker, pid])
 
     assert :tenant_b_marker in eval(sb_b, :erlang, :registered, []),
            "precondition failed: the marker was never registered on tenant B"
@@ -90,15 +97,4 @@ defmodule ExSandbox.Mechanism.Beam.IsolationProcessesTest do
            "tenant A can see tenant B's process -- the sandboxes share a runtime"
   end
 
-  # ⚠️ A **self-contained** fun, not `&register_marker/0`. A capture references
-  # this test module, which is absent from the sandbox's code path, so the fun
-  # would die with `:undef` before registering anything -- and "tenant A cannot
-  # see the marker" would then be satisfied by a marker that never existed.
-  # `Process.*` is `:undef` there for the same reason, hence the OTP calls.
-  defp register_marker do
-    fn ->
-      :erlang.register(:tenant_b_marker, self())
-      :timer.sleep(:infinity)
-    end
-  end
 end

@@ -52,7 +52,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          :ok <- prepare_storage(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
          {:ok, launched} <- start_peer(sandbox, exec),
-         :ok <- verify_or_terminate(launched) do
+         :ok <- verify_or_terminate(launched, sandbox) do
       {:ok, launched}
     end
   end
@@ -136,7 +136,24 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       {:ok, peer, node} ->
         case os_pid(peer) do
           {:ok, os_pid} ->
-            {:ok, %{node: node, os_pid: os_pid, peer: peer, cookie: cookie}}
+            # ⚠️ Captured **now**, while the process is alive. Once a sandbox
+            # dies, `/proc/<pid>` is gone and the path is unrecoverable -- which
+            # is why every cap breach was reported as `:mechanism_error` rather
+            # than `:resource_cap`.
+            {:ok,
+             %{
+               node: node,
+               os_pid: os_pid,
+               peer: peer,
+               cookie: cookie,
+               cgroup_path: read_cgroup_path(os_pid),
+               # The parent slice's `oom_kill` count as of launch. The sandbox's
+               # own scope is destroyed by systemd the instant it dies -- a 200ms
+               # poll never once caught it -- but the parent slice persists and
+               # its counter aggregates children, so a delta against this
+               # baseline is what distinguishes a cap breach from a crash.
+               oom_baseline: read_parent_oom_kills(read_cgroup_path(os_pid))
+             }}
 
           {:error, reason} ->
             # No os_pid means nothing downstream can verify confinement, so this
@@ -210,8 +227,28 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # non-Linux host the launch fails before reaching this gate, which left the
   # terminate-on-unverified path silently untested -- caught by mutation, where
   # replacing the whole check with `:ok` kept every test green.
-  def verify_or_terminate(%{os_pid: os_pid, node: node, peer: peer}) do
-    case hardening().verify_applied(os_pid) do
+  def verify_or_terminate(launched, sandbox \\ nil)
+
+  def verify_or_terminate(%{os_pid: os_pid, node: node, peer: peer}, sandbox) do
+    outcome = hardening().verify_applied(os_pid)
+
+    # Emitted on **both** outcomes. A failure-only event leaves an operator
+    # unable to tell "confinement is being verified and holding" from
+    # "verification stopped running" -- identical in any dashboard that only
+    # plots failures.
+    if sandbox do
+      ExSandbox.Telemetry.hardening_verified(
+        __MODULE__,
+        sandbox,
+        outcome,
+        case outcome do
+          {:ok, applied} when is_map(applied) -> applied
+          _ -> %{}
+        end
+      )
+    end
+
+    case outcome do
       # `{:ok, applied}` carries the limits actually in force -- the uid, the
       # cgroup's effective `memory.max` and `cpu.max`, the namespace comparisons.
       # A bare `:ok` is accepted too because the substitutable fakes return it,
@@ -470,6 +507,39 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   #
   # Read after `:peer.start_link/1` returns, so the BEAM has booted and is
   # present in the tree; a launch that never got that far has already failed.
+  # The `oom_kill` count on the **parent slice** of `cgroup_path`.
+  #
+  # ⚠️ The parent rather than the scope itself, and that is the whole trick.
+  # systemd removes a transient scope the moment its last process exits, taking
+  # its `memory.events` with it -- so by the time anything notices the sandbox
+  # died, the file recording *why* is gone. Measured: a tight poll never once
+  # read it. The parent slice survives and its counter includes children, so the
+  # cause is recoverable as a delta.
+  def read_parent_oom_kills(nil), do: nil
+
+  def read_parent_oom_kills(cgroup_path) do
+    parent = Path.dirname(Path.join("/sys/fs/cgroup", cgroup_path))
+
+    with {:ok, events} <- File.read(Path.join(parent, "memory.events")),
+         [_, count] <- Regex.run(~r/^oom_kill (\d+)$/m, events) do
+      String.to_integer(count)
+    else
+      _ -> nil
+    end
+  end
+
+  # The sandbox's cgroup scope, read while it still has a `/proc` entry. Returns
+  # `nil` rather than raising: a host without cgroup v2 has no path to record,
+  # and that is an ordinary outcome rather than a failed launch.
+  defp read_cgroup_path(os_pid) do
+    with {:ok, contents} <- File.read("/proc/#{os_pid}/cgroup"),
+         [_, path] <- Regex.run(~r{^0::(.+)$}m, String.trim(contents)) do
+      path
+    else
+      _ -> nil
+    end
+  end
+
   # A `:peer` gen_server outlives its port when the sandbox halts, so liveness of
   # the process says nothing about whether the control channel still exists.
   defp peer_port_open?(peer) do

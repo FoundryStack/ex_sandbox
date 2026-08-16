@@ -38,7 +38,20 @@ defmodule ExSandbox.Mechanism.Beam do
     # What the launch actually needs, rather than the union of everything the
     # hardening module can do: a caller checking capabilities before
     # provisioning should learn the real prerequisites.
-    [:process_isolation, :filesystem_isolation, :memory_limit, :cpu_limit]
+    #
+    # ⚠️ Names from `ExSandbox.Capability.known/0`, not invented ones. These were
+    # `:process_isolation`, `:filesystem_isolation`, `:memory_limit`, and
+    # `:cpu_limit` -- none of which that module recognises, so every caller that
+    # checked them crashed rather than got a report. The conformance suite died
+    # with a `FunctionClauseError` instead of reporting host capability
+    # unavailable, which is the outcome `FR-012b` requires.
+    #
+    # The mapping is not lossy: `:resource_limits` covers the memory and CPU
+    # caps (both come from the same cgroup scope, and a host with one has the
+    # other), `:filesystem_confinement` is the mount namespace, and
+    # `:privilege_separation` is the dropped uid that makes process isolation
+    # mean anything.
+    [:resource_limits, :filesystem_confinement, :privilege_separation]
   end
 
   @impl true
@@ -159,7 +172,7 @@ defmodule ExSandbox.Mechanism.Beam do
   # `halt(1)` are both just a dead process to the parent.
   defp record_exit(id, launched) do
     reason =
-      case oom_kills(launched.os_pid) do
+      case oom_kills(launched) do
         n when is_integer(n) and n > 0 -> :resource_cap
         _ -> :mechanism_error
       end
@@ -167,17 +180,32 @@ defmodule ExSandbox.Mechanism.Beam do
     store(id, Map.put(launched, :exit_reason, reason))
   end
 
-  defp oom_kills(os_pid) do
-    with {:ok, cgroup} <- File.read("/proc/#{os_pid}/cgroup"),
-         [_, path] <- Regex.run(~r{^0::(.+)$}m, cgroup),
-         {:ok, events} <- File.read("/sys/fs/cgroup#{path}/memory.events"),
-         [_, count] <- Regex.run(~r/^oom_kill (\d+)$/m, events) do
-      String.to_integer(count)
+  # ⚠️ A **delta on the parent slice**, measured against a baseline taken at
+  # launch. Three earlier shapes of this were all wrong, each measured:
+  #
+  #   1. Deriving the cgroup from `/proc/<pid>/cgroup` at death. By the time a
+  #      sandbox is observed dead its `/proc` entry is gone, so this always
+  #      failed and every cap breach was reported as `:mechanism_error` -- the
+  #      operator sent to debug the platform for a tenant's memory leak.
+  #   2. Reading the sandbox's own scope. systemd destroys a transient scope the
+  #      instant its last process exits, taking `memory.events` with it. A poll
+  #      as tight as the runtime allows never once caught the file present.
+  #   3. Reading the parent's absolute count. It aggregates every sandbox on the
+  #      host, so any prior OOM anywhere would report this one as a cap breach.
+  #
+  # The delta is specific to this sandbox's lifetime, and the parent slice
+  # outlives the scope. It is still not perfect: a *different* sandbox under the
+  # same slice OOM-ing in the same window would also raise the counter. That
+  # narrows a wrong answer to a genuinely concurrent breach rather than any
+  # historical one, which is the best this cgroup layout allows.
+  defp oom_kills(launched) do
+    baseline = Map.get(launched, :oom_baseline)
+    current = NodeLauncher.read_parent_oom_kills(Map.get(launched, :cgroup_path))
+
+    if is_integer(baseline) and is_integer(current) do
+      current - baseline
     else
-      # The process is already reaped, or this host does not expose cgroup v2.
-      # Either way the cause is unknown, and guessing `:resource_cap` would be
-      # worse than admitting it.
-      _ -> nil
+      nil
     end
   end
 

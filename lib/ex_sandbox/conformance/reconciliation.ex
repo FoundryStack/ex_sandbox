@@ -57,7 +57,7 @@ defmodule ExSandbox.Conformance.Reconciliation do
           # `list_running/0`. This is the post-restart case -- the host was down,
           # the sandbox died, and nothing recorded either fact.
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
           on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
 
@@ -96,7 +96,7 @@ defmodule ExSandbox.Conformance.Reconciliation do
           # recognise makes that decision unmakeable -- and terminating on a
           # guess is worse than leaking.
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
           on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
 
@@ -135,7 +135,7 @@ defmodule ExSandbox.Conformance.Reconciliation do
           # that keeps reporting destroyed sandboxes turns the reconciler into a
           # loop that repeatedly tries to terminate things that are already gone.
           sandbox = build_sandbox()
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           {:ok, started} = ExSandbox.start(@mechanism, provisioned)
 
           :ok = ExSandbox.destroy(@mechanism, started)

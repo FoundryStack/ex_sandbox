@@ -71,7 +71,7 @@ defmodule ExSandbox.Conformance.Isolation do
 
         check "reading another sandbox's filesystem is refused" do
           other = build_sandbox()
-          {:ok, other} = ExSandbox.provision(@mechanism, other)
+          other = provision_or_report(@mechanism, other)
           {:ok, other} = ExSandbox.start(@mechanism, other)
           on_exit(fn -> ExSandbox.destroy(@mechanism, other) end)
 
@@ -109,7 +109,7 @@ defmodule ExSandbox.Conformance.Isolation do
           hostile = "tenant:../../etc/passwd\0 ' OR 1=1"
           sandbox = build_sandbox(owner_ref: hostile)
 
-          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          provisioned = provision_or_report(@mechanism, sandbox)
           on_exit(fn -> ExSandbox.destroy(@mechanism, provisioned) end)
 
           assert_guarantee(

@@ -49,9 +49,32 @@ defmodule ExSandbox.Capability do
   Returns a report; it never raises, because "cannot determine" is a legitimate
   answer that must be *reported* rather than thrown (`FR-012b`).
   """
-  @spec check(name()) :: t()
+  @spec check(name() | atom()) :: t()
   def check(name) when name in @known do
     do_check(name, :os.type())
+  end
+
+  # ⚠️ An unknown name is **reported**, not raised. The docstring above promises
+  # this function never raises because "cannot determine" is a legitimate answer,
+  # and a `FunctionClauseError` here breaks that promise exactly where it matters
+  # most: a mechanism whose `required_capabilities/0` names something this
+  # library has not heard of would crash every caller that tried to check it --
+  # including `ExSandbox.Conformance`, whose whole job is to *report* on hosts
+  # rather than blow up on them. Measured: `Mechanism.Beam` returned
+  # `:process_isolation` and the conformance suite died with a
+  # `FunctionClauseError` instead of reporting anything.
+  #
+  # `available?: false` is the safe direction. An unrecognised capability is one
+  # nothing has verified, and treating it as satisfied is the fail-open shape
+  # this module exists to prevent.
+  def check(name) when is_atom(name) do
+    %__MODULE__{
+      name: name,
+      available?: false,
+      detail:
+        "unknown capability #{inspect(name)}; this library knows #{inspect(@known)}. " <>
+          "A mechanism requiring it must either use a known name or extend this module."
+    }
   end
 
   @doc "Checks every known capability."
