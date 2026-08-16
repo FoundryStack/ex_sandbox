@@ -86,7 +86,7 @@ defmodule ExSandbox.ConformanceExclusionsTest do
       end)
     end
 
-    test "`use ExSandbox.Conformance` accepts only :mechanism and :target_stack" do
+    test "`use ExSandbox.Conformance` accepts only known non-exclusion options" do
       {_path, body} = Enum.find(sources(), fn {path, _} -> path =~ ~r/conformance\.ex$/ end)
 
       read_options =
@@ -95,9 +95,45 @@ defmodule ExSandbox.ConformanceExclusionsTest do
         |> Enum.uniq()
         |> Enum.sort()
 
-      assert read_options == [":mechanism", ":target_stack"],
-             "the suite reads #{inspect(read_options)} from consumer options. Any " <>
-               "option beyond :mechanism and :target_stack risks being an exclusion."
+      # An allowlist rather than a count, and each entry has to earn its place.
+      #
+      # `:credential_probe` supplies a *capability* the library cannot have --
+      # `ex_sandbox` depends on Elixir and OTP alone (`012-FR-001`), so it has
+      # no way to open a database connection and must be handed one. What makes
+      # it not an exclusion is the next test: omitting it reports `host
+      # capability unavailable`, never a pass. A consumer cannot use it to
+      # silence a check they would otherwise fail, which is what `FR-011`
+      # forbids.
+      #
+      # Anything added here needs the same two properties: it must supply
+      # something the library genuinely cannot obtain, and its absence must
+      # report rather than pass.
+      permitted = [":credential_probe", ":mechanism", ":target_stack"]
+
+      assert read_options -- permitted == [],
+             "the suite reads #{inspect(read_options -- permitted)} from consumer " <>
+               "options. Any option beyond #{inspect(permitted)} risks being an exclusion."
+    end
+
+    test "an omitted :credential_probe reports unavailable rather than passing" do
+      # The assertion that keeps `:credential_probe` honest. If its absence let
+      # the credentials group pass, it would be an exclusion wearing a
+      # capability's clothes: a consumer with a broken credential model could
+      # omit the probe and see green.
+      {_path, body} =
+        Enum.find(sources(), fn {path, _} -> path =~ ~r/conformance\/credentials\.ex$/ end)
+
+      assert body =~ ~r/def probe!\(nil\) do/,
+             "credentials.ex must handle a missing probe explicitly"
+
+      [_, nil_clause] = Regex.run(~r/def probe!\(nil\) do(.*?)\n  end/s, body)
+
+      assert nil_clause =~ "capability_unavailable",
+             "a missing credential probe must report the third outcome, not pass. " <>
+               "Found instead: #{nil_clause}"
+
+      refute nil_clause =~ ~r/:ok\b/,
+             "a missing credential probe must not resolve to a pass"
     end
   end
 

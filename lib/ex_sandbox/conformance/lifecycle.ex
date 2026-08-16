@@ -15,6 +15,29 @@ defmodule ExSandbox.Conformance.Lifecycle do
       may already be gone. A destroy that errors on "already gone" makes every
       sweep a source of spurious failures, and the usual response to that is to
       stop running the sweep.
+
+  ## The three checks `003` T018–T020 added
+
+  `012` built this group around the mechanism callbacks. `003` covers the rest
+  of quickstart Scenario 3, and the additions are the steps most easily skipped
+  because none of them is on the happy path:
+
+    * **step 3 — a missing template fails naming the template** (`003-FR-027`).
+      The distinguishable-cause requirement, at the one point where the generic
+      error is most tempting: provisioning fails for many reasons and they all
+      arrive as `{:error, _}`.
+
+    * **step 4 — a mid-provision failure leaves zero orphans** (`003-SC-006`),
+      verified by **enumerating `list_running/0`** rather than by inspecting the
+      cleanup code. `SC-006` is a claim about *unanticipated* failures; a check
+      that trusts the compensation path can only confirm the paths its author
+      thought of, which is the same set the compensation already handles.
+
+    * **step 5 — data survives a stop/start cycle**. A mechanism that
+      reprovisions from the template on `start/1` passes every other check in
+      this group: it starts, it reports `:running`, it appears in
+      `list_running/0`. The only observable difference is that the tenant's data
+      is gone.
   """
 
   @doc "Emits the lifecycle checks into the calling test module."
@@ -193,7 +216,160 @@ defmodule ExSandbox.Conformance.Lifecycle do
               guarantee_failure("003-FR-026", "usage/1 returned #{inspect(other)}")
           end
         end
+
+        check "a missing template fails naming the template, not generically" do
+          # Quickstart Scenario 3 step 3. FR-027 requires the sandbox-specific
+          # causes stay distinguishable; `:template_missing` is the one a caller
+          # can actually act on, because the fix is to name a template that
+          # exists and the error has to say which name did not.
+          missing = "definitely-not-a-real-template-#{System.unique_integer([:positive])}"
+          sandbox = build_sandbox(template_ref: missing)
+
+          case ExSandbox.provision(@mechanism, sandbox) do
+            {:ok, provisioned} ->
+              on_exit(fn -> ExSandbox.destroy(@mechanism, provisioned) end)
+
+              guarantee_failure("003-FR-027", """
+              Provisioning succeeded with a template that does not exist
+              (#{inspect(missing)}).
+
+              A mechanism that invents a template on demand cannot report
+              `:template_missing`, and a caller who typos a template name gets a
+              running sandbox built from something they did not choose.
+              """)
+
+            {:error, reason} ->
+              assert_guarantee(
+                ExSandbox.Conformance.Lifecycle.template_missing?(reason),
+                "003-FR-027",
+                """
+                Provisioning with a nonexistent template failed, but not
+                distinguishably: #{inspect(reason)}
+
+                FR-027 requires `:template_missing` **naming the template**. A
+                generic `{:error, :provision_failed}` satisfies the type and
+                fails the requirement -- the caller cannot tell a typo from a
+                host outage, and those have opposite fixes.
+                """
+              )
+
+            other ->
+              guarantee_failure("003-FR-027", "provision/2 returned #{inspect(other)}")
+          end
+        end
+
+        check "a failed provision leaves no orphan running" do
+          # Quickstart Scenario 3 step 4, and the reason it enumerates rather
+          # than inspects: SC-006 is a claim about failures nobody anticipated.
+          # Reading the compensation code can only confirm it handles the cases
+          # its author thought of, which is exactly the set that is already fine.
+          {:ok, before} = ExSandbox.list_running(@mechanism)
+
+          missing = "orphan-probe-#{System.unique_integer([:positive])}"
+          sandbox = build_sandbox(template_ref: missing)
+
+          result = ExSandbox.provision(@mechanism, sandbox)
+
+          on_exit(fn ->
+            case result do
+              {:ok, s} -> ExSandbox.destroy(@mechanism, s)
+              _ -> :ok
+            end
+          end)
+
+          case result do
+            {:error, _reason} ->
+              {:ok, current} = ExSandbox.list_running(@mechanism)
+              leaked = current -- before
+
+              assert_guarantee(
+                leaked == [],
+                "003-SC-006",
+                """
+                A provision that failed left #{length(leaked)} sandbox(es)
+                running: #{inspect(leaked)}
+
+                Nothing will ever clean these up: the host recorded no sandbox,
+                so they are unattributable, and therefore unbillable and
+                unauditable. This is measured against `list_running/0` rather
+                than against the cleanup code precisely because the cleanup code
+                believes it ran.
+                """
+              )
+
+            {:ok, _} ->
+              # The failure could not be induced through the template, so this
+              # check demonstrated nothing about orphans. Not a pass.
+              capability_unavailable(
+                :provision_failure_injection,
+                "provisioning a nonexistent template succeeded, so no failure " <>
+                  "path could be exercised; the orphan check measured nothing"
+              )
+
+            other ->
+              guarantee_failure("003-SC-006", "provision/2 returned #{inspect(other)}")
+          end
+        end
+
+        check "a stop/start cycle preserves the sandbox rather than rebuilding it" do
+          # Quickstart Scenario 3 step 5. The conformance suite cannot write
+          # into a sandbox's storage without assuming a stack (Principle VI), so
+          # it checks the property that reprovisioning would necessarily break:
+          # `mechanism_ref` identifies *this* sandbox, and a mechanism that
+          # rebuilds from the template on `start/1` has a different one.
+          sandbox = build_sandbox()
+          {:ok, provisioned} = ExSandbox.provision(@mechanism, sandbox)
+          {:ok, started} = ExSandbox.start(@mechanism, provisioned)
+          on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
+
+          {:ok, stopped} = ExSandbox.stop(@mechanism, started)
+          {:ok, restarted} = ExSandbox.start(@mechanism, stopped)
+
+          # Two assertions rather than one conjunction. `nil == nil` is true, so
+          # a mechanism that never sets a ref would pass the equality by having
+          # no identity to change -- but folding the `is_binary` guard into the
+          # comparison would then report that as "the ref changed: nil -> nil",
+          # sending the author looking for a bug that is not the one they have.
+          assert_guarantee(
+            is_binary(started.mechanism_ref),
+            "003-FR-010",
+            "a started sandbox has no `mechanism_ref`, so there is no identity " <>
+              "for a restart to preserve; got " <> inspect(started.mechanism_ref)
+          )
+
+          assert_guarantee(
+            restarted.mechanism_ref == started.mechanism_ref,
+            "003-FR-012",
+            """
+            The sandbox's `mechanism_ref` changed across a stop/start cycle:
+            #{inspect(started.mechanism_ref)} -> #{inspect(restarted.mechanism_ref)}
+
+            A restart must resume the same sandbox, not build a new one from the
+            template. A rebuilding mechanism passes every other check in this
+            group -- it starts, reports `:running`, appears in `list_running/0`
+            -- and the only observable difference is that the tenant's data is
+            gone.
+            """
+          )
+
+          assert_guarantee(
+            ExSandbox.status(@mechanism, restarted) == {:ok, :running},
+            "003-FR-024",
+            "a restarted sandbox must report `:running`; got " <>
+              inspect(ExSandbox.status(@mechanism, restarted))
+          )
+        end
       end
     end
+  end
+
+  @doc false
+  # A refusal counts as distinguishable only if it both carries the
+  # `:template_missing` cause and names the template -- FR-027's two halves. A
+  # bare `:template_missing` tells a caller a template was wrong but not which,
+  # and provisioning takes exactly one template, so omitting it is pure loss.
+  def template_missing?(reason) do
+    flat = inspect(reason)
+    String.contains?(flat, "template_missing") and String.contains?(flat, "-template-")
   end
 end

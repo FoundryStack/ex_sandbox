@@ -66,13 +66,27 @@ defmodule ExSandbox.Conformance do
       @mechanism Keyword.fetch!(opts, :mechanism)
       @target_stack Keyword.get(opts, :target_stack)
 
+      # Optional, and its absence is an *outcome* rather than a skip. A host
+      # with no data store legitimately has no probe; a host that has one and
+      # supplies no probe gets `host capability unavailable` on every check in
+      # the credentials group, which is loud. Neither is an exclusion under
+      # `FR-011` -- the consumer cannot use it to silence a check that would
+      # otherwise fail, because the group reports rather than passes.
+      @credential_probe Keyword.get(opts, :credential_probe)
+
       import ExSandbox.Conformance.Helpers
 
+      require ExSandbox.Conformance.Credentials
       require ExSandbox.Conformance.Isolation
       require ExSandbox.Conformance.Lifecycle
+      require ExSandbox.Conformance.Reachability
+      require ExSandbox.Conformance.Reconciliation
       require ExSandbox.Conformance.ResourceLimits
 
       ExSandbox.Conformance.Lifecycle.tests()
+      ExSandbox.Conformance.Reachability.tests()
+      ExSandbox.Conformance.Reconciliation.tests()
+      ExSandbox.Conformance.Credentials.tests()
       ExSandbox.Conformance.Isolation.tests()
       ExSandbox.Conformance.ResourceLimits.tests()
     end
