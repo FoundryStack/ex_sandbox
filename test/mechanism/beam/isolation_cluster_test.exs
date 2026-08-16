@@ -151,10 +151,41 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
     #
     # A `:peer` node started WITHOUT the hardening wrapper: same OTP, same
     # cookie, same platform, but with a network stack. It must connect.
+    # ⚠️ The platform node must be distributed *before* the peer starts, and this
+    # is not incidental setup -- the assertions below are meaningless without it.
+    #
+    # `mix test` runs undistributed: `Node.self()` is `nonode@nohost` and
+    # `Node.alive?()` is false. The control then asked a peer to connect to a
+    # node that does not exist on any network, which cannot succeed however
+    # healthy the host is. It failed as `{:boot_failed, {:exit_status, 1}}` and
+    # read as "clustering is broken here", i.e. the exact misattribution the
+    # comment below warns about, produced by the control itself.
+    #
+    # `:longnames` with an IP is what works in this container. The short-name
+    # form (`name:` + `host: ~c"127.0.0.1"`) makes `net_kernel` try to set a
+    # short name from an address and abort with `Can't set short node name!`.
+    # Measured, both forms, inside the isolation container.
+    # ⚠️ `epmd` is started explicitly, because nothing else in this container
+    # starts it. Distribution needs the port mapper, and `Node.start/2` reports
+    # its absence as `{:EXIT, :nodistribution}` -- a message that names the
+    # symptom (no distribution) rather than the cause (no epmd), and reads like
+    # a kernel or hostname problem. `erl` normally spawns epmd on demand; this
+    # suite never starts a distributed node any other way, so nothing does.
+    #
+    # Idempotent: a second `-daemon` on a live epmd exits non-zero and is
+    # ignored, so this is safe whether or not one is already running.
+    _ = System.cmd("epmd", ["-daemon"], stderr_to_stdout: true)
+
+    unless Node.alive?() do
+      {:ok, _} = Node.start(:"control_host@127.0.0.1", :longnames)
+      Node.set_cookie(:isolation_control_cookie)
+    end
+
     {:ok, peer, node} =
       :peer.start_link(%{
         name: :"control_#{System.unique_integer([:positive])}",
         host: ~c"127.0.0.1",
+        longnames: true,
         args: [~c"-setcookie", Atom.to_string(Node.get_cookie()) |> String.to_charlist()],
         connection: :standard_io,
         wait_boot: 20_000,
