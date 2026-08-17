@@ -34,7 +34,21 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   end
 
   @typedoc "What a caller needs to address and later reclaim a launched node."
-  @type launched :: %{node: node(), os_pid: integer(), peer: pid(), cookie: atom()}
+  @type launched :: %{
+          node: node(),
+          os_pid: integer(),
+          peer: pid(),
+          cookie: atom(),
+          # ⚠️ The egress binding, carried here because `destroy/1` has no other
+          # route to it. `Binding.release/2` needs the struct, and the struct is
+          # created inside `launch/2` -- so without a field on the row that
+          # outlives this frame, the `/30` and its policy leak silently. See
+          # `ExSandbox.Egress.BindingLifecycleTest` for what that costs.
+          #
+          # `nil` on a host with no egress path, which is the ordinary case on
+          # macOS and the reason `destroy/1` must tolerate its absence.
+          binding: ExSandbox.Egress.Binding.t() | nil
+        }
 
   @doc """
   Launch one hardened sandbox node.
@@ -52,9 +66,211 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          :ok <- prepare_storage(sandbox),
          :ok <- clear_stale_scope(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
-         {:ok, launched} <- start_peer(sandbox, exec),
+         {:ok, exec, binding} <- policed(sandbox, exec),
+         {:ok, launched} <- start_peer_releasing(sandbox, exec, binding),
          :ok <- verify_or_terminate(launched, sandbox) do
-      {:ok, launched}
+      {:ok, Map.put(launched, :binding, binding)}
+    end
+  end
+
+  # Puts the tenant inside a policed namespace, or leaves the command alone.
+  #
+  # ⚠️ **There is no third answer, and in particular no silent fallback.** The
+  # tempting one is: if the egress path cannot be built, launch under
+  # `--unshare-net` anyway, because an empty namespace reaches nothing and no
+  # tenant is exposed. That is precisely the state `contracts/egress.md` names
+  # as worse than failing -- a sandbox that denies everything passes every
+  # denial check in the conformance suite and is recorded as a demonstrated
+  # network boundary, while the tenant's allowlist is not enforced but
+  # *unreachable*, and nothing reports it.
+  #
+  # So the two outcomes are: policed (allowlist enforced), or refused. A host
+  # that can confine but cannot police returns `{:error, :mechanism_error}`
+  # from `LaunchPlan.build/4` rather than a weaker sandbox.
+  #
+  # Hosts with no egress path at all -- macOS, where `--unshare-net` is not in
+  # the command because `Hardening.Linux` never ran -- take the passthrough
+  # clause. That is not a fallback: nothing was confined to begin with, and
+  # `require_hardening/0` above has already refused if confinement was required.
+  defp policed(%Sandbox{} = sandbox, exec) do
+    case egress_allowlist(sandbox) do
+      [] ->
+        # No allowlist means no policy to install. The tenant keeps whatever
+        # confinement `build_command/2` produced -- today `--unshare-net`, which
+        # denies everything. ⚠️ Correct only because it is *also* what the
+        # census reports as the third outcome rather than a pass: `:permitted`
+        # is absent, so `require_permitted_reachable/2` reports
+        # `capability_unavailable` instead of scoring a boundary it never saw.
+        {:ok, exec, nil}
+
+      allowed ->
+        install_policy(exec, allowed)
+    end
+  end
+
+  defp install_policy(exec, allowed) do
+    with {:ok, binding} <- acquire_binding(allowed),
+         {:ok, plan} <- build_plan(binding, exec) do
+      {:ok, plan, binding}
+    end
+  end
+
+  defp acquire_binding(allowed) do
+    case ExSandbox.Egress.Binding.acquire(allowed) do
+      {:ok, binding} ->
+        {:ok, binding}
+
+      {:error, reason} ->
+        # ⚠️ Refused, not downgraded. `:pool_exhausted` means this host cannot
+        # give the tenant a policy -- and a tenant who cannot be given a policy
+        # must not be given a sandbox that reaches everything instead, nor one
+        # that reaches nothing while the census calls it policed.
+        Logger.error("""
+        sandbox launch refused: no egress binding available (#{inspect(reason)}).
+
+        Launching without one would produce a sandbox whose allowlist is not
+        enforced. Refusing is the only outcome that cannot be mistaken for a
+        working boundary.
+        """)
+
+        {:error, :mechanism_error}
+    end
+  end
+
+  # ⚠️ `exec` is `{prog, args}` -- what `Hardening.Linux.compose/3` returns and
+  # what `:peer` needs -- while `LaunchPlan.build/4` works on a flat command
+  # list, because the flag it removes and the prefix it adds can appear at any
+  # position. So the tuple is flattened on the way in and reassembled on the way
+  # out, with the plan's own head becoming the new program.
+  #
+  # The reassembly matters: the plan prefixes `ip netns exec <name>`, so the
+  # program `:peer` spawns is now `ip`, not `systemd-run`. Rebuilding the tuple
+  # from `plan.tenant_command` rather than keeping the original `prog` is what
+  # makes that true -- keeping it would exec `systemd-run` with `ip`'s arguments.
+  defp build_plan(binding, {prog, args}) do
+    flat = [prog | args]
+
+    case ExSandbox.Egress.LaunchPlan.build(binding.source_key, pool_port(), flat) do
+      {:ok, plan} ->
+        # ⚠️ The plan is *ordered work*, not just a rewritten command, and using
+        # only `tenant_command` is a defect that compiles and reads as finished:
+        # the namespace `ip netns exec` names would never have been created, so
+        # every launch would fail with "Cannot open network namespace" -- on
+        # Linux only, after the macOS suite went green.
+        with :ok <- run_setup(plan) do
+          {:ok, exec_from_plan(plan)}
+        end
+
+      {:error, reason} ->
+        # The binding is already held at this point, so it has to go back before
+        # this returns -- otherwise a host that consistently fails to build a
+        # plan burns one /30 per attempt until the pool is empty, and reports
+        # `:pool_exhausted` for a cause that has nothing to do with capacity.
+        :ok = ExSandbox.Egress.Binding.release(binding)
+
+        Logger.error("""
+        sandbox launch refused: could not build the egress path (#{inspect(reason)}).
+
+        `:no_network_confinement` means the hardening command did not confine
+        the network, so there is nothing to convert -- rewriting it would launch
+        a tenant with the host's own network. `:no_pool_port` means the acceptor
+        pool is not listening, so the redirect would point at a dead port, which
+        from inside the sandbox is indistinguishable from a correctly denied
+        destination.
+        """)
+
+        {:error, :mechanism_error}
+    end
+  end
+
+  # Runs the namespace setup, then pasta, in the order the plan gives them.
+  #
+  # ⚠️ Order is the whole content of the plan (`LaunchPlan`'s moduledoc says so
+  # explicitly): the namespace must exist before anything runs inside it, and
+  # pasta must be attached before the tenant joins. A runner that ran these
+  # concurrently, or sorted them, would produce the same commands and a
+  # namespace with no route -- which denies everything and passes every denial
+  # check.
+  defp run_setup(plan) do
+    with :ok <- run_steps(plan.setup_steps) do
+      run_steps([plan.pasta_command])
+    end
+  end
+
+  defp run_steps(steps) do
+    Enum.reduce_while(steps, :ok, fn [prog | args], :ok ->
+      case System.cmd(prog, args, stderr_to_stdout: true) do
+        {_out, 0} ->
+          {:cont, :ok}
+
+        {out, code} ->
+          # Named rather than swallowed. A failed setup step means the sandbox
+          # cannot be policed, and the tenant must not launch -- but an operator
+          # needs the command and its output, because the causes (missing
+          # `/dev/net/tun`, no `CAP_SYS_ADMIN`, a stale namespace of the same
+          # name) are host facts this library cannot fix and can only report.
+          Logger.error("""
+          egress setup step failed (exit #{code}): #{Enum.join([prog | args], " ")}
+
+          #{String.trim(out)}
+          """)
+
+          {:halt, {:error, :mechanism_error}}
+      end
+    end)
+  end
+
+  # The pool the redirect points at. Read from the running pool rather than
+  # configured: a configured port answers about a listener that may not exist.
+  defp pool_port do
+    ExSandbox.Egress.Pool.port()
+  catch
+    :exit, _ -> 0
+  end
+
+  @doc """
+  The allowlist a sandbox was provisioned with, or `[]`.
+
+  Public because it is a *decision* -- whether this sandbox gets a policy at
+  all -- and `launch/2` cannot run on any host that is not Linux. Left private,
+  the rule would be verifiable only where the whole launch works, which is the
+  arrangement that let the earlier context-discard defect survive: the
+  allowlist was parsed correctly, then dropped, and every test asserted on the
+  parse.
+  """
+  @spec egress_allowlist(Sandbox.t()) :: [ExSandbox.Egress.Policy.destination()]
+  def egress_allowlist(%Sandbox{context: context}) when is_map(context) do
+    context |> Map.get(:network_allowlist, []) |> List.wrap()
+  end
+
+  def egress_allowlist(_sandbox), do: []
+
+  @doc """
+  Rebuilds `{prog, args}` from a plan's `tenant_command`.
+
+  ⚠️ Public for the same reason, and it guards a specific mistake: the plan
+  prefixes `ip netns exec <name>`, so the program to spawn becomes `ip` rather
+  than `systemd-run`. Keeping the original `prog` and taking only the plan's
+  arguments produces a command that looks right in a log line and execs the
+  wrong binary.
+  """
+  @spec exec_from_plan(ExSandbox.Egress.LaunchPlan.t()) :: {String.t(), [String.t()]}
+  def exec_from_plan(%ExSandbox.Egress.LaunchPlan{tenant_command: [prog | args]}) do
+    {prog, args}
+  end
+
+  # ⚠️ A binding acquired but never launched is a leak, and the failure that
+  # produces it -- `start_peer/2` refusing -- is the ordinary one, not the rare
+  # one: a missing image, a bad exec, a host out of memory. Releasing here keeps
+  # the pool's occupancy tied to sandboxes that actually exist.
+  defp start_peer_releasing(sandbox, exec, binding) do
+    case start_peer(sandbox, exec) do
+      {:ok, launched} ->
+        {:ok, launched}
+
+      {:error, reason} ->
+        if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
+        {:error, reason}
     end
   end
 

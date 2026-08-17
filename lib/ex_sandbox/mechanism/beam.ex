@@ -222,6 +222,18 @@ defmodule ExSandbox.Mechanism.Beam do
         # but its row must still go. Destroy is the only operation that forgets,
         # which is what keeps `stop` recoverable and `destroy` final.
         if launched[:peer], do: NodeLauncher.terminate(launched.peer)
+
+        # ⚠️ After the peer is terminated, and unconditionally. Releasing before
+        # the tenant is dead would hand the /30 and its policy to the next
+        # sandbox while this one is still running on it -- the reuse crossing
+        # `003-FR-002` forbids, arriving through the reclaim path rather than
+        # through the allocator.
+        #
+        # `nil` for a sandbox launched with no allowlist, and for every sandbox
+        # on a host with no egress path, so the absence is ordinary rather than
+        # exceptional. `Binding.release/2` is itself idempotent (`003-FR-013`),
+        # which is what makes a second destroy safe.
+        if launched[:binding], do: :ok = ExSandbox.Egress.Binding.release(launched.binding)
         # The key the row was found under -- see `stop/1`. Forgetting
         # `sandbox.id` for a ref-resolved struct would terminate the node and
         # leave its row behind, which reconciliation would then see as an orphan
