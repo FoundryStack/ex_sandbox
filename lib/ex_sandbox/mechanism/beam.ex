@@ -504,12 +504,86 @@ defmodule ExSandbox.Mechanism.Beam do
     # suite probe something other than this sandbox.
     host_context = if is_map(sandbox.context), do: sandbox.context, else: %{}
 
-    Map.merge(host_context, %{
+    published = %{
+      # ⚠️ A string, and deliberately **not** the `{host, port}` tuple the
+      # network group pattern-matches on (005 T060a4).
+      #
+      # `Conformance.Reachability.addressed?/1` accepts any non-empty value and
+      # `Conformance.Network.sandbox_address/2` matches only `{host, port}`, so
+      # the census reports "carries no `:address`" for a mechanism that does
+      # publish one. That mismatch is real, and the obvious fix -- make it a
+      # tuple -- is a **false pass**:
+      #
+      #   1. `sandbox_address/2` matches and returns `{:ok, {"peer", id}}`,
+      #   2. the group hands both halves to `connect_from_sandbox/3`,
+      #   3. `:gen_tcp.connect(~c"peer", id, ...)` fails to resolve them,
+      #   4. the clause returns `:refused`,
+      #   5. `:refused` is scored as **the boundary holding**.
+      #
+      # `003-FR-002` would read as demonstrated against a mechanism that never
+      # attempted a crossing. The honest tuple is the sandbox's own listener,
+      # which does not exist until the netns install gives it one (T060a3b).
+      # Until then the string keeps `FR-022` satisfied while the network group
+      # reports the third outcome -- which is the true state.
       address: "peer:" <> sandbox.id,
       exec: fn command -> exec_in_sandbox(sandbox, command) end,
       connect: fn host, port -> connect_from_sandbox(sandbox, host, port) end
-    })
+    }
+
+    host_context
+    |> Map.merge(published)
+    |> put_permitted()
   end
+
+  # ⚠️ `:permitted` is published **only when the tenant's allowlist names a
+  # destination that can actually be dialled**, and its absence is deliberate
+  # (005 T060a4, `FR-011a`).
+  #
+  # The network group probes this destination and expects it to *succeed*. Three
+  # ways to get that wrong, all of which report a failure against a mechanism
+  # that did nothing wrong:
+  #
+  #   1. publishing a placeholder when the allowlist is empty -- the probe dials
+  #      something that was never permitted and scores its failure as a boundary
+  #      that is too tight,
+  #   2. publishing an `:any_port` entry verbatim -- it matches the suite's
+  #      `{host, port}` pattern, so the check proceeds and hands `:any_port` to
+  #      `:gen_tcp.connect/4`, which cannot dial it,
+  #   3. publishing the first entry regardless of shape -- same as (2), but only
+  #      for allowlists that happen to begin with a wildcard, which is the
+  #      version that passes in testing and fails for one tenant in production.
+  #
+  # When nothing dialable is listed the key is left out, and the group reports
+  # `:no_allowlist` -- the third outcome, visible in the census as a gap rather
+  # than counted as a demonstrated guarantee.
+  #
+  # ⚠️ `:permitted` is **derived here or absent**, never taken from the caller.
+  # `Map.delete/2` before the derivation is what enforces that, and it closes the
+  # same provenance hole 673373b closed for `:address` and `:connect` -- in the
+  # one field that fix did not cover.
+  #
+  # Measured: a host passing `permitted: {"evil.example.com", 443}` alongside an
+  # **empty** allowlist had it published verbatim. The network group would dial
+  # that destination and score the result as `FR-011a` evidence -- a check
+  # reporting on a destination this mechanism never authorized, supplied by the
+  # party the check exists to constrain.
+  #
+  # Found by a surviving sabotage, not by a failing test: reordering the merge
+  # so the host could win was invisible, because `published` carries no
+  # `:permitted` for the merge to protect.
+  defp put_permitted(context) do
+    context
+    |> Map.get(:network_allowlist, [])
+    |> List.wrap()
+    |> Enum.find(&dialable?/1)
+    |> case do
+      nil -> Map.delete(context, :permitted)
+      destination -> Map.put(context, :permitted, destination)
+    end
+  end
+
+  defp dialable?({host, port}) when is_binary(host) and is_integer(port), do: true
+  defp dialable?(_), do: false
 
   # ⚠️ A native connect probe, because the shell one cannot work here (005
   # T060b/T060d).
