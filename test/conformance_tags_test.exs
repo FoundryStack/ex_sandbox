@@ -19,7 +19,15 @@ defmodule ExSandbox.ConformanceTagsTest do
   # Every group quickstart offers a `--only conformance:<group>` invocation for
   # and which is implemented today. `emission` is documented but deferred with
   # FR-017, so it is deliberately absent.
-  @groups [:lifecycle, :reachability, :reconciliation, :credentials, :isolation, :resource_limits]
+  @groups [
+    :lifecycle,
+    :reachability,
+    :reconciliation,
+    :credentials,
+    :isolation,
+    :network,
+    :resource_limits
+  ]
 
   # Read from source rather than by compiling a suite.
   #

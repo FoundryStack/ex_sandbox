@@ -1,0 +1,538 @@
+defmodule ExSandbox.Conformance.Network do
+  @moduledoc """
+  Conformance group: network confinement (005 T060b, T060d; `003-FR-002`,
+  `005-FR-003`, `005-FR-011a`–`FR-011d`).
+
+  ## Why this group did not exist, and what its absence cost
+
+  `003-FR-002` says no sandbox may observe or connect to another. Until this
+  group, the published contract did not check it. The only network assertion in
+  the repository lived in `test/mechanism/beam/isolation_cluster_test.exs` — a
+  **mechanism-private** test, shipped with `ex_sandbox`'s own suite rather than
+  with the contract a third party runs.
+
+  So a third-party mechanism could implement `ExSandbox.Mechanism`, pass the
+  entire published suite, and provide no network isolation whatsoever.
+  `012-FR-010`'s promise that the suite is "usable by any mechanism
+  implementation" was true of the code and not of the guarantee.
+
+  ## Both directions, because denial alone is not a policy
+
+  The first version of this group would have checked one thing: that a sandbox
+  cannot reach what it must not. That check is passed perfectly by a mechanism
+  that permits **nothing** — no DNS, no API calls, no webhooks out — which is
+  what `--unshare-net` gives today and is not what a tenant application can run
+  under (`005-FR-011a`).
+
+  A denial-only suite therefore rewards the wrong mechanism: it scores a
+  sandbox that cannot work at all above one that implements a real allowlist,
+  because the second has to get the permitted half right and the first has no
+  permitted half to get wrong. `FR-011d` requires both directions for this
+  reason, and the checks below come in pairs.
+
+  ⚠️ The permitted-direction check reports **capability unavailable**, not
+  failure, when the mechanism declares no allowlist. A mechanism that denies
+  everything is at an earlier point on the road, not in violation — but it must
+  not be able to collect a green tick for the half it never implemented.
+
+  ## The transport must not be the subject
+
+  Every check reaches into the sandbox through `context.exec`, never through
+  distribution. Asking "can this sandbox reach the platform?" over `:erpc`
+  cannot answer: a refused connection and an unreachable sandbox are both
+  `:noconnection`, so the suite cannot tell the boundary holding from the test
+  never running.
+
+  This is not hypothetical tidiness. It is the measured failure that
+  `isolation_cluster_test.exs` documents at length, and it is why that file
+  reaches its sandbox over stdio.
+  """
+
+  # Seconds. Long enough that a permitted destination on a loaded host still
+  # answers, short enough that three denied destinations do not read as a hang.
+  @probe_timeout_s 3
+
+  # Milliseconds. Bounds the whole exec, including a `context.exec` that never
+  # returns. Comfortably above @probe_timeout_s so a probe that *does* honour
+  # its own bound reports its own result rather than being killed first.
+  @exec_timeout_ms 15_000
+
+  @doc "Emits the network checks into the calling test module."
+  defmacro tests do
+    quote do
+      require ExSandbox.Conformance.Group
+      import ExSandbox.Conformance.Group, only: [check: 2]
+
+      describe "network confinement (003-FR-002, 005-FR-011a-d)" do
+        @describetag conformance: :network
+
+        ExSandbox.Conformance.Group.guarded_setup do
+          sandbox = build_sandbox()
+
+          case ExSandbox.provision(@mechanism, sandbox) do
+            {:ok, provisioned} ->
+              {:ok, started} = ExSandbox.start(@mechanism, provisioned)
+              on_exit(fn -> ExSandbox.destroy(@mechanism, started) end)
+              %{sandbox: started}
+
+            {:error, {:capability_unavailable, [missing | _]}} ->
+              capability_unavailable(missing.name, missing.detail)
+
+            other ->
+              guarantee_failure("003-FR-010", "could not provision: #{inspect(other)}")
+          end
+        end
+
+        # -- The denied direction ------------------------------------------
+
+        check "reaching another sandbox over the network is refused" do
+          other = build_sandbox()
+          other = provision_or_report(@mechanism, other)
+          {:ok, other} = ExSandbox.start(@mechanism, other)
+          on_exit(fn -> ExSandbox.destroy(@mechanism, other) end)
+
+          require_refused("003-FR-002", fn ->
+            ExSandbox.Conformance.Network.attempt_reach_sandbox(
+              @mechanism,
+              var!(context).sandbox,
+              other
+            )
+          end)
+        end
+
+        check "reaching the platform's own listening port is refused" do
+          # The platform is the highest-value target on the host: it holds the
+          # credentials every sandbox is denied, and it is reachable by address
+          # without discovery. A sandbox that can open a socket to it has
+          # defeated the boundary regardless of what it does next.
+          require_refused("003-FR-002", fn ->
+            ExSandbox.Conformance.Network.attempt_reach_platform(
+              @mechanism,
+              var!(context).sandbox
+            )
+          end)
+        end
+
+        check "a destination outside the environment's allowlist is refused" do
+          # ⚠️ The address is chosen to be routable-but-denied, not
+          # unroutable. Probing a black-hole address passes against a mechanism
+          # with no policy at all, because the connection fails for reasons
+          # having nothing to do with confinement -- the same shape as asserting
+          # a leak was not observed by never looking.
+          require_refused("005-FR-011c", fn ->
+            ExSandbox.Conformance.Network.attempt_reach_denied_host(
+              @mechanism,
+              var!(context).sandbox
+            )
+          end)
+        end
+
+        # -- The permitted direction ---------------------------------------
+
+        check "a destination inside the environment's allowlist is reachable" do
+          # The half a denial-only mechanism cannot pass, and must not be able
+          # to skip quietly. `FR-011a`: a sandbox that cannot reach its
+          # permitted destinations cannot run a tenant application, so a
+          # mechanism confining by denying everything has not finished.
+          ExSandbox.Conformance.Network.require_permitted_reachable(
+            @mechanism,
+            var!(context).sandbox
+          )
+        end
+
+        check "the allowlist cannot be widened from inside the sandbox" do
+          # `FR-011b`. An allowlist a sandbox can edit is not an allowlist, and
+          # this is the check that distinguishes a policy enforced *around* the
+          # sandbox from one merely configured *in* it. A mechanism that stores
+          # its policy inside the confined filesystem passes every other check
+          # in this group and fails this one.
+          require_refused("005-FR-011b", fn ->
+            ExSandbox.Conformance.Network.attempt_widen_allowlist(
+              @mechanism,
+              var!(context).sandbox
+            )
+          end)
+        end
+      end
+    end
+  end
+
+  # -- Attempts ---------------------------------------------------------------
+  #
+  # Each returns `{:refused, evidence}` or `{:succeeded, evidence}`, the shape
+  # `require_refused/2` reads. Anything else routes to its inconclusive clause,
+  # which fails -- never to a pass.
+
+  @doc """
+  Attempts to open a TCP connection from one sandbox to another.
+
+  ⚠️ Addressed by **IP and port**, not by node name. An undistributed sandbox
+  has no node name, so a name-based attempt fails for a reason that has nothing
+  to do with the network boundary and reports a pass either way.
+  """
+  def attempt_reach_sandbox(mechanism, sandbox, other) do
+    case sandbox_address(mechanism, other) do
+      {:ok, {host, port}} ->
+        probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}")
+
+      :unknown ->
+        # ⚠️ Not `{:refused, _}`. A mechanism that exposes no address for its
+        # sandboxes would otherwise pass this check by being unaddressable,
+        # which is indistinguishable from having no boundary at all. This shape
+        # falls through to `require_refused/2`'s inconclusive clause.
+        {:no_address,
+         "this mechanism's sandbox `context` carries no `:address` -- " <>
+           "`{host, port}` the sandbox listens on -- so one sandbox cannot " <>
+           "attempt to reach another, and 003-FR-002 cannot be established by " <>
+           "declining to try. Populate `context.address`."}
+    end
+  end
+
+  @doc "Attempts to reach the platform node's own listening socket."
+  def attempt_reach_platform(mechanism, sandbox) do
+    case platform_listener() do
+      {:ok, {host, port}} ->
+        probe_connect(mechanism, sandbox, host, port, "the platform")
+
+      :unknown ->
+        {:no_listener,
+         "the platform has no listening socket to attempt, so this check " <>
+           "cannot establish 003-FR-002 on this host"}
+    end
+  end
+
+  @doc """
+  Attempts to reach a destination the environment does not permit.
+
+  Uses a documentation-reserved address that is **routable** (RFC 5737
+  TEST-NET-1) rather than a black hole, so a connection failure is evidence of
+  policy rather than of the address being unreachable for everyone.
+  """
+  def attempt_reach_denied_host(mechanism, sandbox) do
+    probe_connect(mechanism, sandbox, "203.0.113.1", 443, "a denied destination")
+  end
+
+  @doc """
+  Requires that a permitted destination is actually reachable (`FR-011a`,
+  `FR-011d`).
+
+  ⚠️ Reports **capability unavailable** rather than failure when the mechanism
+  declares no allowlist. A mechanism that denies everything has not violated
+  `FR-011a` so much as not reached it — but the distinction has to be visible,
+  because a silent skip here is what lets a deny-everything mechanism collect a
+  full green suite while being unable to run any tenant application.
+  """
+  def require_permitted_reachable(mechanism, sandbox) do
+    case permitted_destination(mechanism, sandbox) do
+      {:ok, {host, port}} ->
+        case probe_connect(mechanism, sandbox, host, port, "a permitted destination") do
+          {:succeeded, _evidence} ->
+            :ok
+
+          {:refused, evidence} ->
+            ExSandbox.Conformance.Helpers.guarantee_failure("005-FR-011a", """
+            A destination the environment PERMITS was not reachable from inside
+            the sandbox.
+
+            Evidence: #{inspect(evidence)}
+
+            Confinement that denies the permitted half is not confinement, it is
+            an outage. `FR-011a` requires the allowlist to be an allowlist: a
+            sandbox must be able to reach what its environment declares, or it
+            cannot serve a webhook, call an API, or resolve a name.
+            """)
+
+          other ->
+            ExSandbox.Conformance.Helpers.guarantee_failure("005-FR-011a", """
+            Reaching a permitted destination neither succeeded nor was refused:
+            #{inspect(other)}
+            """)
+        end
+
+      :no_allowlist ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          this mechanism declares no permitted destinations, so the permitted
+          half of `FR-011d` cannot be demonstrated.
+
+          This is the third outcome and not a pass. A mechanism that denies all
+          egress passes every denial check in this group trivially -- it has no
+          permitted half to get wrong -- and a suite that stayed silent here
+          would rank it above a mechanism implementing a real allowlist.
+
+          Populate `context.permitted` with `{host, port}` the environment
+          permits (005-FR-011a).
+          """
+        )
+    end
+  end
+
+  @doc """
+  Attempts to widen the environment's own allowlist from inside the sandbox
+  (`FR-011b`).
+
+  The hostile act is reconfiguration, not connection: tenant code that can edit
+  the policy does not need to defeat it.
+
+  Requires the mechanism to declare `context.policy_handle`. Without it the
+  check reports the third outcome rather than guessing — see the implementation
+  for the two guesses that passed against a mechanism with no policy at all.
+  """
+  def attempt_widen_allowlist(mechanism, sandbox) do
+    # ⚠️ This check asks the mechanism where its policy lives, and reports the
+    # third outcome when it does not say. Two earlier versions guessed, and both
+    # **passed against `PorousMechanism`** -- a mechanism that runs every command
+    # in the host's own unconfined shell and has no policy at all:
+    #
+    #   1. Reading `/proc/self/net/route` and treating an empty result as "no
+    #      egress path to redirect". On macOS the file does not exist, `wc -l`
+    #      printed 0, and the absence of a Linux procfs entry scored as a
+    #      boundary holding.
+    #   2. Running `ip`/`iptables`/`route` and treating a non-zero exit as a
+    #      denial. On macOS `route add` exists and fails for lack of root, so a
+    #      **permission error** scored as a boundary holding.
+    #
+    # Both are the same mistake in different clothes: inferring confinement from
+    # a failure that confinement did not cause. There is no host-neutral way to
+    # tell "the policy is out of reach" from "this shell could not run the tool"
+    # without knowing what the policy *is*, so the suite stops guessing and asks.
+    #
+    # A mechanism that answers gets a real check. One that does not gets the
+    # third outcome -- honest, visible in the census, and impossible to mistake
+    # for a demonstrated guarantee.
+    case policy_handle(mechanism, sandbox) do
+      {:ok, handle} ->
+        attempt_policy_write(mechanism, sandbox, handle)
+
+      :undeclared ->
+        {:no_policy_handle,
+         "this mechanism's sandbox `context` carries no `:policy_handle` -- a " <>
+           "path or command naming where the egress allowlist is enforced -- so " <>
+           "`FR-011b` cannot be checked. It is not enough for the widening to " <>
+           "fail: on a host without root, every attempt fails for reasons having " <>
+           "nothing to do with the boundary, and a check that accepted that " <>
+           "would pass against a mechanism with no policy at all. Populate " <>
+           "`context.policy_handle` with the path the mechanism's allowlist is " <>
+           "read from."}
+    end
+  end
+
+  defp policy_handle(_mechanism, %{context: %{policy_handle: handle}}) when is_binary(handle),
+    do: {:ok, handle}
+
+  defp policy_handle(_mechanism, _sandbox), do: :undeclared
+
+  # The act: append to the mechanism's own policy from inside the sandbox. A
+  # policy enforced *around* the sandbox is not writable from within it; one
+  # merely configured *in* it is.
+  #
+  # ⚠️ `test -e` first, and its absence is a **refusal** here rather than
+  # inconclusive -- unlike the guesses above, this is the mechanism's own
+  # declared path, so "not present inside the sandbox" is a real answer about a
+  # real thing rather than an inference from a missing host file.
+  defp attempt_policy_write(mechanism, sandbox, handle) do
+    command = """
+    if [ ! -e '#{handle}' ]; then
+      echo ABSENT
+    elif echo '203.0.113.0/24' >> '#{handle}' 2>/dev/null; then
+      echo WIDENED
+    else
+      echo DENIED
+    fi
+    """
+
+    case bounded_exec(mechanism, sandbox, command) do
+      {:no_runner, _} = no_runner ->
+        no_runner
+
+      :probe_timeout ->
+        {:probe_timed_out, "the allowlist-widening attempt did not finish in time"}
+
+      {:ok, output} ->
+        cond do
+          String.contains?(output, "WIDENED") ->
+            {:succeeded,
+             "tenant code appended to #{handle} from inside the sandbox; " <>
+               "the egress policy is editable by its subject"}
+
+          String.contains?(output, "ABSENT") ->
+            {:refused, {:policy_not_visible, handle}}
+
+          String.contains?(output, "DENIED") ->
+            {:refused, {:policy_not_writable, handle}}
+
+          true ->
+            {:no_probe, "the widening attempt produced no verdict: #{inspect(output)}"}
+        end
+
+      {:error, reason} ->
+        {:refused, reason}
+    end
+  end
+
+  # -- Probing ----------------------------------------------------------------
+
+  # ⚠️ The probe runs **inside** the sandbox and reports its own result, rather
+  # than the host observing a connection. A host-side observation cannot
+  # distinguish "the sandbox was stopped" from "the sandbox never tried".
+  #
+  # Plain shell, no interpreter assumed: a mechanism's sandbox may carry no
+  # Erlang, no Python, and no `nc`.
+  #
+  # ⚠️ Three verdicts, not two, and `TIMEDOUT` is the one that took two attempts
+  # to get right.
+  #
+  # `nc -z -w N` bounds the *read*, not the connect: against a filtered address
+  # on macOS it blocks indefinitely and takes `System.cmd/3` with it. Measured --
+  # one denied-destination check ran past ExUnit's 60s test timeout and the whole
+  # suite read as a deadlock. So the attempt is wrapped in `timeout` wherever
+  # that exists, and exit 124 -- its documented timed-out status -- is reported
+  # as `TIMEDOUT` rather than collapsed into `REFUSED`.
+  #
+  # That distinction is what lets a **drop** count as a refusal (the probe ran
+  # and observed no answer within its own bound) while a **hang** stays
+  # inconclusive (nothing was observed at all). Without it the suite rewards a
+  # `REJECT` policy, which advertises the boundary's existence, over a `DROP`
+  # policy, which does not.
+  defp probe_connect(mechanism, sandbox, host, port, description) do
+    attempt =
+      "if command -v nc >/dev/null 2>&1; then " <>
+        "nc -z -w #{@probe_timeout_s} #{host} #{port}; " <>
+        "else exec 3<>/dev/tcp/#{host}/#{port}; fi"
+
+    command = """
+    if ! command -v nc >/dev/null 2>&1 && [ -z "$BASH_VERSION" ]; then
+      echo NOPROBE
+    else
+      if command -v timeout >/dev/null 2>&1; then
+        timeout #{@probe_timeout_s} sh -c '#{attempt}' >/dev/null 2>&1
+      else
+        sh -c '#{attempt}' >/dev/null 2>&1
+      fi
+      case "$?" in
+        0)   echo CONNECTED ;;
+        124) echo TIMEDOUT ;;
+        *)   echo REFUSED ;;
+      esac
+    fi
+    """
+
+    case bounded_exec(mechanism, sandbox, command) do
+      {:no_runner, _} = no_runner ->
+        no_runner
+
+      :probe_timeout ->
+        # ⚠️ The outer bound means the probe never reported at all, which is
+        # different from the probe reporting that it timed out. Reaching here,
+        # nothing about the boundary was observed -- inconclusive, which
+        # `require_refused/2` fails.
+        {:probe_timed_out,
+         "the connection attempt to #{description} (#{host}:#{port}) produced no " <>
+           "result within #{@exec_timeout_ms}ms -- not even a timeout verdict from " <>
+           "the probe itself, so nothing about the boundary was observed."}
+
+      {:ok, output} ->
+        cond do
+          String.contains?(output, "CONNECTED") ->
+            {:succeeded, "the sandbox opened a connection to #{description} (#{host}:#{port})"}
+
+          String.contains?(output, "REFUSED") ->
+            {:refused, {description, host, port}}
+
+          # A probe that ran and got no answer within its own bound: what a DROP
+          # policy looks like from inside.
+          String.contains?(output, "TIMEDOUT") ->
+            {:refused, {:no_answer_within_bound, description, host, port}}
+
+          true ->
+            # ⚠️ Deliberately neither. A sandbox with no way to attempt a
+            # connection has demonstrated nothing, and returning `{:refused, _}`
+            # here would score "we could not try" as "the boundary held" -- the
+            # precise substitution `require_refused/2` exists to prevent.
+            {:no_probe,
+             "no connection probe is available inside this sandbox " <>
+               "(neither `nc` nor a shell with /dev/tcp), so reaching " <>
+               "#{description} was never attempted"}
+        end
+
+      {:error, reason} ->
+        {:refused, reason}
+    end
+  end
+
+
+  # -- What the mechanism has to tell us --------------------------------------
+
+  defp sandbox_address(_mechanism, %{context: %{address: {host, port}}}), do: {:ok, {host, port}}
+  defp sandbox_address(_mechanism, _sandbox), do: :unknown
+
+  defp permitted_destination(_mechanism, %{context: %{permitted: {host, port}}}),
+    do: {:ok, {host, port}}
+
+  defp permitted_destination(_mechanism, _sandbox), do: :no_allowlist
+
+  # The platform's own listener, if it has one. Read from the running system
+  # rather than assumed: a hardcoded port answers about a socket that may not
+  # exist, and a failed connection to nothing looks exactly like a boundary.
+  defp platform_listener do
+    case :inet.getaddr(~c"127.0.0.1", :inet) do
+      {:ok, _} ->
+        case :erlang.ports() |> Enum.find_value(&listening_port/1) do
+          nil -> :unknown
+          port -> {:ok, {"127.0.0.1", port}}
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
+  defp listening_port(port) do
+    case :inet.port(port) do
+      {:ok, n} when is_integer(n) and n > 0 -> n
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  # ⚠️ The timeout lives **here**, not in the shell command, and the first
+  # version of this got that wrong.
+  #
+  # `nc -z -w 3` bounds the *read* phase, not the connect: against a filtered
+  # address on macOS it blocks indefinitely, and `System.cmd/3` blocks with it.
+  # Measured -- a single denied-destination check ran past ExUnit's 60s test
+  # timeout and the whole suite read as a deadlock.
+  #
+  # A mechanism's `context.exec` is supplied by the mechanism and carries no
+  # timeout guarantee, so the suite cannot delegate the bound to it. Running it
+  # in a task the suite can abandon is the only place the bound holds for every
+  # mechanism.
+  defp bounded_exec(mechanism, sandbox, command) do
+    task = Task.async(fn -> exec(mechanism, sandbox, command) end)
+
+    case Task.yield(task, @exec_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      _ -> :probe_timeout
+    end
+  end
+
+  # Same contract as the isolation group's: a mechanism reaches its sandbox
+  # through `context.exec`, and having none is inconclusive rather than a pass.
+  defp exec(_mechanism, %{context: %{exec: exec}}, command) when is_function(exec, 1) do
+    exec.(command)
+  end
+
+  defp exec(_mechanism, _sandbox, _command) do
+    {:no_runner,
+     "this mechanism's sandbox `context` carries no `:exec` function, so no " <>
+       "network act can be attempted from inside the sandbox -- and a network " <>
+       "boundary is established by attempting to cross it, never by declining " <>
+       "to. Populate `context.exec` with a 1-arity function running a shell " <>
+       "command inside the sandbox and returning `{:ok, output}` or " <>
+       "`{:error, reason}`."}
+  end
+end

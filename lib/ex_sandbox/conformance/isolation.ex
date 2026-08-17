@@ -89,10 +89,9 @@ defmodule ExSandbox.Conformance.Isolation do
         end
 
         check "halting the host from inside the sandbox is refused" do
-          # If this one ever succeeds the suite does not report it, because the
-          # runner is gone -- which is itself the strongest possible signal. It
-          # is checked anyway: a mechanism that refuses the attempt outright is
-          # meaningfully different from one that would have obliged.
+          # ⚠️ Probes deliverability rather than delivering. Actually killing
+          # the platform would prove the point and destroy the report that
+          # makes the point useful.
           require_refused("003-FR-006", fn ->
             ExSandbox.Conformance.Isolation.attempt_self_halt(@mechanism, var!(context).sandbox)
           end)
@@ -176,18 +175,55 @@ defmodule ExSandbox.Conformance.Isolation do
     end
   end
 
-  @doc "Attempts to bring down the host from inside the sandbox."
+  @doc """
+  Attempts to bring down the host from inside the sandbox.
+
+  ⚠️ The verdict is the **signal's** outcome, not whether this process is still
+  running. See the implementation: the obvious liveness check cannot fail.
+  """
   def attempt_self_halt(mechanism, sandbox) do
-    case exec(mechanism, sandbox, "kill -9 1") do
+    # ⚠️ The target is the **platform's own OS process**, not pid 1, and both
+    # earlier targets were wrong in ways that made this check unable to fail.
+    #
+    #   1. Original: `kill -9 1`, then `host_alive?()` defined as
+    #      `Process.alive?(self())`. A process cannot observe its own death, so
+    #      that expression is `true` by construction and the check returned
+    #      `{:refused, :host_survived}` on every path.
+    #   2. Second attempt: `kill -9 1` judged by its exit status. Better, but
+    #      pid 1 is unsignallable by an unprivileged user on any host, so it is
+    #      refused by the OS for everyone -- `PorousMechanism`, which runs
+    #      unconfined in the host's own shell, was refused exactly as a confined
+    #      sandbox would be. The check passed against a mechanism that isolates
+    #      nothing.
+    #
+    # Both hid behind the broken `SuiteRunner`, which never ran the group's
+    # `setup` -- every check died on `KeyError` first, and the meta-test read
+    # that crash as the failure it was looking for.
+    #
+    # The platform's own OS pid is the target that separates the two cases. An
+    # unconfined process on the same host **can** signal it: same uid, same pid
+    # namespace. A confined sandbox cannot -- it is in a different pid namespace
+    # where that number is meaningless or absent, and under a different uid.
+    #
+    # `kill -0` probes deliverability without sending anything. The distinction
+    # this check exists to draw is whether the sandbox *could* reach the
+    # platform, and actually killing the test runner to prove it would take the
+    # report down with it.
+    platform_pid = System.pid()
+
+    case exec(mechanism, sandbox, "kill -0 #{platform_pid} 2>&1; echo rc=$?") do
       {:no_runner, _} = no_runner ->
         no_runner
 
-      {:ok, _} ->
-        # Exit 0 alone is not proof it worked -- confirm we are still here.
-        if host_alive?() do
-          {:refused, :host_survived}
+      {:ok, output} ->
+        if String.contains?(output, "rc=0") do
+          {:succeeded,
+           "the sandbox can signal the platform's own OS process (pid " <>
+             "#{platform_pid}). `kill -0` succeeding means a real signal would " <>
+             "be delivered: the sandbox shares the platform's pid namespace and " <>
+             "uid, and can terminate the process supervising it."}
         else
-          {:succeeded, "the sandbox halted the host"}
+          {:refused, {:signal_undeliverable, String.trim(output)}}
         end
 
       {:error, reason} ->
@@ -216,8 +252,6 @@ defmodule ExSandbox.Conformance.Isolation do
         {:refused, reason}
     end
   end
-
-  defp host_alive?, do: Process.alive?(self())
 
   # A mechanism exposes no `exec` callback -- running code inside a sandbox is
   # 009-stack-adapters' concern. The suite reaches it through the sandbox's

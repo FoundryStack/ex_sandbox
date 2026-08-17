@@ -103,33 +103,37 @@ defmodule ExSandbox.SuiteRunner do
     kind, value -> {:failed, "#{kind}: #{inspect(value)}"}
   end
 
-  # Direct invocation bypasses ExUnit's callback machinery, so `setup` blocks
-  # are applied here. A check whose setup raises CapabilityUnavailable is the
-  # third outcome for that check, not a crash of the run.
+  # Direct invocation bypasses ExUnit's callback machinery, so `setup` blocks are
+  # applied here through `__ex_unit__/2` -- the entry point ExUnit's own runner
+  # uses.
+  #
+  # ⚠️ This previously looked for exported `__ex_unit_setup_N/1` functions by
+  # name, and on Elixir 1.20 **there are none**: the module exports only
+  # `__ex_unit__/0,1,2`. So `setup_callbacks/2` returned `[]`, no setup ever ran,
+  # and every check reached its body with no `context.sandbox`.
+  #
+  # It failed with `KeyError`, and `KeyError` is a failure -- so the meta-tests
+  # asserting "every hostile act fails against a porous mechanism" passed. They
+  # were measuring a crash in the harness, not a breach the group detected, and
+  # they would have gone on passing if the isolation group had been deleted
+  # outright. Found while adding the network group, whose identical green was
+  # the thing that looked wrong.
+  #
+  # `:setup` runs the per-test callbacks, including a `describe`'s own, so the
+  # old `relevant_setup?/2` question ("which of these belong to this describe?")
+  # does not arise -- ExUnit answers it. That comment claimed the suite had only
+  # one setup, which stopped being true when a second group grew one.
   defp run_setups(suite, test) do
-    Enum.reduce(setup_callbacks(suite, test), %{test: test.name, module: suite}, fn callback,
-                                                                                    context ->
-      merge_context(context, apply(suite, callback, [context]))
-    end)
+    context = %{
+      test: test.name,
+      module: suite,
+      case: suite,
+      registered: %{},
+      describe: test.tags[:describe]
+    }
+
+    merge_context(context, suite.__ex_unit__(:setup, context))
   end
-
-  defp setup_callbacks(suite, test) do
-    describe = test.tags[:describe]
-
-    suite.__info__(:functions)
-    |> Enum.filter(fn {name, arity} ->
-      arity == 1 and Atom.to_string(name) =~ ~r/^__ex_unit_setup_/ and
-        relevant_setup?(name, describe)
-    end)
-    |> Enum.map(&elem(&1, 0))
-    |> Enum.sort()
-  end
-
-  # Setups defined inside a `describe` are numbered per-describe; module-level
-  # ones apply everywhere. Without a public API for the mapping this errs
-  # toward running all of them, which is safe here because the suite's only
-  # setup is the isolation group's.
-  defp relevant_setup?(_name, _describe), do: true
 
   defp merge_context(context, %{} = returned), do: Map.merge(context, returned)
   defp merge_context(context, {:ok, %{} = returned}), do: Map.merge(context, returned)

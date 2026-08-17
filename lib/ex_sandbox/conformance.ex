@@ -79,6 +79,7 @@ defmodule ExSandbox.Conformance do
       require ExSandbox.Conformance.Credentials
       require ExSandbox.Conformance.Isolation
       require ExSandbox.Conformance.Lifecycle
+      require ExSandbox.Conformance.Network
       require ExSandbox.Conformance.Reachability
       require ExSandbox.Conformance.Reconciliation
       require ExSandbox.Conformance.ResourceLimits
@@ -88,6 +89,7 @@ defmodule ExSandbox.Conformance do
       ExSandbox.Conformance.Reconciliation.tests()
       ExSandbox.Conformance.Credentials.tests()
       ExSandbox.Conformance.Isolation.tests()
+      ExSandbox.Conformance.Network.tests()
       ExSandbox.Conformance.ResourceLimits.tests()
     end
   end
