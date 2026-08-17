@@ -215,15 +215,50 @@ defmodule ExSandbox.Capability do
           "bubblewrap is not installed, so a network namespace cannot be created"
         )
 
-      unshares?("--unshare-net") ->
-        available(:network_restriction)
-
-      true ->
+      not unshares?("--unshare-net") ->
         unavailable(
           :network_restriction,
           "bubblewrap is present but `--unshare-net` failed; unprivileged user " <>
             "namespaces are likely disabled or restricted by the host policy"
         )
+
+      # ⚠️ Everything below this line is what makes the namespace *policed*
+      # rather than merely empty, and its absence was this probe's defect.
+      #
+      # `--unshare-net` alone yields a namespace with no interfaces. That denies
+      # everything, which passes every denial check in the conformance suite
+      # while enforcing no allowlist at all -- so reporting the capability
+      # available on the strength of `--unshare-net` describes a boundary this
+      # library will not build.
+      #
+      # ⚠️ It also *disagreed with the other probe for the same capability*.
+      # `Hardening.Linux.probe_network_policy/0` has required pasta and the tap
+      # device since T060a; this one did not. Because
+      # `Conformance.Helpers.host_capability/1` consults **this** probe to
+      # explain a third outcome, a host with bwrap and no pasta launched nothing
+      # (hardening refused) while the census reported an undemonstrable check
+      # with no cause attached -- the cause being known to the other probe, in
+      # the same library, at the same moment.
+      not executable?("pasta") ->
+        unavailable(
+          :network_restriction,
+          "bubblewrap can unshare the network but `pasta` is not installed; " <>
+            "`--unshare-net` gives isolation (a namespace with no route out) " <>
+            "and not policy (a route leading somewhere the allowlist is " <>
+            "enforced), so egress could be denied entirely but never permitted " <>
+            "selectively (005 T060a)"
+        )
+
+      not File.exists?("/dev/net/tun") ->
+        unavailable(
+          :network_restriction,
+          "`pasta` is installed but `/dev/net/tun` is absent; pasta needs the " <>
+            "tap device to build the sandbox's route, and without it fails " <>
+            "with `Failed to open() /dev/net/tun` at launch rather than here"
+        )
+
+      true ->
+        available(:network_restriction)
     end
   end
 
