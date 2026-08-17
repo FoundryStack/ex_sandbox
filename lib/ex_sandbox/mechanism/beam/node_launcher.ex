@@ -66,13 +66,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          :ok <- prepare_storage(sandbox),
          :ok <- clear_stale_scope(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
-         {:ok, exec, binding, plan} <- policed(sandbox, exec),
+         {:ok, exec, binding, _plan} <- policed(sandbox, exec),
          {:ok, launched} <- start_peer_releasing(sandbox, exec, binding),
-         # ⚠️ Between `start_peer_releasing/3` and here the tenant is running
-         # and unpoliced. The window cannot be closed by reordering -- the
-         # namespace does not exist until `pasta` starts the tenant in it -- so
-         # it is closed by failing toward termination instead. See `police/2`.
-         :ok <- police_or_terminate(plan, launched, binding),
          :ok <- verify_or_terminate(launched, sandbox) do
       {:ok, Map.put(launched, :binding, binding)}
     end
@@ -157,18 +152,14 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
     case ExSandbox.Egress.LaunchPlan.build(binding.source_key, pool_port(), flat) do
       {:ok, plan} ->
-        # ⚠️ Nothing is *run* here any more, and that inversion is the whole of
-        # the T060a3 rework. The old code executed `setup_steps` at this point,
-        # creating and configuring a namespace before the tenant existed. That
-        # order is not reachable: `pasta` cannot attach to a namespace made by
-        # `ip netns add` (measured -- `Failed to join network namespace:
-        # Permission denied`), and a tenant inside `pasta`'s namespace has no
-        # `CAP_NET_ADMIN` to configure it from within.
-        #
-        # So the namespace is created *by starting the tenant in it*, and the
-        # policy is installed afterwards by `police/2`. See
-        # `egress-path-measurements.md` defects 3 and 4.
-        {:ok, exec_from_plan(plan), plan}
+        # ⚠️ The plan is *ordered work*, not just a rewritten command. Using
+        # only `tenant_command` is a defect that compiles and reads as
+        # finished: the namespace it names would never have been created, so
+        # every launch would fail with "Cannot open network namespace" -- on
+        # Linux only, after the macOS suite went green.
+        with :ok <- run_steps(plan.setup_steps) do
+          {:ok, exec_from_plan(plan), plan}
+        end
 
       {:error, reason} ->
         # The binding is already held at this point, so it has to go back before
@@ -189,90 +180,6 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         """)
 
         {:error, :mechanism_error}
-    end
-  end
-
-  @doc """
-  Installs the redirect into a launched tenant's namespace.
-
-  ⚠️ This runs **after** the tenant is already executing, and that is forced by
-  the mechanism rather than chosen: the namespace does not exist until `pasta`
-  creates it, and `pasta` creates it by starting the tenant inside it. There is
-  a real window in which the tenant runs unpoliced.
-
-  The window fails *closed*. Until the redirect lands there is no NAT rule
-  sending the tenant's traffic anywhere, and the acceptor it would be sent to
-  is not listening -- so a connection attempted in the window reaches nothing.
-  That is asserted rather than assumed: a failure here **terminates the
-  tenant**, because the alternative is a running sandbox whose allowlist is not
-  enforced, and which passes every denial check in the conformance suite.
-
-  Public because it is the ordering rule that cannot be exercised off Linux --
-  left private it would be verified only where the whole launch works, which is
-  the arrangement that let the context-discard defect survive.
-  """
-  @spec police(ExSandbox.Egress.LaunchPlan.t(), keyword()) :: :ok | {:error, atom()}
-  def police(%ExSandbox.Egress.LaunchPlan{} = plan, opts \\ []) do
-    pasta_pid = Keyword.fetch!(opts, :pasta_pid)
-    finder = Keyword.get(opts, :finder, &ExSandbox.Egress.Pasta.find/2)
-    runner = Keyword.get(opts, :runner, &run_steps/1)
-
-    case finder.(pasta_pid, opts) do
-      {:ok, holder_pid} ->
-        runner.(ExSandbox.Egress.LaunchPlan.redirect_steps(plan, holder_pid))
-
-      {:error, reason} ->
-        # ⚠️ Refused, never defaulted to `pasta_pid`. That fallback is available,
-        # reads as robustness, and installs the sandbox's redirect into the HOST
-        # namespace -- succeeding, warning about nothing, and leaving the tenant
-        # unpoliced. See `ExSandbox.Egress.Pasta`.
-        Logger.error("""
-        egress: could not identify the sandbox's namespace holder (#{inspect(reason)}).
-
-        The tenant is running but unpoliced and must not be left that way.
-        Falling back to pasta's own pid would install the redirect into the
-        host's network namespace, which succeeds silently.
-        """)
-
-        {:error, :mechanism_error}
-    end
-  end
-
-  # ⚠️ A tenant that could not be policed is **terminated**, not left running.
-  #
-  # The tempting alternative is to log and continue: the sandbox exists, the
-  # tenant is confined in every other respect, and the network is at worst
-  # unrestricted. That is exactly the outcome `contracts/egress.md` names as
-  # worse than failing -- an unenforced allowlist that the census records as a
-  # demonstrated boundary, because every denial check passes for reasons that
-  # have nothing to do with policy.
-  defp police_or_terminate(nil, _launched, _binding), do: :ok
-
-  defp police_or_terminate(plan, launched, binding) do
-    case police(plan, pasta_pid: pasta_pid(plan)) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        _ = terminate(launched)
-        if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
-        {:error, reason}
-    end
-  end
-
-  # `pasta` writes its host-side pid here. ⚠️ That pid is NOT the namespace
-  # holder -- `police/2` searches its children for the one whose network
-  # namespace differs from ours. See `ExSandbox.Egress.Pasta`.
-  defp pasta_pid(%ExSandbox.Egress.LaunchPlan{pidfile: pidfile}) do
-    case File.read(pidfile) do
-      {:ok, contents} ->
-        case Integer.parse(String.trim(contents)) do
-          {pid, _} -> pid
-          :error -> 0
-        end
-
-      {:error, _} ->
-        0
     end
   end
 
@@ -325,16 +232,17 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   def egress_allowlist(_sandbox), do: []
 
   @doc """
-  Rebuilds `{prog, args}` from a plan's `pasta_command`.
+  Rebuilds `{prog, args}` from a plan's `tenant_command`.
 
-  ⚠️ The program becomes `pasta`, not `systemd-run` and not `bwrap`. Keeping
-  the original program while taking the plan's arguments produces a command
-  that reads correctly in a log line and execs the wrong binary -- and because
-  the arguments still *contain* every hardening flag, a test that greps the
-  joined string for `--unshare-net` or the scope name would pass.
+  ⚠️ The plan prefixes `ip netns exec <name>`, so the program to spawn becomes
+  `ip`, not `systemd-run`. Keeping the original program while taking the plan's
+  arguments produces a command that reads correctly in a log line and execs the
+  wrong binary -- and because the arguments still *contain* every hardening
+  flag, a test that greps the joined string for `--unshare-net` or the scope
+  name would pass.
   """
   @spec exec_from_plan(ExSandbox.Egress.LaunchPlan.t()) :: {String.t(), [String.t()]}
-  def exec_from_plan(%ExSandbox.Egress.LaunchPlan{pasta_command: [prog | args]}) do
+  def exec_from_plan(%ExSandbox.Egress.LaunchPlan{tenant_command: [prog | args]}) do
     {prog, args}
   end
 

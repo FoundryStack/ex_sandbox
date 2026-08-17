@@ -42,26 +42,104 @@ defmodule ExSandbox.Egress.NetnsTest do
     end
   end
 
-  describe "redirect_commands/2" do
+  describe "setup_commands/3" do
     setup do
-      %{commands: Netns.redirect_commands(4242, 18_080)}
+      %{commands: Netns.setup_commands({10, 0, 0, 0}, 18_080)}
     end
 
-    test "every command enters the holder's namespace", %{commands: commands} do
-      # ⚠️ The whole point of the module. An `nft` command that does NOT carry
-      # `nsenter -t <pid> -n` runs in the **host** namespace and installs the
-      # sandbox's redirect there -- it succeeds, warns about nothing, and
-      # leaves the tenant unpoliced while the host acquires a stray NAT rule.
+    test "the namespace is created before anything runs inside it", %{commands: commands} do
+      # Ordering is not expressible as a set, and it is the whole content of
+      # this list. A step that runs in a namespace that does not exist yet
+      # fails with "Cannot open network namespace".
+      add_at = Enum.find_index(commands, &match?(["ip", "netns", "add" | _], &1))
+      first_exec = Enum.find_index(commands, &match?(["ip", "netns", "exec" | _], &1))
+
+      assert add_at != nil, "the namespace is never created"
+      assert add_at < first_exec
+    end
+
+    test "the veth pair exists before either end is configured", %{commands: commands} do
+      pair_at = Enum.find_index(commands, &match?(["ip", "link", "add" | _], &1))
+      move_at = Enum.find_index(commands, fn step -> "netns" in step and "link" in step end)
+
+      assert pair_at != nil, "no veth pair: the namespace would have no interface at all"
+      assert pair_at < move_at
+
+      # ⚠️ The defect the pasta design shipped: three steps configured `dev sb0`
+      # before anything created it, and all three failed with
+      # `Cannot find device "sb0"`.
+      configure_at =
+        Enum.find_index(commands, &match?(["ip", "addr", "add" | _], &1))
+
+      assert pair_at < configure_at
+    end
+
+    test "installs a default route", %{commands: commands} do
+      # ⚠️ The single most important assertion in this file. Omitting the route
+      # made the end-to-end spike report `redirect did NOT fire`: the kernel
+      # returned `enetunreach` before the nat hook ran, so a missing route
+      # printed exactly like a refused redirect.
+      #
+      # Without it the sandbox is merely *isolated* -- the state `--unshare-net`
+      # already provided, which passes every denial check while enforcing no
+      # policy at all.
+      assert Enum.any?(commands, fn step ->
+               "route" in step and "default" in step
+             end),
+             "no default route: the sandbox would be isolated, not policed, and every denial check would still pass"
+    end
+
+    test "the route's gateway is the /30's gateway address", %{commands: commands} do
+      route = Enum.find(commands, fn step -> "route" in step and "default" in step end)
+      assert "10.0.0.1" in route
+    end
+
+    test "the sandbox end carries an address that masks to its policy key", %{commands: commands} do
+      # The join between the namespace and the allowlist: the acceptor sees this
+      # address, masks it with `source_key/1`, and looks the policy up under the
+      # result. Measured working -- `peer=('10.77.0.2', 32856)`.
+      addr_step =
+        Enum.find(commands, fn step ->
+          "addr" in step and Enum.any?(step, &String.starts_with?(&1, "10.0.0.2/"))
+        end)
+
+      assert addr_step, "the sandbox end has no address, so it cannot be attributed"
+    end
+
+    test "the redirect is installed as part of setup", %{commands: commands} do
+      assert Enum.any?(commands, fn step -> "rule" in step end),
+             "no redirect: the namespace would have a route out and no interception"
+    end
+
+    test "commands are argv lists, never interpolated shell strings", %{commands: commands} do
+      # A string invites a sandbox-controlled value into a command line. Every
+      # element must be a discrete argument.
       for command <- commands do
-        assert Enum.take(command, 4) == ["nsenter", "-t", "4242", "-n"],
+        assert is_list(command)
+        assert Enum.all?(command, &is_binary/1)
+      end
+    end
+  end
+
+  describe "redirect_commands/2" do
+    setup do
+      %{commands: Netns.redirect_commands("sb-10-0-0-0", 18_080)}
+    end
+
+    test "every command runs inside the named namespace", %{commands: commands} do
+      # ⚠️ A command that omits the namespace configures the **host**. On a
+      # developer machine that fails; on the isolation host it succeeds, and the
+      # host acquires a NAT rule redirecting its own outbound TCP while the
+      # sandbox is left entirely unpoliced.
+      for command <- commands do
+        assert Enum.take(command, 4) == ["ip", "netns", "exec", "sb-10-0-0-0"],
                "a policy command that does not enter the namespace configures the host: " <>
                  Enum.join(command, " ")
       end
     end
 
     test "redirects to the acceptor's port", %{commands: commands} do
-      rule = rule(commands)
-      assert ":18080" in rule
+      assert ":18080" in rule(commands)
     end
 
     # ⚠️ These two pin the rule's *grammar*, which nothing checked until the
@@ -77,15 +155,15 @@ defmodule ExSandbox.Egress.NetnsTest do
     # with a working default route and no interception, which is an *unpoliced*
     # sandbox whose denial checks all still pass for want of anything to deny.
     test "the redirect rule matches TCP in grammar nft accepts", %{commands: commands} do
-      rule = rule(commands)
+      r = rule(commands)
 
-      assert rule
+      assert r
              |> Enum.chunk_every(3, 1, :discard)
              |> Enum.any?(&(&1 == ["meta", "l4proto", "tcp"])),
              """
              the redirect rule does not carry an `nft` protocol match.
 
-             Built: #{Enum.join(rule, " ")}
+             Built: #{Enum.join(r, " ")}
 
              A bare `tcp` is not valid `nft` grammar -- measured in the isolation
              container, `nft` rejects it with `syntax error, unexpected redirect`
@@ -112,88 +190,49 @@ defmodule ExSandbox.Egress.NetnsTest do
       refute Enum.any?(commands, fn cmd -> "prerouting" in cmd end)
     end
 
-    test "no command configures an interface or a route", %{commands: commands} do
-      # ⚠️ `pasta --config-net` does this, and an earlier version of this module
-      # emitted `ip addr add`/`ip link set`/`ip route add` of its own. All three
-      # failed with `Cannot find device "sb0"`: nothing had created the device,
-      # because the thing that creates it had not run yet. They were not merely
-      # redundant -- they ran *before* what makes them possible.
-      # ⚠️ Checks the *program*, not membership. `"ip" in command` is true of
-      # every rule here -- `nft add table ip nat` names the address family --
-      # so a membership test fails against correct commands and would be
-      # "fixed" by deleting it.
-      for command <- commands do
-        program = Enum.at(command, 4)
-
-        assert program == "nft",
-               "pasta configures the namespace; this must only police it: " <>
-                 Enum.join(command, " ")
-      end
-    end
-
-    test "commands are argv lists, never interpolated shell strings", %{commands: commands} do
-      # A string invites a sandbox-controlled value into a command line. Every
-      # element must be a discrete argument.
-      for command <- commands do
-        assert is_list(command)
-        assert Enum.all?(command, &is_binary/1)
-      end
-    end
-
     defp rule(commands), do: Enum.find(commands, &("rule" in &1))
   end
 
-  describe "default_route?/1" do
-    test "recognises the route pasta installs" do
-      # Measured output from the isolation container. Without a default route
-      # the kernel rejects an outbound connect with `enetunreach` *before* the
-      # nat hook runs, so a missing route prints exactly like a refused
-      # redirect -- the defect that cost the first spike a cycle.
-      assert Netns.default_route?("default via 172.19.0.1 dev eth0\n172.19.0.0/16 dev eth0")
+  describe "interface_names/1" do
+    test "names fit the kernel's 15-character limit" do
+      # ⚠️ Measured constraint, not a style rule. `sbh-10-255-255-252` is 18
+      # characters and the kernel rejects it -- so a sandbox at the top of the
+      # range would fail to launch while every one below it worked.
+      for key <- [{10, 0, 0, 0}, {10, 255, 255, 252}, {10, 4, 8, 128}] do
+        {host, sandbox} = Netns.interface_names(key)
+        assert String.length(host) <= 15, "host interface name too long: #{host}"
+        assert String.length(sandbox) <= 15, "sandbox interface name too long: #{sandbox}"
+      end
     end
 
-    test "an isolated namespace is not mistaken for a policed one" do
-      # ⚠️ The failure this guards. A namespace with addresses but no default
-      # route reaches nothing, which passes every denial check while enforcing
-      # no policy at all -- the `--unshare-net` shape.
-      refute Netns.default_route?("172.19.0.0/16 dev eth0 proto kernel scope link")
-      refute Netns.default_route?("")
+    test "adjacent /30s get distinct host-side names" do
+      # ⚠️ The host end lives in the **host** namespace alongside every other
+      # sandbox's. A name that collided would fail the second sandbox with
+      # `RTNETLINK answers: File exists` -- after the first worked.
+      {a, _} = Netns.interface_names({10, 0, 0, 0})
+      {b, _} = Netns.interface_names({10, 0, 0, 4})
+      assert a != b
     end
   end
 
-  describe "pasta_command/2" do
-    test "uses --config-net, the flag measured to need no host capability" do
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-      assert "--config-net" in command
-    end
+  describe "teardown_commands/2" do
+    test "removes the namespace and the host-side veth" do
+      commands = Netns.teardown_commands({10, 0, 0, 0})
 
-    test "runs as root, without which pasta cannot enter the namespace it made" do
-      # ⚠️ Not a hardening choice. Measured: without `--runas 0`, pasta drops to
-      # `nobody` and then fails with `Failed to join network namespace:
-      # Permission denied` -- it cannot re-enter the namespace it just created.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-      assert Enum.chunk_every(command, 2, 1, :discard) |> Enum.member?(["--runas", "0"])
-    end
+      assert Enum.any?(commands, &match?(["ip", "netns", "delete" | _], &1))
 
-    test "does not pass --interface, which names a HOST device" do
-      # ⚠️ An earlier version passed `--interface sb0` believing it named the
-      # namespace-side device. `-i` selects the **host** interface to copy
-      # addresses and routes *from*; the namespace-side name is `-I`. Measured:
-      # `pasta --config-net --interface sb0 ...` fails with
-      # `Invalid interface name sb0: No such device`.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-      refute "--interface" in command
-      refute "-i" in command
+      # ⚠️ The host end survives a namespace delete when the pair was created
+      # but the move failed, and it lives in the host's namespace -- so leaking
+      # it exhausts host interface names rather than the sandbox's.
+      {host_if, _} = Netns.interface_names({10, 0, 0, 0})
+      assert Enum.any?(commands, fn step -> "delete" in step and host_if in step end)
     end
+  end
 
-    test "the tenant command follows the argument separator" do
-      # Everything after `--` is the tenant. Without the separator, a tenant
-      # flag that happens to match one of pasta's own would be consumed by
-      # pasta instead of reaching the tenant.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "--die-with-parent", "erlexec"])
-      [_pasta | rest] = command
-      tenant = rest |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
-      assert tenant == ["bwrap", "--die-with-parent", "erlexec"]
+  describe "in_namespace/3" do
+    test "the tenant launches inside the namespace that was configured" do
+      command = Netns.in_namespace({10, 0, 0, 0}, ["bwrap", "erlexec"])
+      assert ["ip", "netns", "exec", "sb-10-0-0-0", "bwrap", "erlexec"] == command
     end
   end
 end

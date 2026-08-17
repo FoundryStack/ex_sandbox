@@ -71,11 +71,12 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
       # and execs the wrong binary -- and because the arguments still *contain*
       # every hardening flag, a test that greps the joined string for
       # `--unshare-net` or the scope name would pass.
-      assert prog == "pasta"
+      assert prog == "ip"
+      assert Enum.take(args, 2) == ["netns", "exec"]
 
       refute prog == "systemd-run",
-             "the plan runs the tenant under `pasta`; keeping the original " <>
-               "program would exec systemd-run with pasta's arguments"
+             "the plan prefixes `ip netns exec`; keeping the original program " <>
+               "would exec systemd-run with ip's arguments"
     end
 
     test "the confinement survives the rewrite" do
@@ -97,16 +98,15 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
                "the configured one, and every denial check would still pass"
     end
 
-    test "the pidfile is derived from the /30 the policy is keyed by" do
+    test "the netns name matches the /30 the policy is keyed by" do
       {:ok, plan} = LaunchPlan.build({10, 0, 0, 8}, 9999, @confined)
       {_prog, args} = NodeLauncher.exec_from_plan(plan)
 
-      # A pidfile named from anything but the source key can collide between
-      # sandboxes, and two sandboxes sharing one would have the second overwrite
-      # the first -- so the host would search the wrong process's children and
-      # police the wrong namespace, or none.
-      assert plan.pidfile == LaunchPlan.default_pidfile({10, 0, 0, 8})
-      assert plan.pidfile in args
+      # A namespace named from anything but the source key can drift from the
+      # identity the acceptor enforces against -- the sandbox would be in
+      # namespace A while its policy was filed under B.
+      assert Enum.at(args, 2) == ExSandbox.Egress.Netns.namespace_name({10, 0, 0, 8})
+      assert plan.namespace == Enum.at(args, 2)
     end
   end
 end
