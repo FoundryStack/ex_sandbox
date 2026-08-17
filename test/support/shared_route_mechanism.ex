@@ -36,22 +36,36 @@ defmodule ExSandbox.SharedRouteMechanism do
   """
   @behaviour ExSandbox.Mechanism
 
-  # ⚠️ Host-side and genuinely **unwritable**, and getting this right took a
-  # measured failure. The first version wrote the policy to `/tmp` like the
-  # other fixtures. But `context.exec` here runs in the host's own shell, so
-  # tenant code appended to it and this mechanism failed `FR-011b` as well as
-  # `003-FR-002` -- which made the peer-crossing failure unattributable and
-  # tripped the meta-test's own attribution guard.
+  # ⚠️ The enforced policy is **held in host memory**, and it took two measured
+  # failures to get here. Both are worth keeping, because each one is the same
+  # mistake at a different depth.
   #
-  # That is the fixture equivalent of the defect species this suite keeps
-  # finding: a control that looks correct until it is executed. The file is now
-  # created read-only, so `>>` is refused for a real reason and the mechanism
-  # fails exactly one guarantee.
-  @policy_path "/tmp/ex-sandbox-shared-route-allowlist"
+  # **First:** the policy was a file in `/tmp` like the other fixtures. But
+  # `context.exec` runs in the host's own shell, so tenant code appended to it,
+  # and the mechanism failed `FR-011b` as well as `003-FR-002` -- making the
+  # peer-crossing failure unattributable. The meta-test's attribution guard
+  # caught it.
+  #
+  # **Second:** the fix was mode `0444`, which made `>>` fail on macOS as a
+  # non-root user. It was verified there, in the one environment where it
+  # works. The container runs the suite as **root**, and root ignores mode bits
+  # entirely -- measured: appending to a `0444` file as uid 0 succeeds. The
+  # guard fired again, on the platform that actually matters.
+  #
+  # So permission was never the right mechanism: any mode bit is a permission
+  # question, and root always wins that argument. The policy now lives in
+  # `:persistent_term`, where the sandbox's shell has no path to it at all --
+  # not because it is forbidden, but because there is nothing on the filesystem
+  # to open. That holds at any privilege level.
+  @policy {__MODULE__, :policy}
 
-  # Owner-read-only. `File.write!` would reset the mode, so the write happens
-  # first and the mode is applied after.
-  @policy_mode 0o444
+  # ⚠️ `:policy_handle` must still be a **path** -- `FR-011e` has the suite
+  # attack it, and a handle it cannot even attempt to write would make the
+  # widening check vacuous rather than passing. This names a path that is
+  # deliberately absent from the filesystem: writing to it is refused for a
+  # reason unrelated to the policy, and the policy it *claims* to name cannot be
+  # reached from inside at all.
+  @policy_handle "/proc/ex-sandbox/shared-route-allowlist"
 
   # Every sandbox on this "bridge" registers its listener here, which is what
   # makes one sandbox reachable from another. `:persistent_term` rather than
@@ -67,12 +81,9 @@ defmodule ExSandbox.SharedRouteMechanism do
 
   @impl true
   def start(sandbox) do
-    # ⚠️ `File.chmod!` after the write, and `File.rm` before it: an existing
-    # 0444 file cannot be overwritten, so a second sandbox on the bridge would
-    # crash here rather than start.
-    File.rm(@policy_path)
-    File.write!(@policy_path, "127.0.0.1/32\n")
-    File.chmod!(@policy_path, @policy_mode)
+    # Host-side, in memory. No file to chmod, no file to race, and nothing for a
+    # second sandbox on the bridge to collide with.
+    :persistent_term.put(@policy, ["127.0.0.1/32"])
 
     # A real listening socket, so a peer crossing can genuinely be attempted
     # and genuinely succeed.
@@ -86,7 +97,7 @@ defmodule ExSandbox.SharedRouteMechanism do
       |> Map.put(:exec, &host_exec/1)
       |> Map.put(:address, {"127.0.0.1", port})
       |> Map.put(:permitted, {"127.0.0.1", port})
-      |> Map.put(:policy_handle, @policy_path)
+      |> Map.put(:policy_handle, @policy_handle)
       |> Map.put(:connect, &shared_route_connect/2)
 
     {:ok, %{sandbox | context: context}}
@@ -102,8 +113,6 @@ defmodule ExSandbox.SharedRouteMechanism do
       _ -> :ok
     end
 
-    # Restore write permission so the next run can replace it.
-    File.chmod(@policy_path, 0o644)
     :ok
   end
 
@@ -130,7 +139,8 @@ defmodule ExSandbox.SharedRouteMechanism do
   # The platform's own listener is NOT on the bridge and not in the allowlist,
   # so that check is refused honestly.
   defp permitted?(host, port) do
-    File.read!(@policy_path) |> String.contains?("#{host}/32") and on_bridge?(port)
+    allowed = :persistent_term.get(@policy, [])
+    Enum.any?(allowed, &(&1 == "#{host}/32")) and on_bridge?(port)
   end
 
   defp on_bridge?(port), do: Map.has_key?(bridge(), port)
