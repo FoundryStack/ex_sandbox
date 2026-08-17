@@ -31,7 +31,7 @@ defmodule ExSandbox.Mechanism.Beam.VerifyContractTest do
          memory_limit_mb: 256,
          cpu_quota: 50.0,
          mount_confined: true,
-         egress_restricted: true,
+         netns_separated: true,
          disk_quota_mb: :filesystem_enforced
        }}
     end

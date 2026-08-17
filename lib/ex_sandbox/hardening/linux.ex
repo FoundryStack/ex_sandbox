@@ -148,7 +148,10 @@ defmodule ExSandbox.Hardening.Linux do
         # what R2 composes would leave them unchecked, which is the same silent
         # gap one level down.
         mount_confined: mount_namespace_applied?(os_pid),
-        egress_restricted: egress_policy_applied?(os_pid),
+        # ⚠️ Named for what is measured (a separate netns), not for the
+        # guarantee it is often read as (an enforced allowlist). See
+        # `sandbox_netns_separated?/1`.
+        netns_separated: sandbox_netns_separated?(os_pid),
         disk_quota_mb: read_effective_disk_quota(os_pid)
       }
 
@@ -164,7 +167,7 @@ defmodule ExSandbox.Hardening.Linux do
         applied.memory_limit_mb == :unlimited ->
           {:error, :not_applied}
 
-        not applied.mount_confined or not applied.egress_restricted ->
+        not applied.mount_confined or not applied.netns_separated ->
           {:error, :not_applied}
 
         true ->
@@ -679,7 +682,25 @@ defmodule ExSandbox.Hardening.Linux do
     end
   end
 
-  defp egress_policy_applied?(os_pid) do
+  # ⚠️ **This verifies namespace separation, not egress policy** -- the same
+  # distinction drawn in `probe_network_policy/0`. It answers "is the sandbox in
+  # a different netns?", and a namespace with a full route to the internet
+  # satisfies it.
+  #
+  # That is sound *today* only because `--unshare-net` yields a namespace with no
+  # route at all, so isolation and policy happen to coincide. **T060a breaks that
+  # coincidence on purpose**: the sandbox gets a working default route pointing
+  # at the acceptor pool, and from that moment this function keeps returning
+  # `true` while the property its name claims goes unverified -- a guard that
+  # reads correctly and returns green on the path it was written to catch.
+  #
+  # It is left in place and renamed rather than "fixed" here, because the honest
+  # fix needs something to check *against*: that the sandbox's default route
+  # leads to this host's pool and that the pool holds a policy for its /30.
+  # T060a4 publishes the `:policy_handle` that makes that checkable, and T060a5
+  # is where this becomes a real egress assertion. Until then the narrow name
+  # states what is actually measured.
+  defp sandbox_netns_separated?(os_pid) do
     with {:ok, sandbox_ns} <- File.read_link("/proc/#{os_pid}/ns/net"),
          {:ok, own_ns} <- File.read_link("/proc/self/ns/net") do
       sandbox_ns != own_ns

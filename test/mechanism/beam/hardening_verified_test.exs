@@ -60,7 +60,7 @@ defmodule ExSandbox.Mechanism.Beam.HardeningVerifiedTest do
 
       assert applied.uid != 0, "sandbox is running as root"
       assert applied.mount_confined, "sandbox shares the platform's mount namespace"
-      assert applied.egress_restricted, "sandbox shares the platform's network namespace"
+      assert applied.netns_separated, "sandbox shares the platform's network namespace"
 
       assert applied.memory_limit_mb == 128,
              "cgroup reports #{inspect(applied.memory_limit_mb)} rather than the requested 128 MB"

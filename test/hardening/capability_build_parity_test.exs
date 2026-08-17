@@ -145,7 +145,7 @@ defmodule ExSandbox.Hardening.CapabilityBuildParityTest do
 
     source = File.read!("lib/ex_sandbox/hardening/linux.ex")
 
-    for evidence <- ["mount_confined", "egress_restricted", "disk_quota_mb"] do
+    for evidence <- ["mount_confined", "netns_separated", "disk_quota_mb"] do
       assert source =~ evidence,
              "verify_applied/1 does not report #{evidence}; a boundary is built but unchecked"
     end
