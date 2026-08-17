@@ -70,6 +70,45 @@ defmodule ExSandbox.Egress.NetnsTest do
       assert ":18080" in rule
     end
 
+    # ⚠️ These two pin the rule's *grammar*, which nothing checked until the
+    # policed path was first executed on Linux and every rule was rejected:
+    #
+    #     nft add rule ip nat output tcp redirect to :44697
+    #     Error: syntax error, unexpected redirect
+    #
+    # The test above passed throughout -- `":18080" in rule` is true of a rule
+    # `nft` will not accept. That is the gap worth naming: the assertion checked
+    # the part that was right. A malformed rule is not a cosmetic defect here,
+    # because a redirect that fails to install leaves the namespace with a
+    # default route and no interception, which is an *unpoliced* sandbox whose
+    # denial checks all still pass for want of anything to deny.
+    test "the redirect rule matches TCP in grammar nft accepts", %{commands: commands} do
+      rule = Enum.find(commands, &match?(["nft", "add", "rule" | _], &1))
+
+      assert Enum.chunk_every(rule, 3, 1, :discard) |> Enum.any?(&(&1 == ["meta", "l4proto", "tcp"])),
+             """
+             the redirect rule does not carry an `nft` protocol match.
+
+             Built: #{Enum.join(rule, " ")}
+
+             A bare `tcp` is not valid `nft` grammar -- measured in the isolation
+             container, `nft` rejects it with `syntax error, unexpected redirect`
+             and installs nothing. `meta l4proto tcp` is accepted and matches all
+             TCP without a port predicate.
+             """
+    end
+
+    test "the redirect rule carries no port predicate", %{commands: commands} do
+      # The allowlist is enforced at the pool, which is the only component that
+      # knows the destination. `tcp dport 1-65535` also parses, and choosing it
+      # would move a filtering decision into `nft` where an unlisted port would
+      # bypass the enforcement point rather than be refused by it.
+      rule = Enum.find(commands, &match?(["nft", "add", "rule" | _], &1))
+
+      refute "dport" in rule,
+             "the redirect must match all TCP; a port predicate lets traffic bypass the pool entirely"
+    end
+
     test "the redirect hooks output, not prerouting", %{commands: commands} do
       # Traffic originates inside the namespace, so it traverses `output`.
       # A `prerouting` rule installs cleanly, lists correctly, and matches

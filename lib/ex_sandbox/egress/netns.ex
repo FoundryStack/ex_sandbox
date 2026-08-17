@@ -88,7 +88,25 @@ defmodule ExSandbox.Egress.Netns do
       # enforced at the pool, which is the only component that knows the
       # destination; filtering by port here would let an unlisted port bypass
       # the enforcement point entirely rather than be refused by it.
-      ["nft", "add", "rule", "ip", "nat", "output", "tcp", "redirect", "to", ":#{pool_port}"]
+      #
+      # ⚠️ `meta l4proto tcp`, not a bare `tcp`. The latter is not valid nft
+      # grammar and every rule built from it was rejected at install time:
+      #
+      #     nft add rule ip nat output tcp redirect to :44697
+      #     Error: syntax error, unexpected redirect
+      #
+      # Measured in the isolation container -- `meta l4proto tcp` and
+      # `ip protocol tcp` are both accepted, as is `tcp dport 1-65535`. The
+      # first is used because it matches all TCP with no port predicate, which
+      # is the property the paragraph above depends on; `tcp dport 1-65535`
+      # would install but reintroduces exactly the port match ruled out there.
+      #
+      # This was invisible for as long as it existed: these commands are built
+      # here and run by `NodeLauncher`, and no sandbox in the conformance suite
+      # carries an allowlist, so the policed branch never executed and the rule
+      # was never handed to `nft`. See `egress-path-measurements.md`.
+      ["nft", "add", "rule", "ip", "nat", "output", "meta", "l4proto", "tcp", "redirect", "to",
+       ":#{pool_port}"]
     ]
   end
 
