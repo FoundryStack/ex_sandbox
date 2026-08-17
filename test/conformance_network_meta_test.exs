@@ -41,7 +41,27 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
     "a destination outside the environment's allowlist is refused"
   ]
 
+  # ⚠️ Excluded from the "must fail / must not be unavailable" assertions
+  # below, and the exclusion is a real weakening that has to be named.
+  #
+  # This check is gated on a host control probe against the same denied address
+  # (`005-FR-011c`, T060j). On a host that cannot itself route to TEST-NET-1 --
+  # which is every host in practice, because no operator routes it -- the check
+  # reports the third outcome for a correct reason: from inside and outside the
+  # sandbox alike the address is silent, so silence attributes to nothing.
+  #
+  # Before that gate existed, this check PASSED against `PorousMechanism`. The
+  # third outcome is strictly better than that, but it means the check is
+  # demonstrated only where a real allowlist makes a reachable destination
+  # denied -- which is what 005 T060a builds, and what T060a8 measures.
+  @host_gated_check "a destination outside the environment's allowlist is refused"
+
+  @unconditional_denial_checks @denial_checks -- [@host_gated_check]
+
   @permitted_check "a destination inside the environment's allowlist is reachable"
+
+  @widening_check "the allowlist cannot be widened from inside the sandbox"
+  @peer_check "reaching another sandbox over the network is refused"
 
   defp names(results) do
     Enum.map(results.passed, &Atom.to_string/1) ++
@@ -63,7 +83,7 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
     # mode this whole file exists to catch, arriving through its own guard.
     present = names(network_results(ExSandbox.PorousMechanism))
 
-    for check <- [@permitted_check | @denial_checks] do
+    for check <- [@permitted_check, @widening_check, @peer_check | @denial_checks] do
       assert Enum.any?(present, &String.contains?(&1, check)),
              "no network check named #{inspect(check)} -- this file's lists are stale"
     end
@@ -81,7 +101,7 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       results = network_results(ExSandbox.PorousMechanism)
 
       wrongly_passed =
-        Enum.flat_map(@denial_checks, &matching(results.passed, &1))
+        Enum.flat_map(@unconditional_denial_checks, &matching(results.passed, &1))
 
       assert wrongly_passed == [],
              """
@@ -114,10 +134,7 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       # which is the reason that fixture exists.
       results = network_results(ExSandbox.PorousMechanism)
 
-      attemptable = [
-        "reaching the platform's own listening port is refused",
-        "a destination outside the environment's allowlist is refused"
-      ]
+      attemptable = ["reaching the platform's own listening port is refused"]
 
       wrongly_unavailable = Enum.flat_map(attemptable, &matching(results.unavailable, &1))
 
@@ -177,7 +194,14 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       results = network_results(ExSandbox.OpenNetworkMechanism)
 
       wrongly_passed = Enum.flat_map(@denial_checks, &matching(results.passed, &1))
-      wrongly_unavailable = Enum.flat_map(@denial_checks, &matching(results.unavailable, &1))
+
+      # ⚠️ Third-outcome assertion scoped to the checks that do not depend on
+      # the host being able to route to the denied address. This mechanism's
+      # `connect` reports success unconditionally, so it must still FAIL every
+      # denial check (asserted above, unscoped) -- but the host-gated one can
+      # legitimately report unavailable before it ever reaches `connect`.
+      wrongly_unavailable =
+        Enum.flat_map(@unconditional_denial_checks, &matching(results.unavailable, &1))
 
       assert wrongly_passed == [],
              """
@@ -242,6 +266,142 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
                #{Enum.map_join(wrongly_passed, "\n  ", &inspect/1)}
 
              Declining to attempt a connection is not evidence of a boundary.
+             """
+    end
+  end
+
+  describe "against a mechanism whose allowlist is enforced but editable" do
+    # ⚠️ The shape a first implementation actually produces, and the reason
+    # `EditablePolicyMechanism` exists. Its allowlist is real: denied
+    # destinations are refused, the permitted one is reachable, peers are
+    # separated. Four of five checks pass honestly. Its only defect is that the
+    # policy lives where tenant code can append to it.
+    #
+    # `OpenNetworkMechanism` cannot establish this. Everything fails there, so a
+    # green assertion says "something failed" rather than "FR-011b caught it" --
+    # consistent with a widening check that had rotted into always-failing.
+    test "the allowlist-widening check fails" do
+      results = network_results(ExSandbox.EditablePolicyMechanism)
+
+      assert matching(results.failures, @widening_check) != [],
+             """
+             The allowlist-widening check did not FAIL against a mechanism whose
+             policy file tenant code can append to.
+
+             Passed:      #{inspect(matching(results.passed, @widening_check))}
+             Unavailable: #{inspect(matching(results.unavailable, @widening_check))}
+
+             This mechanism enforces its allowlist for real -- every connection
+             the suite attempts is decided correctly -- and stores it inside the
+             confined space. `FR-011b` is the only check in the group that can
+             tell an enforced boundary from one its own subject can rewrite, so
+             a pass or a third outcome here means the group cannot make that
+             distinction at all.
+             """
+    end
+
+    test "the other four checks still pass" do
+      # ⚠️ Guards the opposite failure, and it is the half that keeps the
+      # fixture honest. A widening check that failed everything would satisfy
+      # the assertion above while telling a conformant mechanism it had leaked.
+      # Requiring the other four to pass pins this fixture to failing exactly
+      # one guarantee -- so the test above is attributable to `FR-011b` and not
+      # to a mechanism that is broken in some unrelated way.
+      results = network_results(ExSandbox.EditablePolicyMechanism)
+
+      # ⚠️ Excludes @host_gated_check for the same reason as above: it reports
+      # the third outcome on any host that cannot route to TEST-NET-1, which is
+      # a property of the internet rather than of this fixture. Including it
+      # would make this guard fail for a reason having nothing to do with the
+      # editable policy it exists to attribute.
+      expected = [@permitted_check | @unconditional_denial_checks]
+      passed = Enum.flat_map(expected, &matching(results.passed, &1))
+
+      not_passed =
+        Enum.flat_map(expected, fn check ->
+          matching(results.failures, check) ++ matching(results.unavailable, check)
+        end)
+
+      assert not_passed == [],
+             """
+             These checks did not pass against a mechanism that enforces a real
+             allowlist and separates its sandboxes:
+
+               #{Enum.map_join(not_passed, "\n  ", &inspect/1)}
+
+             Only `FR-011b` should fail here. If others do, the widening result
+             above is not attributable to the editable policy, and this fixture
+             establishes nothing about that check.
+             """
+
+      assert length(passed) == length(expected),
+             "expected all #{length(expected)} non-widening checks to pass, got #{length(passed)}"
+
+      # The host-gated check must not PASS here either -- unavailable is the
+      # only acceptable non-failing outcome for it.
+      assert matching(results.passed, @host_gated_check) == [],
+             """
+             The host-gated denied-destination check PASSED against a mechanism
+             whose allowlist tenant code can widen.
+
+             It is gated on a host control probe precisely so it cannot report a
+             pass it did not earn (T060j).
+             """
+    end
+  end
+
+  describe "against a mechanism that puts every sandbox on one shared route" do
+    # ⚠️ The topological defect, and the only fixture that can prove the
+    # peer-crossing check does any work. Against `PorousMechanism` that check
+    # reports the third outcome (no `:address`); against `OpenNetworkMechanism`
+    # it fails alongside everything else. Both are consistent with a check that
+    # never attempts a real crossing and merely trusts the declared topology.
+    test "the peer-crossing check fails" do
+      results = network_results(ExSandbox.SharedRouteMechanism)
+
+      assert matching(results.failures, @peer_check) != [],
+             """
+             The peer-crossing check did not FAIL against a mechanism that puts
+             every sandbox on one shared route.
+
+             Passed:      #{inspect(matching(results.passed, @peer_check))}
+             Unavailable: #{inspect(matching(results.unavailable, @peer_check))}
+
+             This mechanism enforces a real, host-side, unwritable allowlist --
+             every outward-facing check passes honestly -- and shares one link
+             between sandboxes, so A can open a socket to B's published address.
+             That is precisely what `005-FR-011c`'s "no shared bridge" forbids
+             and what `003-FR-002` guarantees.
+
+             A pass here means the check is reading the declared topology rather
+             than attempting the crossing, which T060a8 requires it not to do.
+             """
+    end
+
+    test "the outward-facing checks still pass" do
+      # The same attribution guard as above: this fixture must fail exactly
+      # `003-FR-002`, so the result above cannot be explained by anything else.
+      results = network_results(ExSandbox.SharedRouteMechanism)
+
+      # ⚠️ @host_gated_check deliberately absent -- see the note on that
+      # attribute. Its third outcome here is a fact about routing, not about
+      # this fixture's shared route.
+      expected = [@permitted_check, @widening_check]
+
+      not_passed =
+        Enum.flat_map(expected, fn check ->
+          matching(results.failures, check) ++ matching(results.unavailable, check)
+        end)
+
+      assert not_passed == [],
+             """
+             These outward-facing checks did not pass against a mechanism whose
+             only defect is a route shared between sandboxes:
+
+               #{Enum.map_join(not_passed, "\n  ", &inspect/1)}
+
+             If they fail, the peer-crossing failure above is not attributable
+             to the shared route.
              """
     end
   end

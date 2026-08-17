@@ -57,6 +57,18 @@ defmodule ExSandbox.Conformance.Network do
   # its own bound reports its own result rather than being killed first.
   @exec_timeout_ms 15_000
 
+  # RFC 5737 TEST-NET-1: documentation-reserved and guaranteed never to host a
+  # real service. See `attempt_reach_denied_host/2` for why being *nominally*
+  # routable turned out not to be enough.
+  @denied_host "203.0.113.1"
+  @denied_port 443
+
+  # Bounds the host control probe. Deliberately short: it is a discrimination
+  # question, not a latency measurement, and it is paid once per run.
+  @control_timeout_ms 2_000
+
+  @control_key {__MODULE__, :denied_address_control}
+
   @doc "Emits the network checks into the calling test module."
   defmacro tests do
     quote do
@@ -219,14 +231,121 @@ defmodule ExSandbox.Conformance.Network do
   end
 
   @doc """
-  Attempts to reach a destination the environment does not permit.
+  Attempts to reach a destination the environment does not permit
+  (`005-FR-011c`).
 
-  Uses a documentation-reserved address that is **routable** (RFC 5737
-  TEST-NET-1) rather than a black hole, so a connection failure is evidence of
-  policy rather than of the address being unreachable for everyone.
+  ⚠️ Gated on a **host control probe against this same address**, and the shape
+  of that control is the whole correctness of this check.
+
+  The address is documentation-reserved (RFC 5737 TEST-NET-1), chosen because it
+  is nominally routable rather than a black hole, so that a refusal would be
+  evidence of policy. That reasoning does not survive contact with the internet.
+
+  Measured on a macOS dev host: `nc -z -w 3 203.0.113.1 443` **ignored its own
+  bound and blocked for 75 seconds**, so the suite's outer `timeout 3` fired
+  first and produced exit 124. Exit 124 is `TIMEDOUT`, which this group
+  deliberately scores as a refusal — a probe that ran and saw no answer within
+  its bound is exactly what a `DROP` policy looks like from inside.
+
+  Every step is right in isolation, and together they made this check pass
+  against `ExSandbox.PorousMechanism`: a mechanism that runs every command in
+  the host's own unconfined shell and has no policy whatsoever.
+
+  The first fix attempted here was a general reachability baseline — can the
+  host reach the open internet at all? It measured **yes** on this host, and the
+  check went on passing. That refuted the diagnosis: TEST-NET-1 is *nominally*
+  routable but **nobody actually routes it**, so it is silent for everyone
+  regardless of host health. A liveness question about the host cannot detect
+  that, because the host is fine.
+
+  So the control probes **this exact address, from the host, outside any
+  sandbox**. If the host — subject to no sandbox policy — also sees silence,
+  then silence from inside the sandbox distinguishes nothing, and the check
+  reports the third outcome. It has force only where the host reaches the
+  address and the sandbox does not: the one configuration where the difference
+  is attributable to the boundary.
+
+  `012-FR-016a` exists for precisely this: a check that cannot be demonstrated
+  here is not a check that passed.
   """
   def attempt_reach_denied_host(mechanism, sandbox) do
-    probe_connect(mechanism, sandbox, "203.0.113.1", 443, "a denied destination")
+    case host_reaches_denied_address?() do
+      :yes ->
+        probe_connect(mechanism, sandbox, @denied_host, @denied_port, "a denied destination")
+
+      :no ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          this host cannot itself reach #{@denied_host}:#{@denied_port}, so a
+          refused connection from inside the sandbox is not evidence of an egress
+          policy.
+
+          A refusal means something only if the same attempt SUCCEEDS from
+          outside the sandbox -- otherwise both sides are silent and the boundary
+          explains nothing.
+
+          Measured: RFC 5737 TEST-NET-1 is documentation-reserved and nominally
+          routable, but in practice no operator routes it, so the probe times out
+          for the host too. The suite scores an unanswered probe as a drop, which
+          made this check PASS against a mechanism with no network confinement at
+          all.
+
+          This is the third outcome and not a pass. Closing it needs a denied
+          destination genuinely reachable from the host and denied by policy --
+          which the egress work (005 T060a) creates by construction, since the
+          allowlist will then be real.
+          """
+        )
+    end
+  end
+
+  # ⚠️ The control probes the SAME address the check does, from the host.
+  #
+  # Two weaker questions were considered and are wrong:
+  #
+  #   * "Can the host reach the open internet?" -- measured `:yes` on a host
+  #     where this check was still passing vacuously. The host was healthy; the
+  #     address was unrouted. It answers a question nobody was asking.
+  #
+  #   * Asking this of a correctly-confined production host -- there the honest
+  #     answer may be no, because the host itself sits behind the same egress
+  #     policy, and the control would disable the check exactly where it works.
+  #     That is a real limitation and it is the right trade: a check that goes
+  #     quiet when it cannot discriminate is strictly better than one reporting
+  #     a pass it did not earn.
+  #
+  # `:gen_tcp` rather than a shell: this runs on the host, where the suite has a
+  # BEAM and needs no `nc`, and `connect/4`'s timeout is actually honoured --
+  # unlike `nc -w`, whose disregard for its own bound is the original defect.
+  defp host_reaches_denied_address? do
+    case :persistent_term.get(@control_key, :unknown) do
+      :unknown ->
+        result = measure_control()
+        # Cached: the answer cannot change within a run, and an unrouted address
+        # costs a full timeout every time it is asked.
+        :persistent_term.put(@control_key, result)
+        result
+
+      cached ->
+        cached
+    end
+  end
+
+  defp measure_control do
+    case :gen_tcp.connect(
+           to_charlist(@denied_host),
+           @denied_port,
+           [:binary, active: false],
+           @control_timeout_ms
+         ) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        :yes
+
+      {:error, _reason} ->
+        :no
+    end
   end
 
   @doc """
