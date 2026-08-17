@@ -26,7 +26,12 @@ defmodule ExSandbox.Capability do
   is `ExSandbox.Conformance`'s question, answered by breaching it.
   """
 
-  @type name :: :resource_limits | :filesystem_confinement | :privilege_separation
+  @type name ::
+          :resource_limits
+          | :filesystem_confinement
+          | :privilege_separation
+          | :network_restriction
+          | :disk_quota
 
   @type t :: %__MODULE__{
           name: name(),
@@ -37,7 +42,13 @@ defmodule ExSandbox.Capability do
   @enforce_keys [:name, :available?]
   defstruct [:name, :available?, :detail]
 
-  @known [:resource_limits, :filesystem_confinement, :privilege_separation]
+  @known [
+    :resource_limits,
+    :filesystem_confinement,
+    :privilege_separation,
+    :network_restriction,
+    :disk_quota
+  ]
 
   @doc "Every capability this library knows how to check."
   @spec known() :: [name()]
@@ -129,28 +140,151 @@ defmodule ExSandbox.Capability do
     )
   end
 
+  # ⚠️ Both clauses below were presence checks, and `ExSandbox.CapabilityTest`'s
+  # agreement guard caught them disagreeing with `Hardening.Linux` on macOS
+  # (005 T060c). The moduledoc's rule -- availability is evidence, not
+  # configuration -- was stated here and not followed here.
+  #
+  # The Linux clause accepted `/proc/self/ns/mnt` existing as evidence of mount
+  # namespaces. That path exists in **every** Linux process, including one that
+  # cannot unshare, so the fallback reported available unconditionally on Linux.
+  # A host with unprivileged user namespaces disabled -- a common hardening
+  # setting, and the default in several distributions -- passed this check and
+  # then failed at launch.
   defp do_check(:filesystem_confinement, {:unix, :linux}) do
     cond do
-      executable?("bwrap") ->
-        available(:filesystem_confinement)
+      not executable?("bwrap") ->
+        unavailable(
+          :filesystem_confinement,
+          "bubblewrap is not installed; the BEAM mechanism binds the sandbox filesystem " <>
+            "with bwrap and has no fallback"
+        )
 
-      File.exists?("/proc/self/ns/mnt") ->
+      binds_root?() ->
         available(:filesystem_confinement)
 
       true ->
         unavailable(
           :filesystem_confinement,
-          "neither bubblewrap nor mount namespaces are available"
+          "bubblewrap is present but cannot bind a root filesystem; unprivileged " <>
+            "user namespaces are likely disabled or restricted by the host policy"
         )
     end
   end
 
+  # ⚠️ macOS reports unavailable even with `sandbox-exec` present, and the
+  # previous `true` was a false available with a consumer.
+  #
+  # `ExSandbox.Mechanism.Beam.required_capabilities/0` names
+  # `:filesystem_confinement` meaning *the mount namespace* -- its own comment
+  # says so -- and that mechanism confines with `bwrap`, which does not exist on
+  # macOS. Finding `sandbox-exec` on the PATH answered a question nobody asked:
+  # it is not what the launch builds, so its presence said nothing about whether
+  # the sandbox would be confined.
+  #
+  # This is the same shape as R9b's `taskpolicy -m`: a mechanism that exists,
+  # looks applicable, and is not the one in the path being taken.
   defp do_check(:filesystem_confinement, {:unix, :darwin}) do
-    if executable?("sandbox-exec") do
-      available(:filesystem_confinement)
-    else
-      unavailable(:filesystem_confinement, "sandbox-exec not found")
+    unavailable(
+      :filesystem_confinement,
+      "macOS has no mount namespace, and `sandbox-exec` is not what the BEAM " <>
+        "mechanism binds with (005 R9); the sandbox filesystem cannot be confined here"
+    )
+  end
+
+  # ⚠️ Added late, and the lateness is the finding (005 T060c).
+  #
+  # `ExSandbox.Hardening.Linux` has probed `network_restriction` since it was
+  # written, but nothing consulted the answer: it fed the capability map and
+  # stopped there. `Capability.known/0` did not list it, no mechanism required
+  # it, and the conformance suite had no network group. The result is that a
+  # mechanism could implement the whole behaviour, pass every published check,
+  # and confine nothing about the network -- `003-FR-002` asserted by a contract
+  # that never tested it.
+  #
+  # Probed the way `Hardening.Linux` probes it, by *attempting* the unshare
+  # rather than looking for bubblewrap on the PATH. A host can ship `bwrap` and
+  # still deny network namespaces (unprivileged userns disabled, seccomp policy,
+  # a container without `CAP_SYS_ADMIN`), and on those hosts the presence check
+  # reports a boundary that would not be built.
+  defp do_check(:network_restriction, {:unix, :linux}) do
+    cond do
+      not executable?("bwrap") ->
+        unavailable(
+          :network_restriction,
+          "bubblewrap is not installed, so a network namespace cannot be created"
+        )
+
+      unshares?("--unshare-net") ->
+        available(:network_restriction)
+
+      true ->
+        unavailable(
+          :network_restriction,
+          "bubblewrap is present but `--unshare-net` failed; unprivileged user " <>
+            "namespaces are likely disabled or restricted by the host policy"
+        )
     end
+  end
+
+  # ⚠️ macOS reports unavailable, and this is the change that makes provisioning
+  # refuse where it previously succeeded (Principle II). `sandbox-exec` can deny
+  # network operations by profile, but `005` R9's standard is enforcement that
+  # survives an intervening exec, and the same measurement that disqualified
+  # `taskpolicy -m` applies: a profile is inherited by the immediate child and
+  # is not a namespace, so a sandbox that re-execs is no longer inside it.
+  #
+  # A host that cannot confine the network was never providing the guarantee.
+  # It was only never asked.
+  defp do_check(:network_restriction, {:unix, :darwin}) do
+    unavailable(
+      :network_restriction,
+      "macOS has no network namespace; a `sandbox-exec` profile is not inherited " <>
+        "across an intervening exec (005 R9b), so egress cannot be confined"
+    )
+  end
+
+  # ⚠️ Found by the parity guard in `ExSandbox.CapabilityTest`, not by review --
+  # the same defect as `:network_restriction`, one capability over. `disk_quota`
+  # was probed by `Hardening.Linux`, constructed by `build_command/2` as the
+  # sandbox's storage bind, and absent from this vocabulary, so no mechanism
+  # could require it.
+  #
+  # A quota is only enforceable if the storage root sits on a filesystem that
+  # supports one, which is asked of the filesystem rather than assumed. The root
+  # is read from config for the same reason `Hardening.Linux.storage_path/1` is
+  # public: a check against a made-up path answers about the wrong filesystem.
+  defp do_check(:disk_quota, {:unix, :linux}) do
+    root = sandbox_storage_root()
+
+    cond do
+      not File.dir?(root) ->
+        unavailable(
+          :disk_quota,
+          "the sandbox storage root #{root} does not exist, so no quota can be applied " <>
+            "to it (set :ex_sandbox, :beam, storage_root: ... or create the directory)"
+        )
+
+      quota_capable_filesystem?(root) ->
+        available(:disk_quota)
+
+      true ->
+        unavailable(
+          :disk_quota,
+          "#{root} is not on a quota-capable filesystem (xfs, ext2/3/4, btrfs), " <>
+            "so a configured disk limit would not be enforced"
+        )
+    end
+  end
+
+  # tmpfs and overlayfs, which is what a container without a mounted volume
+  # gives you, take no project quota. Reported rather than assumed, for the same
+  # reason as everywhere else here.
+  defp do_check(:disk_quota, {:unix, :darwin}) do
+    unavailable(
+      :disk_quota,
+      "APFS has no per-directory quota equivalent that survives the sandbox launch"
+    )
   end
 
   defp do_check(:privilege_separation, {:unix, _}) do
@@ -174,6 +308,48 @@ defmodule ExSandbox.Capability do
   # claiming on an unknown host is FR-012b's rule.
   defp do_check(name, os) do
     unavailable(name, "unsupported host: #{inspect(os)}")
+  end
+
+  # Evidence, not configuration (FR-012a): the confinement is actually built and
+  # a process runs inside it, rather than bubblewrap being found on the PATH.
+  #
+  # ⚠️ The filesystem probe is a **bind**, not an unshare flag. An earlier
+  # version of this probed `--unshare-ns`, which is not a bubblewrap flag at all
+  # -- `build_command/2` unshares net, pid, ipc and uts, and confines the
+  # filesystem with `--ro-bind`/`--bind`. Probing a flag the launch never uses
+  # answers about the wrong thing even when it happens to return the right
+  # boolean.
+  defp binds_root?, do: bwrap_runs?([])
+
+  defp unshares?(flag), do: bwrap_runs?([flag])
+
+  defp bwrap_runs?(flags) do
+    case System.cmd("bwrap", flags ++ ["--ro-bind", "/", "/", "true"], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  # Deliberately duplicated from `Hardening.Linux` rather than delegated.
+  # `ExSandbox.Capability` is consulted before a mechanism is chosen -- it is
+  # how a caller learns whether provisioning would work at all -- so it must not
+  # depend on one mechanism's hardening module. `ExSandbox.CapabilityTest`
+  # asserts the two agree on this host, which is the property that matters and
+  # the one a shared helper would make untestable.
+  defp sandbox_storage_root do
+    Application.get_env(:ex_sandbox, :beam, [])
+    |> Keyword.get(:storage_root, "/var/lib/axonn/sandboxes")
+  end
+
+  defp quota_capable_filesystem?(path) do
+    case System.cmd("stat", ["-f", "-c", "%T", path], stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output) in ["xfs", "ext2/ext3", "ext4", "btrfs"]
+      _ -> false
+    end
+  rescue
+    _ -> false
   end
 
   defp executable?(name), do: System.find_executable(name) != nil

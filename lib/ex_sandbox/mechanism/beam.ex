@@ -48,10 +48,27 @@ defmodule ExSandbox.Mechanism.Beam do
     #
     # The mapping is not lossy: `:resource_limits` covers the memory and CPU
     # caps (both come from the same cgroup scope, and a host with one has the
-    # other), `:filesystem_confinement` is the mount namespace, and
+    # other), `:filesystem_confinement` is the mount namespace,
     # `:privilege_separation` is the dropped uid that makes process isolation
-    # mean anything.
-    [:resource_limits, :filesystem_confinement, :privilege_separation]
+    # mean anything, and `:network_restriction` is the network namespace.
+    #
+    # ⚠️ `:network_restriction` was missing here for as long as this list has
+    # existed (005 T060c), and its absence was not benign. `build_command/2`
+    # composes `--unshare-net` unconditionally, so on a host that cannot create
+    # a network namespace the launch either fails for an unexplained reason or
+    # -- worse -- succeeds without one. `005-SC-002` (cluster isolation) rests
+    # entirely on that namespace, so a sandbox launched here without it is
+    # reachable by distribution from every other sandbox on the host.
+    #
+    # Declaring it means `ExSandbox.provision/2` refuses on such a host instead,
+    # naming what is missing. That refusal is the guarantee working (Principle
+    # II): the host never provided the boundary, it was only never asked.
+    [
+      :resource_limits,
+      :filesystem_confinement,
+      :privilege_separation,
+      :network_restriction
+    ]
   end
 
   @impl true
