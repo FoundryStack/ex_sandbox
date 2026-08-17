@@ -257,6 +257,35 @@ defmodule ExSandbox.Capability do
             "with `Failed to open() /dev/net/tun` at launch rather than here"
         )
 
+      # ⚠️ The third condition, and the one that keeps this probe in step with
+      # `Hardening.Linux.probe_network_policy/0`. The comment above warns about
+      # exactly this class of disagreement -- and it recurred: once that probe
+      # started testing whether a policed launch can be *composed*, this one
+      # still reported `available` on the strength of pasta being installed.
+      #
+      # The consequence was not a wrong answer in isolation; it was 30 failed
+      # conformance checks. `ExSandbox.provision/2` consults **this** probe,
+      # found the capability available, and proceeded -- then `require_hardening/0`
+      # consulted the *other* probe, found it missing, and refused with a bare
+      # `:mechanism_error`. Every group scored that as a `guarantee_failure`,
+      # so "this host cannot police egress" was reported as "halting the host
+      # from inside the sandbox was not refused".
+      #
+      # Measured: `pasta` and `bwrap` do not compose. `pasta` starts its child
+      # with `CapEff=0` in a user namespace whose mappings it could not write,
+      # and `bwrap` then cannot create the mount namespace that is its entire
+      # purpose. See `egress-path-measurements.md`.
+      not policed_launch_composable?() ->
+        unavailable(
+          :network_restriction,
+          "`pasta` and `/dev/net/tun` are both present but a policed launch " <>
+            "cannot be composed: `pasta` starts its child with no capabilities " <>
+            "in a user namespace it could not map, and `bwrap` then fails with " <>
+            "`No permissions to create new namespace`. Egress could be denied " <>
+            "entirely but never permitted selectively, and the tenant could not " <>
+            "be confined either (005 T060a, egress-path-measurements.md)"
+        )
+
       true ->
         available(:network_restriction)
     end
@@ -390,6 +419,36 @@ defmodule ExSandbox.Capability do
   defp executable?(name), do: System.find_executable(name) != nil
 
   defp available(name), do: %__MODULE__{name: name, available?: true, detail: nil}
+
+  # ⚠️ Asks by attempting, not by reading `CapEff`. The capability model here
+  # has already produced two wrong answers: rootless Podman grants a full set
+  # inside its own user namespace, `--cap-drop=ALL` grants none, and default
+  # Docker grants a subset without `CAP_SYS_ADMIN` -- and `bwrap` fails in the
+  # last two for reasons no single bit explains. Running the composition is the
+  # only check that cannot be fooled by a capability set that looks sufficient.
+  defp policed_launch_composable? do
+    case System.cmd(
+           "pasta",
+           [
+             "--config-net",
+             "--runas",
+             "0",
+             "--",
+             "bwrap",
+             "--dev-bind",
+             "/",
+             "/",
+             "--",
+             "/bin/true"
+           ],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
 
   defp unavailable(name, detail),
     do: %__MODULE__{name: name, available?: false, detail: detail}
