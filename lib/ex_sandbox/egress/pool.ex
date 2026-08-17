@@ -186,8 +186,28 @@ defmodule ExSandbox.Egress.Pool do
     :gen_tcp.close(socket)
   end
 
+  # ⚠️ `warning`, not `debug`, and the level is load-bearing rather than a
+  # matter of taste.
+  #
+  # A policy denial is this pool's central security event -- the moment a tenant
+  # was stopped from reaching somewhere. At `debug` it is filtered out by every
+  # configuration this project ships, so the record of an enforcement decision
+  # existed only on a developer machine with a lowered threshold.
+  #
+  # How it surfaced, and why it could only surface there: on macOS
+  # `OriginalDst.read/1` fails, so the `{:error, _}` clause below runs at
+  # `warning` and the transport test's log assertion passed. In the isolation
+  # container the destination reads fine, the `{:refused, _}` clause runs
+  # instead, and the same assertion failed. The one host where the denial path
+  # actually executes is the one where its log disappeared.
+  #
+  # ⚠️ The first fix was `info`, and it was wrong for a reason worth keeping:
+  # `config/test.exs` sets `level: :warning`, so `Logger.info` is dropped before
+  # any handler sees it. Measured -- `capture_log` returned `""`. That fix reads
+  # as an obvious improvement over `debug` and would have left the container
+  # failure exactly as it was, with a commit message claiming otherwise.
   defp log_refusal({:refused, reason}),
-    do: Logger.debug("egress: refused (#{inspect(reason)})")
+    do: Logger.warning("egress: refused (#{inspect(reason)})")
 
   # ⚠️ No catch-all clause, deliberately. `handle_connection/2`'s `else` can be
   # reached only by `{:refused, _}` from `decide/3` or `{:error, _}` from the
