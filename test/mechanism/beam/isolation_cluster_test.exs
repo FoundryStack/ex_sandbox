@@ -76,9 +76,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationClusterTest do
   end
 
   defp launch(tag) do
-    {:ok, provisioned} = Beam.provision(sandbox(tag))
-    on_exit(fn -> Beam.destroy(provisioned) end)
-    provisioned
+    ExSandbox.Test.IsolationLaunch.provision_or_skip(Beam, sandbox(tag))
   end
 
   # ⚠️ The **transport** is stdio; the **subject** is distribution. This file

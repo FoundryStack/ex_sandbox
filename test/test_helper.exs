@@ -45,13 +45,68 @@
 # assertion is measuring the boundary or measuring its own mistake.
 linux? = match?({:unix, :linux}, :os.type())
 
+# ⚠️ Linux is necessary and not sufficient. These tests launch a real sandbox,
+# and the mechanism *refuses* to launch when any capability it requires is
+# missing (R9, Principle II) -- correctly, because a partially confined tenant
+# is worse than none.
+#
+# Left un-excluded on such a host, every one of them reports a **failure of the
+# guarantee it names**. Measured: when `network_restriction` began reporting its
+# true value, nineteen tests failed, among them "a sandbox cannot see the
+# platform's processes" and "one sandbox halting leaves the platform serving".
+# Neither had stopped being true; there was no sandbox to try them in.
+#
+# That is the same false report the conformance census avoids with its third
+# outcome, arriving at the layer that has no third outcome to give -- ExUnit
+# knows only pass and fail, so the honest answer has to be "not run".
+missing_capabilities =
+  if linux? do
+    ExSandbox.Hardening.Linux.capabilities()
+    |> Enum.reject(fn {_name, present?} -> present? end)
+    |> Enum.map(&elem(&1, 0))
+  else
+    []
+  end
+
+# ⚠️ Only the OS decides `excluded`. A capability shortfall must NOT be
+# expressed here, and the reason is measured: `run-isolation-tests.sh` passes
+# `--include isolation --include reclamation` precisely so that an accidental
+# edit to this file cannot silently shrink the run. `--include` re-admits an
+# excluded tag, so an exclusion added here is overridden inside the very
+# container where it would matter -- it changes the local run and nothing else.
+#
+# The capability shortfall is handled where `--include` cannot reach it:
+# `ExSandbox.Test.IsolationLaunch.provision_or_skip/2` refuses at the point of
+# provisioning, naming the missing capability. The warning below still fires so
+# the shortfall is impossible to miss.
 excluded = if linux?, do: [], else: [:isolation, :reclamation]
 
-if excluded != [] do
-  IO.puts("""
-  \n\e[33m005: skipping #{Enum.join(excluded, ", ")} tests on #{elem(:os.type(), 1)}.
-  Six of ten success criteria are NOT verified by this run.\e[0m
-  """)
+cond do
+  not linux? ->
+    IO.puts("""
+    \n\e[33m005: skipping #{Enum.join(excluded, ", ")} tests on #{elem(:os.type(), 1)}.
+    Six of ten success criteria are NOT verified by this run.\e[0m
+    """)
+
+  missing_capabilities != [] ->
+    # ⚠️ Louder than the macOS notice, deliberately. Off Linux nobody mistakes a
+    # green run for evidence. On Linux they might -- the suite looks like it ran
+    # somewhere it could have verified everything, and the excluded tests are
+    # exactly the ones that would have caught a containment defect.
+    IO.puts("""
+    \n\e[31m005: skipping #{Enum.join(excluded, ", ")} tests on a Linux host that
+    CANNOT LAUNCH A SANDBOX. Missing: #{Enum.join(missing_capabilities, ", ")}.
+
+    These tests are not passing -- they are NOT RUNNING. Every containment
+    guarantee they cover (process, cluster, filesystem, privilege, resource
+    caps) is UNVERIFIED by this run. A green result here is not evidence that
+    tenant code is contained.
+
+    Fix the capability and re-run; do not read this as success.\e[0m
+    """)
+
+  true ->
+    :ok
 end
 
 ExUnit.start(exclude: excluded)

@@ -36,9 +36,7 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
   end
 
   defp launch(tag, overrides \\ %{}) do
-    {:ok, provisioned} = Beam.provision(sandbox(tag, overrides))
-    on_exit(fn -> Beam.destroy(provisioned) end)
-    provisioned
+    ExSandbox.Test.IsolationLaunch.provision_or_skip(Beam, sandbox(tag, overrides))
   end
 
   # ⚠️ Stdio, not `:erpc` -- a sandbox under `--unshare-net` has no network

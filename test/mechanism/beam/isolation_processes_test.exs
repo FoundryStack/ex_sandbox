@@ -26,9 +26,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationProcessesTest do
   end
 
   defp launch(tag) do
-    {:ok, provisioned} = Beam.provision(sandbox(tag))
-    on_exit(fn -> Beam.destroy(provisioned) end)
-    provisioned
+    ExSandbox.Test.IsolationLaunch.provision_or_skip(Beam, sandbox(tag))
   end
 
   # ⚠️ `Beam.call/5`, never `:erpc.call/5`. The sandbox runs under

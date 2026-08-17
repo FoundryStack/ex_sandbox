@@ -32,9 +32,7 @@ defmodule ExSandbox.Mechanism.Beam.IsolationHaltTest do
   end
 
   defp launch(owner, tag) do
-    {:ok, provisioned} = Beam.provision(sandbox(owner, tag))
-    on_exit(fn -> Beam.destroy(provisioned) end)
-    provisioned
+    ExSandbox.Test.IsolationLaunch.provision_or_skip(Beam, sandbox(owner, tag))
   end
 
   test "one sandbox halting leaves the platform and every other sandbox serving" do
