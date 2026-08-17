@@ -3,51 +3,44 @@ defmodule ExSandbox.Egress.Netns do
   The commands that turn a sandbox's network namespace into its only path out
   (005 T060a3, `contracts/egress.md`).
 
-  ## The shape, measured end to end
+  ## The shape, and why it is inverted from the obvious one
 
-  1. the host creates a named namespace and a **veth pair**, moves one end into
-     it, addresses both ends from the sandbox's `/30`, and installs a default
-     route,
-  2. the tenant is launched **inside** that namespace, still `bwrap`-confined,
-  3. the host installs the redirect; an acceptor listens inside the namespace.
+  The obvious design — create a named namespace, configure it, attach `pasta`,
+  then have the tenant join it — **is not reachable**. Measured, in
+  `egress-path-measurements.md`: `pasta` cannot join a namespace made by
+  `ip netns add` here, failing with `Failed to join network namespace:
+  Permission denied`. It works only when it *spawns* the namespace itself.
 
-  Measured working together: a `bwrap`-confined tenant connecting to
-  `93.184.216.34:443` was redirected to an in-namespace acceptor that read
-  `ORIGINAL_DST=93.184.216.34:443` from a peer at `10.77.0.2` — the sandbox's
-  own `/30` address, which is what `ExSandbox.Egress.Policy.source_key/1`
-  attributes by.
+  So the order inverts:
 
-  ## ⚠️ Why not `pasta`
+  1. `pasta --config-net --runas 0 -P <pidfile> -- <tenant>` creates the
+     namespace, configures its interface and default route, and starts the
+     tenant inside it,
+  2. the **host** then installs the redirect into that namespace with
+     `nsenter -t <holder-pid> -n nft …`.
 
-  An earlier version used `pasta --config-net`, which needs no host capability
-  and looked ideal. **It cannot carry a confined tenant.**
+  ⚠️ Step 2 cannot be done from inside. `pasta`'s namespace is unprivileged, so
+  the tenant has no `CAP_NET_ADMIN` and `nft` there fails with `Operation not
+  permitted`. That is *desirable* — a tenant able to edit the ruleset would
+  defeat `FR-011b` by reconfiguration rather than by connection — but it means
+  the policy is installed from outside, by us, after the tenant is running.
 
-  Measured: `pasta` starts its child as **uid 65534 with
-  `CapEff=0000000000000000`**, inside a user namespace whose mappings it failed
-  to write (`Couldn't write to /proc/self/uid_map`). From there the tenant
-  cannot create any namespace, so `bwrap` — whose entire job is creating
-  namespaces — fails with `No permissions to create new namespace`. `--runas 0`
-  sets *pasta's* uid, not the tenant's.
+  ## What `pasta` configures, and what this module therefore does not
 
-  Inverting the nesting (`bwrap` outside, `pasta` inside) runs, but
-  `--unshare-net` leaves `pasta` no interface to copy, so it falls back to
-  **local mode** on a link-local address and an outbound connect returns
-  `Connection refused`. That is a namespace with a default route and no path
-  out — *isolated, not policed*, wearing a route, which is the shape most
-  likely to be mistaken for success.
+  `pasta --config-net` brings up the interface, assigns the address, and
+  installs the default route. An earlier version of this module emitted
+  `ip addr add`, `ip link set`, and `ip route add` steps of its own; all three
+  failed with `Cannot find device "sb0"`, because nothing had created the
+  device and `pasta` had not yet run. They were not merely redundant — they ran
+  *before* the thing that makes them possible.
 
-  A veth pair costs `CAP_NET_ADMIN` on the host, which `pasta` was chosen to
-  avoid. That cost is real, and it is why the capability probe must gate this
-  rather than assume it.
-
-  ## ⚠️ The default route is load-bearing
-
-  Without it the kernel rejects an outbound connect with `enetunreach` *before*
-  the nat hook runs, so a missing route prints exactly like a refused redirect.
-  Omitting it made the first spike report `redirect did NOT fire` — a true
-  statement about the wrong thing. Without the route the sandbox is merely
-  *isolated*: the state `--unshare-net` already gave, which passes every denial
-  check while enforcing no policy at all.
+  ⚠️ **The default route is still load-bearing, it is simply not ours to
+  install.** Without it the kernel rejects an outbound connect with
+  `enetunreach` *before* the nat hook runs, and the sandbox is merely
+  *isolated* — the state `--unshare-net` already gave, which passes every
+  denial check while enforcing no policy at all. `pasta` provides it; this
+  module's job is to not get in the way, and `verify_route/1` exists so its
+  absence is caught rather than assumed.
 
   ## Why the redirect is `output` rather than `prerouting`
 
@@ -87,43 +80,28 @@ defmodule ExSandbox.Egress.Netns do
   end
 
   @doc """
-  The commands that create and address the sandbox's namespace.
+  The commands that install the redirect into a *running* tenant's namespace.
 
-  Run on the **host**, before the tenant launches. Unlike the `pasta` shape
-  this replaced, the namespace exists before anything runs in it, so the
-  ordering is the plain one: configure, then launch.
+  `holder_pid` is the pid of the process **inside** the namespace.
+
+  ⚠️ It is not `pasta`'s own pid, and the difference is a silent catastrophe
+  rather than an error. `pasta -P` writes its **host-side** pid; the tenant
+  runs in a child. Measured:
+
+      pidfile pid = 10 -> ns net:[4026534462]   <- the HOST namespace
+      tenant  pid = 11 -> ns net:[4026534599]   <- the sandbox namespace
+
+  `nsenter -t 10 -n nft …` installs the sandbox's redirect **into the host
+  namespace**: it succeeds, warns about nothing, and leaves the tenant
+  unpoliced while the host acquires a stray NAT rule. `ExSandbox.Egress.Pasta`
+  finds the holder by comparing namespace inodes for exactly this reason.
   """
-  @spec setup_commands(Policy.source_key(), :inet.port_number(), keyword()) :: [[String.t()]]
-  def setup_commands(source_key, pool_port, opts \\ []) do
-    name = Keyword.get(opts, :name, namespace_name(source_key))
-    %{gateway: gateway, sandbox: sandbox} = addresses(source_key)
-    {host_if, sandbox_if} = interface_names(source_key)
-
+  @spec redirect_commands(pos_integer(), :inet.port_number()) :: [[String.t()]]
+  def redirect_commands(holder_pid, pool_port)
+      when is_integer(holder_pid) and holder_pid > 0 do
     [
-      ["ip", "netns", "add", name],
-      ["ip", "link", "add", host_if, "type", "veth", "peer", "name", sandbox_if],
-      ["ip", "link", "set", sandbox_if, "netns", name],
-      # The host end carries the gateway address the sandbox routes through.
-      ["ip", "addr", "add", "#{gateway}/30", "dev", host_if],
-      ["ip", "link", "set", host_if, "up"],
-      in_ns(name, ["ip", "addr", "add", "#{sandbox}/30", "dev", sandbox_if]),
-      in_ns(name, ["ip", "link", "set", sandbox_if, "up"]),
-      in_ns(name, ["ip", "link", "set", "lo", "up"]),
-      # ⚠️ See the moduledoc. Without this the connect fails `enetunreach`
-      # before the nat hook runs, and the sandbox is isolated rather than
-      # policed -- which passes every denial check.
-      in_ns(name, ["ip", "route", "add", "default", "via", gateway])
-    ] ++ redirect_commands(name, pool_port)
-  end
-
-  @doc """
-  The commands that install the redirect into a namespace.
-  """
-  @spec redirect_commands(String.t(), :inet.port_number()) :: [[String.t()]]
-  def redirect_commands(name, pool_port) when is_binary(name) do
-    [
-      in_ns(name, ["nft", "add", "table", "ip", "nat"]),
-      in_ns(name, [
+      nsenter(holder_pid, ["nft", "add", "table", "ip", "nat"]),
+      nsenter(holder_pid, [
         "nft",
         "add",
         "chain",
@@ -146,8 +124,9 @@ defmodule ExSandbox.Egress.Netns do
       # Measured -- `meta l4proto tcp` and `ip protocol tcp` are both accepted,
       # as is `tcp dport 1-65535`. The first is used because it matches all TCP
       # with no port predicate, which is the property the paragraph above
-      # depends on.
-      in_ns(name, [
+      # depends on; `tcp dport 1-65535` would install but reintroduces exactly
+      # the port match ruled out there.
+      nsenter(holder_pid, [
         "nft",
         "add",
         "rule",
@@ -165,52 +144,6 @@ defmodule ExSandbox.Egress.Netns do
   end
 
   @doc """
-  The commands that give back a sandbox's namespace and its veth pair.
-
-  ⚠️ Deleting the namespace destroys the sandbox-side veth with it, but the
-  **host-side end survives** if the namespace was never created or the pair was
-  built and the move failed. Both are removed, and both tolerate absence --
-  destroy runs for sandboxes that failed to provision and runs twice for ones
-  that did (`003-FR-013`).
-  """
-  @spec teardown_commands(Policy.source_key(), keyword()) :: [[String.t()]]
-  def teardown_commands(source_key, opts \\ []) do
-    name = Keyword.get(opts, :name, namespace_name(source_key))
-    {host_if, _} = interface_names(source_key)
-
-    [
-      ["ip", "netns", "delete", name],
-      ["ip", "link", "delete", host_if]
-    ]
-  end
-
-  @doc """
-  The namespace name for a sandbox's `/30`.
-
-  Derived from the address rather than from the sandbox id: the `/30` is what
-  the policy is keyed by, so a name derived from it cannot drift from the
-  identity the acceptor enforces against.
-  """
-  @spec namespace_name(Policy.source_key()) :: String.t()
-  def namespace_name({a, b, c, d}), do: "sb-#{a}-#{b}-#{c}-#{d}"
-
-  @doc """
-  The host-side and sandbox-side veth names for a `/30`.
-
-  ⚠️ Both are derived from the `/30` and both must be unique **on the host** —
-  the host end lives in the host's namespace alongside every other sandbox's.
-  A fixed name would work for one sandbox and collide on the second, with
-  `RTNETLINK answers: File exists`.
-
-  ⚠️ Kernel interface names are capped at 15 characters. `10.255.255.252`
-  yields `sbh-10-255-255-252`, which is 18 and would be rejected — so the last
-  octet alone is used, which is unique because the allocator hands out
-  non-overlapping `/30`s from one `/16`.
-  """
-  @spec interface_names(Policy.source_key()) :: {String.t(), String.t()}
-  def interface_names({_a, _b, c, d}), do: {"sbh#{c}x#{d}", "sbs#{c}x#{d}"}
-
-  @doc """
   The command that reads a namespace's routing table.
 
   Used to verify `pasta` installed a default route before the tenant is
@@ -218,8 +151,8 @@ defmodule ExSandbox.Egress.Netns do
   `enetunreach` before the redirect is consulted, and the sandbox is isolated
   rather than policed — a state that passes every denial check.
   """
-  @spec route_command(String.t()) :: [String.t()]
-  def route_command(name) when is_binary(name), do: in_ns(name, ["ip", "-4", "route", "show"])
+  @spec route_command(pos_integer()) :: [String.t()]
+  def route_command(holder_pid), do: nsenter(holder_pid, ["ip", "-4", "route", "show"])
 
   @doc """
   Whether `ip route show` output carries a default route.
@@ -228,19 +161,31 @@ defmodule ExSandbox.Egress.Netns do
   def default_route?(output) when is_binary(output), do: String.contains?(output, "default via")
 
   @doc """
-  Wraps a tenant command so it launches inside the sandbox's namespace.
+  The `pasta` invocation that creates a namespace and starts the tenant in it.
 
-  ⚠️ `--unshare-net` must already have been removed by the caller. Left in
-  place, `bwrap` would put the tenant in a fresh **empty** namespace instead of
-  the configured one -- the policy would be installed correctly, on a namespace
-  nothing uses, and every denial check would still pass because an empty
-  namespace denies everything too.
+  ⚠️ `--runas 0` is required and is not a hardening choice. Without it `pasta`
+  drops to `nobody`, then cannot re-enter the namespace it just made:
+
+      Started as root, will change to nobody.
+      Failed to join network namespace: Permission denied
+
+  ⚠️ `--config-net` is what makes this work without a host capability. Its one
+  real prerequisite is the `/dev/net/tun` **device**, not a capability, which is
+  why `probe_network_policy/0` checks for the device and `compose.isolation.yml`
+  declares it.
+
+  ⚠️ There is deliberately no `--interface` flag. An earlier version passed
+  `--interface sb0`, believing it named the namespace-side device; `-i` selects
+  the **host** interface to copy addresses and routes *from*, and the
+  namespace-side name is `-I/--ns-ifname`. Measured:
+  `pasta --config-net --interface sb0 …` fails with `Invalid interface name
+  sb0: No such device`. Neither is needed — `pasta` picks the host's default
+  route interface, which is the one with a route out.
   """
-  @spec in_namespace(Policy.source_key(), [String.t()], keyword()) :: [String.t()]
-  def in_namespace(source_key, [_ | _] = tenant_command, opts \\ []) do
-    name = Keyword.get(opts, :name, namespace_name(source_key))
-    in_ns(name, tenant_command)
+  @spec pasta_command(String.t(), [String.t()]) :: [String.t()]
+  def pasta_command(pidfile, [_ | _] = tenant_command) do
+    ["pasta", "--config-net", "--runas", "0", "-P", pidfile, "--"] ++ tenant_command
   end
 
-  defp in_ns(name, command), do: ["ip", "netns", "exec", name] ++ command
+  defp nsenter(pid, command), do: ["nsenter", "-t", "#{pid}", "-n"] ++ command
 end

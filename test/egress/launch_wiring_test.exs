@@ -41,7 +41,11 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
       refute "--unshare-net" in plan.tenant_command,
              "the tenant would unshare a fresh empty namespace while the policy sat on the configured one"
 
-      assert ["ip", "netns", "exec", "sb-10-0-0-0" | _] = plan.tenant_command
+      # The tenant runs *under* pasta rather than joining a pre-built namespace.
+      assert ["pasta" | _] = plan.pasta_command
+
+      tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
+      assert tenant == plan.tenant_command
     end
 
     test "an unconfined command is refused rather than policed" do
@@ -82,7 +86,7 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
       {:ok, plan} = LaunchPlan.build(source_key, 9999, @confined)
 
       assert plan.source_key == source_key
-      assert plan.namespace == ExSandbox.Egress.Netns.namespace_name(source_key)
+      assert plan.pidfile == LaunchPlan.default_pidfile(source_key)
 
       # ⚠️ The address is no longer configured by us -- `pasta --config-net`
       # assigns it, copying the host's default-route interface. What must still
@@ -96,17 +100,15 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
              "the sandbox address does not mask back to the /30 its policy is filed under"
     end
 
-    test "every setup step names this plan's own namespace" do
-      # ⚠️ A step that omits the namespace configures the *host*. On a developer
+    test "every redirect step enters the holder's namespace" do
+      # ⚠️ A step that omits `nsenter` configures the *host*. On a developer
       # machine that fails; in the isolation container it **succeeds**, and the
       # host acquires a NAT rule redirecting its own outbound TCP while the
       # sandbox is left entirely unpoliced.
       {:ok, plan} = LaunchPlan.build({10, 0, 0, 0}, 9999, @confined)
 
-      assert LaunchPlan.namespaced?(plan)
-
-      for step <- plan.setup_steps, "nft" in step do
-        assert ["ip", "netns", "exec", "sb-10-0-0-0" | _] = step
+      for step <- LaunchPlan.redirect_steps(plan, 7788) do
+        assert ["nsenter", "-t", "7788", "-n" | _] = step
       end
     end
   end

@@ -54,21 +54,13 @@ defmodule ExSandbox.Egress.LaunchPlan do
 
   @type t :: %__MODULE__{
           source_key: Policy.source_key(),
-          namespace: String.t(),
-          setup_steps: [[String.t()]],
-          teardown_steps: [[String.t()]],
+          pidfile: String.t(),
+          pasta_command: [String.t()],
           tenant_command: [String.t()],
           pool_port: :inet.port_number()
         }
 
-  defstruct [
-    :source_key,
-    :namespace,
-    :setup_steps,
-    :teardown_steps,
-    :tenant_command,
-    :pool_port
-  ]
+  defstruct [:source_key, :pidfile, :pasta_command, :tenant_command, :pool_port]
 
   @doc """
   Builds the plan for one sandbox, or refuses.
@@ -93,20 +85,15 @@ defmodule ExSandbox.Egress.LaunchPlan do
 
   def build(source_key, pool_port, tenant_command, opts) when is_list(tenant_command) do
     if "--unshare-net" in tenant_command do
-      # ⚠️ Removed, not supplemented. Keeping it would put the tenant in a fresh
-      # **empty** namespace while the policy sat on the configured one --
-      # isolation restored silently, policy discarded, and every denial check
-      # still green, because an empty namespace denies everything too.
       inner = Enum.reject(tenant_command, &(&1 == "--unshare-net"))
-      name = Keyword.get(opts, :name, Netns.namespace_name(source_key))
+      pidfile = Keyword.get(opts, :pidfile, default_pidfile(source_key))
 
       {:ok,
        %__MODULE__{
          source_key: source_key,
-         namespace: name,
-         setup_steps: Netns.setup_commands(source_key, pool_port, name: name),
-         teardown_steps: Netns.teardown_commands(source_key, name: name),
-         tenant_command: Netns.in_namespace(source_key, inner, name: name),
+         pidfile: pidfile,
+         pasta_command: Netns.pasta_command(pidfile, inner),
+         tenant_command: inner,
          pool_port: pool_port
        }}
     else
@@ -115,31 +102,29 @@ defmodule ExSandbox.Egress.LaunchPlan do
   end
 
   @doc """
-  Whether every setup step runs against this plan's own namespace.
+  The redirect steps for a plan, once the namespace holder is known.
 
-  ⚠️ A step that names a different namespace -- or none -- configures the
-  **host**. On a developer machine that fails; on the isolation host it
-  *succeeds*, and the sandbox is policed by rules installed on the wrong
-  network stack while the host acquires a NAT rule redirecting its own traffic.
+  ⚠️ Deliberately **not** a field on the struct. The holder pid does not exist
+  when the plan is built — the namespace it names is created by running the
+  plan. A field would have to be `nil` at build time and filled in later, and
+  the failure mode of that shape is a plan whose steps were composed against
+  `nil` and quietly target the wrong namespace.
 
-  Exposed as a predicate rather than left implicit so the property is testable
-  where the commands cannot run, which is every host that is not Linux.
+  Requiring the pid as an argument means there is no way to ask for these
+  commands without having one.
   """
-  @spec namespaced?(t()) :: boolean()
-  def namespaced?(%__MODULE__{namespace: name, setup_steps: steps}) do
-    Enum.all?(steps, fn step ->
-      case step do
-        ["ip", "netns", "add", ^name] -> true
-        ["ip", "netns", "exec", ^name | _] -> true
-        # The veth pair and the host-side address are created in the host
-        # namespace by necessity -- the pair must exist before either end can
-        # be moved -- so they are the deliberate exceptions.
-        ["ip", "link", "add" | _] -> true
-        ["ip", "link", "set", _if, "netns", ^name] -> true
-        ["ip", "addr", "add", _addr, "dev", _if] -> true
-        ["ip", "link", "set", _if, "up"] -> true
-        _ -> false
-      end
-    end)
+  @spec redirect_steps(t(), pos_integer()) :: [[String.t()]]
+  def redirect_steps(%__MODULE__{pool_port: pool_port}, holder_pid) do
+    Netns.redirect_commands(holder_pid, pool_port)
   end
+
+  @doc """
+  Where `pasta` records its host-side pid for this sandbox.
+
+  ⚠️ The file contains **pasta's** pid, not the tenant's. See
+  `ExSandbox.Egress.Pasta` for why the difference is a silent catastrophe
+  rather than a detail.
+  """
+  @spec default_pidfile(Policy.source_key()) :: String.t()
+  def default_pidfile({a, b, c, d}), do: "/var/run/axonn-pasta-#{a}-#{b}-#{c}-#{d}.pid"
 end

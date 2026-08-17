@@ -13,11 +13,11 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
   ⚠️ The dangerous direction here is not "the tenant fails to start". It is
   "the tenant starts anyway".
 
-  ## The order
+  ## Why the order inverted
 
-  Setup completes, then the tenant launches into a finished namespace. Getting
-  back to that plain order took two attempts -- see `ExSandbox.Egress.Netns` on
-  why `pasta` could not carry a `bwrap`-confined tenant.
+  The plan no longer configures a namespace before launch. It cannot: `pasta`
+  creates the namespace *by starting the tenant in it*, so the policy is
+  installed afterwards, against a running tenant's pid. See the module.
   """
   use ExUnit.Case, async: true
 
@@ -34,46 +34,52 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
 
     test "the tenant launch no longer unshares the network", %{plan: plan} do
       # ⚠️ `--unshare-net` is a namespace with **no interfaces**. Keeping it
-      # would put the tenant in a *fresh empty* namespace while the policy sat
-      # on the configured one -- isolation restored silently, policy discarded,
-      # and every denial check still green.
+      # would put the tenant in a *fresh empty* namespace while `pasta`
+      # configured a different one -- isolation restored silently, policy
+      # discarded, and every denial check still green.
       refute "--unshare-net" in plan.tenant_command
+      refute "--unshare-net" in plan.pasta_command
     end
 
-    test "the tenant joins the namespace that was configured, by name", %{plan: plan} do
-      assert ["ip", "netns", "exec", name | _] = plan.tenant_command
-      assert name == plan.namespace
+    test "pasta runs the tenant rather than the tenant joining a namespace", %{plan: plan} do
+      # The inversion. An earlier design had the tenant `ip netns exec` into a
+      # pre-built namespace; `pasta` cannot attach to one made that way
+      # (measured: `Failed to join network namespace: Permission denied`).
+      assert hd(plan.pasta_command) == "pasta"
 
-      # A plan that configures `sb-a` and launches into `sb-b` installs a
-      # correct policy on a namespace nothing uses.
-      assert LaunchPlan.namespaced?(plan)
+      tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
+      assert tenant == plan.tenant_command
     end
 
-    test "every setup step precedes the tenant launch", %{plan: plan} do
-      # Ordering is the property, and it is not expressible as a set. The
-      # redirect must exist before the tenant can emit a packet.
-      assert plan.setup_steps != []
-      assert Enum.find_index(plan.setup_steps, &("rule" in &1)) != nil
+    test "the pidfile pasta writes is the one the plan names", %{plan: plan} do
+      # The holder is found by searching this pid's children, so a plan whose
+      # pidfile disagrees with pasta's would search the wrong process -- and
+      # find nothing, which reads as an architectural refusal.
+      assert plan.pidfile in plan.pasta_command
     end
 
-    test "the plan carries the route, without which nothing is policed", %{plan: plan} do
-      # The defect the first spike hit: no route means `enetunreach` before the
-      # nat hook runs, which prints exactly like a refused redirect.
-      assert Enum.any?(plan.setup_steps, fn step ->
-               "route" in step and "default" in step
-             end),
-             "no default route: the sandbox would be isolated, not policed"
+    test "the redirect targets the pid it is given, not pasta's own", %{plan: plan} do
+      # ⚠️ THE trap on this path. `pasta -P` records pasta's HOST-side pid; the
+      # tenant runs in a child. `nsenter -t <pasta pid> -n nft ...` installs the
+      # sandbox's redirect into the HOST namespace: it succeeds, warns about
+      # nothing, and leaves the tenant unpoliced.
+      for step <- LaunchPlan.redirect_steps(plan, 4242) do
+        assert Enum.take(step, 4) == ["nsenter", "-t", "4242", "-n"]
+      end
     end
 
-    test "the plan carries the redirect to the acceptor's port", %{plan: plan} do
-      assert Enum.any?(plan.setup_steps, fn step -> ":#{@port}" in step end)
+    test "the redirect carries the acceptor's port", %{plan: plan} do
+      steps = LaunchPlan.redirect_steps(plan, 4242)
+      assert Enum.any?(steps, fn step -> ":#{@port}" in step end)
     end
 
-    test "the plan can give back what it created", %{plan: plan} do
-      # A namespace and a veth pair outlive the process that made them. Without
-      # teardown, a host leaks one of each per sandbox until `ip` refuses.
-      assert plan.teardown_steps != []
-      assert Enum.any?(plan.teardown_steps, &("delete" in &1))
+    test "the holder pid cannot be omitted", %{plan: plan} do
+      # ⚠️ Deliberately an argument rather than a struct field. The holder does
+      # not exist when the plan is built -- running the plan is what creates the
+      # namespace it names. A `nil` field would let redirect steps be composed
+      # against nothing and quietly target the wrong namespace.
+      refute Map.has_key?(plan, :holder_pid)
+      assert_raise FunctionClauseError, fn -> LaunchPlan.redirect_steps(plan, nil) end
     end
   end
 
