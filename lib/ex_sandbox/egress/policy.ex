@@ -62,12 +62,48 @@ defmodule ExSandbox.Egress.Policy do
   """
   @spec permits?([destination()], {ip() | String.t(), :inet.port_number()}) :: boolean()
   def permits?(allowed, {host, port}) when is_list(allowed) do
+    normalised = normalise_host(host)
+
     Enum.any?(allowed, fn
-      {^host, ^port} -> true
-      {^host, :any_port} -> true
-      _ -> false
+      {allowed_host, allowed_port} when allowed_port == port or allowed_port == :any_port ->
+        normalise_host(allowed_host) == normalised
+
+      _ ->
+        false
     end)
   end
 
   def permits?(_allowed, _destination), do: false
+
+  # ⚠️ **The two sides of this comparison are written in different forms, and
+  # nothing but this function makes them comparable.**
+  #
+  # `OriginalDst.decode/1` yields `{93, 184, 216, 34}` because that is what a
+  # `sockaddr_in` contains. An allowlist resolved from a project's settings is
+  # naturally written `"93.184.216.34"`. `permits?/2` matches the host by
+  # equality, so without normalisation a tuple destination never matches a
+  # string entry.
+  #
+  # That defect **fails closed**, which is exactly what makes it dangerous to
+  # leave to review: nothing is breached, so no denial check goes red. Every
+  # permitted destination is silently refused while the code reads as working
+  # enforcement, and the only symptom is the "permitted destination is
+  # reachable" check failing with no indication that a type mismatch caused it.
+  #
+  # Normalising to the tuple form rather than the string form is deliberate:
+  # `:inet.parse_address/1` rejects what is not an address, so a malformed
+  # entry stays unequal to everything instead of matching by string identity.
+  defp normalise_host(host) when is_tuple(host), do: host
+
+  defp normalise_host(host) when is_binary(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, address} -> address
+      # Kept as the original string rather than coerced: an unparseable host is
+      # not an address, and must not become equal to another unparseable one by
+      # collapsing to a shared sentinel.
+      {:error, _} -> host
+    end
+  end
+
+  defp normalise_host(host), do: host
 end

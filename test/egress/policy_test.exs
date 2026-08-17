@@ -73,4 +73,39 @@ defmodule ExSandbox.Egress.PolicyTest do
       refute Policy.permits?(nil, {"93.184.216.34", 443})
     end
   end
+  describe "an allowlist and a decoded destination must be comparable (T060a3)" do
+    test "a destination decoded as an IP tuple matches an allowlist written as a string" do
+      # ⚠️ This is the seam between two independently-written modules.
+      # `OriginalDst.decode/1` yields `{93, 184, 216, 34}` because that is what
+      # a `sockaddr_in` contains, while an allowlist resolved from project
+      # settings is naturally written `"93.184.216.34"`. `permits?/2` matches
+      # the host by *equality*, so without normalisation these never match.
+      #
+      # It fails closed, which is why nothing would breach -- and why it would
+      # be hard to find. Every permitted destination would be silently refused
+      # while the code read as working enforcement, and the "permitted
+      # destination is reachable" conformance check would fail with no
+      # indication that the cause was a type mismatch.
+      assert Policy.permits?([{"93.184.216.34", 443}], {{93, 184, 216, 34}, 443})
+    end
+
+    test "a tuple allowlist entry matches a string destination" do
+      # The same seam from the other side, so normalisation cannot be
+      # one-directional and pass this group.
+      assert Policy.permits?([{{93, 184, 216, 34}, 443}], {"93.184.216.34", 443})
+    end
+
+    test "normalising host forms does not make different addresses equal" do
+      # ⚠️ The obvious way to close the seam -- coerce both sides to strings --
+      # must not become "compare loosely". A neighbouring address stays denied.
+      refute Policy.permits?([{"93.184.216.34", 443}], {{93, 184, 216, 35}, 443})
+      refute Policy.permits?([{{10, 0, 0, 1}, 443}], {"10.0.0.2", 443})
+    end
+
+    test "a malformed host string is not silently treated as a match" do
+      refute Policy.permits?([{"93.184.216.34", 443}], {"not-an-address", 443})
+      refute Policy.permits?([{"", 443}], {{93, 184, 216, 34}, 443})
+    end
+  end
+
 end
