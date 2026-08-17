@@ -154,7 +154,7 @@ defmodule ExSandbox.Mechanism.Beam do
         #      set to a node name, reconciliation compared node names against a
         #      list of ids, so a running sandbox never appeared in it -- every
         #      one looked like an orphan to be reclaimed.
-        {:ok, %{sandbox | mechanism_ref: sandbox.id, context: build_context(sandbox)}}
+        {:ok, %{sandbox | mechanism_ref: sandbox.id, context: context_for(sandbox)}}
 
       {:error, reason} ->
         {:error, reason}
@@ -449,7 +449,7 @@ defmodule ExSandbox.Mechanism.Beam do
     case NodeLauncher.launch(sandbox) do
       {:ok, launched} ->
         store(sandbox.id, launched)
-        {:ok, %{sandbox | mechanism_ref: sandbox.id, context: build_context(sandbox)}}
+        {:ok, %{sandbox | mechanism_ref: sandbox.id, context: context_for(sandbox)}}
 
       {:error, reason} ->
         {:error, reason}
@@ -479,12 +479,36 @@ defmodule ExSandbox.Mechanism.Beam do
   #
   # ⚠️ This must never become a reason to start distribution. That would trade
   # `FR-003`'s cluster boundary for a string nobody parses.
-  defp build_context(sandbox) do
-    %{
+  @doc false
+  # Public only so `ExSandbox.Mechanism.BeamContextTest` can pin the propagation
+  # contract on a host where the launch path refuses before this is reached.
+  # Not part of the mechanism interface -- `@doc false`, and no consumer calls it.
+  def context_for(sandbox) do
+    # ⚠️ **Merged onto the caller's context, not substituted for it.**
+    #
+    # This returned a bare map of the three keys below until 005 T060a2 gave a
+    # caller something to lose. `ExSandbox.Sandbox` documents `context` as
+    # "stored, compared, and propagated -- never parsed"; replacing it propagates
+    # nothing. `Axonn.Sandbox.Provision` resolves a tenant's `network_allowlist`
+    # before calling `provision/1` -- refusing malformed entries, aborting the
+    # provision on an unreadable one -- and passes it here, where it was dropped.
+    #
+    # Nothing failed. The parse was correct, every test of it passed, and the
+    # sandbox came back `:provisioned` enforcing no policy at all. That is the
+    # `--unshare-net` shape again: a boundary that permits nothing reads exactly
+    # like a correct one under checks that only test denial. Here the policy was
+    # not even wrong, it was absent, having been validated and discarded.
+    #
+    # The mechanism's own keys win the merge deliberately: a host must not be
+    # able to supply an `:address` or a `:connect` and have the conformance
+    # suite probe something other than this sandbox.
+    host_context = if is_map(sandbox.context), do: sandbox.context, else: %{}
+
+    Map.merge(host_context, %{
       address: "peer:" <> sandbox.id,
       exec: fn command -> exec_in_sandbox(sandbox, command) end,
       connect: fn host, port -> connect_from_sandbox(sandbox, host, port) end
-    }
+    })
   end
 
   # ⚠️ A native connect probe, because the shell one cannot work here (005
