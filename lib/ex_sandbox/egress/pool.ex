@@ -142,9 +142,27 @@ defmodule ExSandbox.Egress.Pool do
   # sandbox is not aware it is being proxied and has no frame in which to
   # receive a rejection, so from inside a denied destination behaves like an
   # unreachable one -- which is what `FR-011a` describes.
-  defp handle_connection(socket, registry) do
+  # ⚠️ `destination_reader` exists **only** so this path is reachable in a test,
+  # and its default is the real reader. The reason it is needed is measured, not
+  # hypothetical: on macOS `OriginalDst.read/1` returns `{:error, :unavailable}`
+  # for every connection, so the `:permitted` branch below never executes and
+  # `relay/2` is dead code there. Deleting the relay call entirely left all 306
+  # host tests green -- the same defect species as the unsupervised pool and the
+  # unreferenced `Binding`, found the same way, by sabotage rather than review.
+  #
+  # ⚠️ It is a **test seam, not a configuration option**. It is not read from
+  # application config and no consumer can set it: a host able to substitute the
+  # destination reader could name any destination it liked and have the policy
+  # checked against that instead of the kernel's record, which is exactly the
+  # forgeable claim `OriginalDst` exists to prevent. The pool's public
+  # `start_link/1` does not accept it.
+  @doc false
+  # Public only so `pool_relay_wiring_test.exs` can drive the permit-and-relay
+  # path with a stub reader. Not part of the interface (`FR-014`), and no
+  # consumer calls it -- the accept loop above is its only production caller.
+  def handle_connection(socket, registry, destination_reader \\ &OriginalDst.read/1) do
     with {:ok, source} <- source_address(socket),
-         {:ok, destination} <- OriginalDst.read(socket),
+         {:ok, destination} <- destination_reader.(socket),
          :permitted <- decide(source, destination, registry) do
       relay(socket, destination)
     else
@@ -173,17 +191,40 @@ defmodule ExSandbox.Egress.Pool do
     end
   end
 
-  # ⚠️ Relaying is not yet implemented, and this is the honest placeholder for
-  # it rather than a silent success. `decide/3` has already permitted the
-  # connection, so closing here denies something the policy allows -- a
-  # false *negative*, which fails closed and is visible as the "permitted
-  # destination is reachable" check not passing. It is not a false pass.
+  # ⚠️ This was a placeholder that logged and closed until T060a9. The
+  # placeholder was honest -- `decide/3` had already permitted the connection,
+  # so closing denied something the policy allows, a false *negative* that
+  # fails closed and shows up as the "permitted destination is reachable" check
+  # not passing. It was never a false pass.
   #
-  # Wiring the outbound half needs the netns and redirect rules T060a3 installs;
-  # until those exist there is nothing to relay from.
+  # ⚠️ The note it carried said wiring the outbound half "needs the netns and
+  # redirect rules T060a3 installs". That was wrong, and the wrongness cost a
+  # cycle: T060a3b landed the netns and the check did not move. The relay never
+  # depended on the redirect -- it needs two sockets and a destination, both of
+  # which it is handed. Measured by the census declining to improve after the
+  # supposed blocker was removed.
+  #
+  # Runs in its own process: `splice/3` blocks until the connection ends, and
+  # calling it inline would stop this pool accepting anything else for the
+  # lifetime of one tenant connection -- a denial-of-service any sandbox could
+  # trigger by opening a connection and never closing it.
   defp relay(socket, destination) do
-    Logger.debug("egress: permitted #{inspect(destination)}, relay not yet wired")
-    :gen_tcp.close(socket)
+    {:ok, pid} = Task.start(fn -> ExSandbox.Egress.Relay.splice(socket, destination) end)
+
+    # The relay process must own the socket, or it is closed when this
+    # accept-loop iteration moves on. Same ownership rule that cost three
+    # apparent relay failures in `relay_test.exs` -- see `client_pair/0` there.
+    case :gen_tcp.controlling_process(socket, pid) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        # Fail closed: if ownership could not be transferred the relay cannot
+        # work, and a socket left open would hang the sandbox rather than
+        # refusing it.
+        Logger.warning("egress: could not hand off a permitted connection (#{inspect(reason)})")
+        :gen_tcp.close(socket)
+    end
   end
 
   # ⚠️ `warning`, not `debug`, and the level is load-bearing rather than a
