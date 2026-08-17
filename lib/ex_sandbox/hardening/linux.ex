@@ -536,15 +536,28 @@ defmodule ExSandbox.Hardening.Linux do
   end
 
   defp probe_network_policy do
-    # The same construction as filesystem confinement, probed separately because
-    # a host can support mount namespaces while denying network ones.
-    #
     # ⚠️ `--unshare-net` gives *isolation* -- a namespace with no route out --
     # which is not the same as *policy*. An allowlist needs a route that leads
-    # somewhere we control, and that is what `pasta` plus `/dev/net/tun`
-    # provide (005 T060a, contracts/egress.md).
+    # somewhere we control (005 T060a, contracts/egress.md).
+    #
+    # ⚠️ The third condition is the one measurement forced, and it is the
+    # reason this probe currently reports `false` on every host tried:
+    # **`pasta` and `bwrap` do not compose**. `pasta` starts its child with
+    # `CapEff=0` inside a user namespace whose mappings it could not write, and
+    # `bwrap` -- which must create a mount namespace, that being its entire
+    # job -- then fails with `No permissions to create new namespace`. Measured
+    # five ways, including `--unshare-user-try` and a pre-created userns fd;
+    # see `egress-path-measurements.md`.
+    #
+    # Reporting `true` here would be the exact failure this whole exercise
+    # exists to remove. `require_permitted_reachable/2` scores a refusal as a
+    # `guarantee_failure`, but the *denial* checks would all pass -- because a
+    # tenant that cannot launch, or one confined to an empty namespace, reaches
+    # nothing. A boundary that permits nothing is indistinguishable from a
+    # correct one under a suite that only tests denial, so an over-claiming
+    # probe converts "we cannot do this" into "we demonstrated this".
     executable_present?("bwrap") and can_unshare?("--unshare-net") and
-      pasta_usable?()
+      pasta_usable?() and policed_launch_composable?()
   end
 
   # `pasta` needs one thing this host may not have, and it is a **device**
@@ -554,16 +567,49 @@ defmodule ExSandbox.Hardening.Linux do
   # fails `Failed to open() /dev/net/tun` -> `Failed to set up tap device in
   # namespace`, rc=1. With it present, pasta brings up a genuinely separate
   # netns (different `/proc/self/ns/net` inode) while holding
-  # `CapEff=0000000000000000` -- no capability in the host netns at all, which
-  # is precisely what rootless Podman withholds and what killed the veth
-  # design.
+  # `CapEff=0000000000000000` -- no capability in the host netns at all.
   #
-  # Probing it here means a host without the device reports the third outcome
-  # (`012-FR-016a`) instead of failing with a confusing tap-device error, and
-  # -- more importantly -- instead of a network check passing because nothing
-  # could be attempted.
+  # ⚠️ That last property is why `pasta` was chosen and also why it cannot
+  # carry a confined tenant: the same empty capability set that makes it
+  # rootless-safe is what stops `bwrap` creating its mount namespace. See
+  # `policed_launch_composable?/0`.
   defp pasta_usable? do
     executable_present?("pasta") and File.exists?("/dev/net/tun")
+  end
+
+  # Whether a network-policed tenant can *also* be confined.
+  #
+  # ⚠️ Asks the question by attempting it rather than by inspecting
+  # capabilities, because the capability model here has already produced two
+  # wrong answers. `CapEff` is not the predicate: rootless Podman grants a full
+  # set inside its own user namespace, `--cap-drop=ALL` grants none, and default
+  # Docker grants a subset without `CAP_SYS_ADMIN` -- and `bwrap` fails in the
+  # last two for reasons no single bit explains. Running the composition is the
+  # only check that cannot be fooled by a capability set that looks sufficient.
+  defp policed_launch_composable? do
+    case System.cmd(
+           "pasta",
+           [
+             "--config-net",
+             "--runas",
+             "0",
+             "--",
+             "bwrap",
+             "--dev-bind",
+             "/",
+             "/",
+             "--",
+             "/bin/true"
+           ],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      _ -> false
+    end
+  rescue
+    # `pasta` absent is already covered by `pasta_usable?/0`; this guards the
+    # case where it exists but cannot be executed at all.
+    _ -> false
   end
 
   defp probe_disk_quota do
