@@ -9,8 +9,12 @@ defmodule ExSandbox.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: ExSandbox.Worker.start_link(arg)
-      # {ExSandbox.Worker, arg}
+      # Holds each running sandbox's egress allowlist, keyed by its source /30
+      # (005 T060a1). Started here rather than per-sandbox: `013-FR-014c` asks
+      # for blast radius, not process count, and a process per sandbox is the
+      # heaviest way to get it -- at 500 sandboxes that is 500 supervised
+      # processes doing almost nothing.
+      ExSandbox.Egress.Registry
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
