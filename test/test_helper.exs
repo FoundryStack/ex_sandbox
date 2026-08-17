@@ -15,7 +15,14 @@
 #
 # ## Run them here, without waiting for CI
 #
-#     docker compose -f docker/compose.isolation.yml run --rm --build isolation
+#     docker compose -f docker/compose.isolation.yml up --build \
+#       --abort-on-container-exit --exit-code-from isolation isolation
+#     # results: docker/results/suite.log, census: docker/results/census.txt
+#
+# ⚠️ Not `run --rm ... isolation sh -c ...`. A container command displaces
+# systemd as PID 1, `probe_cgroups/0` then reports no cgroup delegation, and
+# every isolation check fails with an R9 refusal that reads as a mechanism
+# defect rather than as an artefact of how it was launched (measured: 5/33).
 #
 # That container is a real Linux host with systemd as PID 1, cgroup v2
 # delegation, `setpriv`, and `bwrap` -- all five capabilities genuinely
