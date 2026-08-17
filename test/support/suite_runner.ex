@@ -37,7 +37,7 @@ defmodule ExSandbox.SuiteRunner do
   """
   @spec run(module(), keyword()) :: result()
   def run(mechanism, opts \\ []) do
-    suite = compile_suite(mechanism)
+    suite = compile_suite(mechanism, Keyword.get(opts, :credential_probe))
 
     suite.__ex_unit__().tests
     |> filter_describe(Keyword.get(opts, :describe))
@@ -143,7 +143,14 @@ defmodule ExSandbox.SuiteRunner do
 
   defp merge_context(context, _other), do: context
 
-  defp compile_suite(mechanism) do
+  # ⚠️ The probe is threaded through rather than fixed. Without it the
+  # credentials group reports the third outcome for every check -- correct
+  # behaviour for a host with no data store, and useless to a meta-test, which
+  # needs the group to actually *run* against a deliberately leaky probe. A
+  # meta-test that asserted "the credentials group fails a bad probe" while the
+  # group reported unavailable would pass by never running anything, which is
+  # the same vacuous green `run_setups/2` was fixed for.
+  defp compile_suite(mechanism, probe) do
     name = Module.concat([ExSandbox.GeneratedSuite, "S#{System.unique_integer([:positive])}"])
 
     Module.create(
@@ -164,7 +171,9 @@ defmodule ExSandbox.SuiteRunner do
         use ExUnit.Case, async: false
         @moduletag :skip
 
-        use ExSandbox.Conformance, mechanism: unquote(mechanism)
+        use ExSandbox.Conformance,
+          mechanism: unquote(mechanism),
+          credential_probe: unquote(probe)
       end,
       Macro.Env.location(__ENV__)
     )
