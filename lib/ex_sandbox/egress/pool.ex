@@ -201,6 +201,17 @@ defmodule ExSandbox.Egress.Pool do
   # instead, and the same assertion failed. The one host where the denial path
   # actually executes is the one where its log disappeared.
   #
+  # Why the container reaches this clause at all, measured rather than assumed:
+  # the transport test connects to the pool directly, with no netns and no
+  # redirect anywhere in the picture. On Linux a plain loopback socket still
+  # answers `SO_ORIGINAL_DST` -- measured in the isolation image,
+  # `{:ok, {{127,0,0,1}, 36039}}`, the socket's own local address. So the
+  # destination read *succeeds*, `decide/3` runs, finds no policy for that /30,
+  # and lands here as `{:refused, :unknown_source}`. On macOS the same read
+  # fails and the `{:error, _}` clause below runs instead. Same test, same
+  # assertion, two different branches -- which is why this could only be seen
+  # by running the container.
+  #
   # ⚠️ The first fix was `info`, and it was wrong for a reason worth keeping:
   # `config/test.exs` sets `level: :warning`, so `Logger.info` is dropped before
   # any handler sees it. Measured -- `capture_log` returned `""`. That fix reads
