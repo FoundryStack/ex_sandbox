@@ -210,4 +210,52 @@ defmodule ExSandbox.ConformanceExclusionsTest do
                "was never demonstrated (FR-012b)."
     end
   end
+
+  describe "the census separates the third outcome without softening it (FR-016a)" do
+    test "the census classifies on the marker the group actually emits" do
+      # The census keys on this string to tell a third outcome from a defect.
+      # It is produced in exactly one place -- `not_demonstrated/1`, which both
+      # `check/2` and `guarded_setup/1` route through -- and this asserts the
+      # two halves still agree. Without it, rewording the message would silently
+      # reclassify every third outcome as a mechanism defect, and the exit code
+      # `FR-016a` exists to make meaningful would go wrong in the quiet
+      # direction.
+      {_path, group} = Enum.find(sources(), fn {path, _} -> path =~ ~r/group\.ex$/ end)
+      {_path, census} = Enum.find(sources(), fn {path, _} -> path =~ ~r/census\.ex$/ end)
+
+      [_, marker] = Regex.run(~r/@marker "([^"]+)"/, census)
+
+      assert group =~ marker,
+             "the census matches on #{inspect(marker)}, which `not_demonstrated/1` " <>
+               "no longer emits. The two must be changed together or every third " <>
+               "outcome silently becomes a defect."
+    end
+
+    test "an unrecognised failure counts as a defect, not as unavailable" do
+      # The direction of the default is the whole safety property. Matching that
+      # breaks must over-report failures (someone investigates) rather than
+      # convert real violations into "unavailable" and return green.
+      {_path, census} = Enum.find(sources(), fn {path, _} -> path =~ ~r/census\.ex$/ end)
+
+      [_, body] = Regex.run(~r/defp third_outcome\?\(failures\) do(.*?)\n  end/s, census)
+
+      assert body =~ "Enum.all?",
+             "third_outcome?/1 must require *every* failure to carry the marker. " <>
+               "Enum.any? would let a check that reported unavailable *and* failed " <>
+               "an assertion count as a third outcome, hiding a real defect."
+    end
+
+    test "the census cannot change a verdict" do
+      # It is a formatter: it observes what the suite decided. A rescue or a
+      # verdict-setting call here would make it the exclusion `FR-011` forbids,
+      # reachable by anyone who adds a formatter flag.
+      {_path, census} = Enum.find(sources(), fn {path, _} -> path =~ ~r/census\.ex$/ end)
+
+      refute census =~ ~r/\brescue\b/,
+             "the census must not rescue: classifying is not deciding (FR-011)"
+
+      refute census =~ "ExUnit.AssertionError",
+             "the census must not raise or suppress assertions; it counts only"
+    end
+  end
 end
