@@ -535,7 +535,32 @@ defmodule ExSandbox.Hardening.Linux do
   defp probe_network_policy do
     # The same construction as filesystem confinement, probed separately because
     # a host can support mount namespaces while denying network ones.
-    executable_present?("bwrap") and can_unshare?("--unshare-net")
+    #
+    # ⚠️ `--unshare-net` gives *isolation* -- a namespace with no route out --
+    # which is not the same as *policy*. An allowlist needs a route that leads
+    # somewhere we control, and that is what `pasta` plus `/dev/net/tun`
+    # provide (005 T060a, contracts/egress.md).
+    executable_present?("bwrap") and can_unshare?("--unshare-net") and
+      pasta_usable?()
+  end
+
+  # `pasta` needs one thing this host may not have, and it is a **device**
+  # rather than a capability.
+  #
+  # ⚠️ Measured 2026-08-17: with `/dev/net/tun` absent, `pasta --config-net`
+  # fails `Failed to open() /dev/net/tun` -> `Failed to set up tap device in
+  # namespace`, rc=1. With it present, pasta brings up a genuinely separate
+  # netns (different `/proc/self/ns/net` inode) while holding
+  # `CapEff=0000000000000000` -- no capability in the host netns at all, which
+  # is precisely what rootless Podman withholds and what killed the veth
+  # design.
+  #
+  # Probing it here means a host without the device reports the third outcome
+  # (`012-FR-016a`) instead of failing with a confusing tap-device error, and
+  # -- more importantly -- instead of a network check passing because nothing
+  # could be attempted.
+  defp pasta_usable? do
+    executable_present?("pasta") and File.exists?("/dev/net/tun")
   end
 
   defp probe_disk_quota do
