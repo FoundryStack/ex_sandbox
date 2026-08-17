@@ -33,6 +33,15 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @registry __MODULE__.Registry
 
+  # ⚠️ Declared here, with the other module attributes, and that placement is
+  # load-bearing. Defined further down beside the function using it, Elixir
+  # resolved it to `nil` at the use site -- `:gen_tcp.connect/4` with a `nil`
+  # timeout, and a compiler type warning was the only sign.
+  #
+  # Shorter than the exec timeout: three denied destinations at the exec budget
+  # would read as a hang, which is what the shell probe originally did.
+  @connect_probe_timeout_ms 3_000
+
   @impl true
   def required_capabilities do
     # What the launch actually needs, rather than the union of everything the
@@ -473,8 +482,52 @@ defmodule ExSandbox.Mechanism.Beam do
   defp build_context(sandbox) do
     %{
       address: "peer:" <> sandbox.id,
-      exec: fn command -> exec_in_sandbox(sandbox, command) end
+      exec: fn command -> exec_in_sandbox(sandbox, command) end,
+      connect: fn host, port -> connect_from_sandbox(sandbox, host, port) end
     }
+  end
+
+  # ⚠️ A native connect probe, because the shell one cannot work here (005
+  # T060b/T060d).
+  #
+  # The network conformance group probes a connection from inside the sandbox.
+  # Its shell probe needs `nc` or a bash `/dev/tcp`, and the isolation container
+  # has neither -- no netcat installed, and Debian's `/bin/sh` is `dash`, which
+  # has no `/dev/tcp` builtin. Measured: all three denial checks reported
+  # `{:no_probe, _}` and failed as inconclusive, which was the right verdict for
+  # the wrong question. A BEAM sandbox opens sockets fine; it just cannot do it
+  # through a shell.
+  #
+  # `:gen_tcp` is OTP, so it is present in the bare `erl` a sandbox runs -- the
+  # same constraint that rules out `Node` and every Elixir module here.
+  #
+  # ⚠️ Three verdicts, not two. `:etimedout` is what a DROP policy looks like
+  # from inside, and it must stay distinct from a rejection so the suite does
+  # not have to rank REJECT above DROP (`005-FR-011f`).
+  defp connect_from_sandbox(sandbox, host, port) do
+    address = String.to_charlist(host)
+    timeout = @connect_probe_timeout_ms
+
+    case call(sandbox, :gen_tcp, :connect, [address, port, [], timeout], timeout * 2) do
+      {:ok, {:ok, socket}} ->
+        _ = call(sandbox, :gen_tcp, :close, [socket], timeout)
+        :connected
+
+      {:ok, {:error, :timeout}} ->
+        :timeout
+
+      {:ok, {:error, :etimedout}} ->
+        :timeout
+
+      {:ok, {:error, _reason}} ->
+        :refused
+
+      # The sandbox itself became unreachable, which says nothing about the
+      # destination. Reported as neither, so the group's inconclusive clause
+      # fails rather than scoring a dead sandbox as a held boundary.
+      {:error, reason} ->
+        {:sandbox_unreachable, reason}
+    end
   end
 
   # ⚠️ `PATH` is set explicitly. The sandbox's environment is built by `env -i`

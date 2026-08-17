@@ -396,6 +396,58 @@ defmodule ExSandbox.Conformance.Network do
   # `REJECT` policy, which advertises the boundary's existence, over a `DROP`
   # policy, which does not.
   defp probe_connect(mechanism, sandbox, host, port, description) do
+    # ⚠️ A mechanism may supply its own connect probe, and for the BEAM
+    # mechanism it must. Measured in the isolation container: a BEAM sandbox
+    # has a shell but the image carries neither `netcat` nor `iproute2`, and
+    # Debian's `/bin/sh` is `dash`, which has no `/dev/tcp` -- that is a bash
+    # builtin. Every shell-based probe therefore reported `{:no_probe, _}` and
+    # all three denial checks failed as inconclusive.
+    #
+    # That was the correct verdict for the question asked ("did a connection
+    # attempt happen?" -- no) and the wrong question to be asking. A BEAM
+    # sandbox can open a socket perfectly well; it just cannot do it through a
+    # shell. So the mechanism gets to answer in its own terms, and the shell is
+    # the fallback for mechanisms that have no native way to try.
+    case native_connect(mechanism, sandbox, host, port, description) do
+      :no_native_probe -> shell_connect(mechanism, sandbox, host, port, description)
+      result -> result
+    end
+  end
+
+  # `context.connect` is a 2-arity function taking `{host, port}` and returning
+  # `:connected`, `:refused`, or `:timeout` -- the same three verdicts the shell
+  # probe produces, for the same reason (`FR-011f`).
+  defp native_connect(_mechanism, %{context: %{connect: connect}}, host, port, description)
+       when is_function(connect, 2) do
+    case connect.(host, port) do
+      :connected ->
+        {:succeeded, "the sandbox opened a connection to #{description} (#{host}:#{port})"}
+
+      :refused ->
+        {:refused, {description, host, port}}
+
+      :timeout ->
+        {:refused, {:no_answer_within_bound, description, host, port}}
+
+      # ⚠️ NOT `{:refused, _}`. The sandbox becoming unreachable says nothing
+      # about the destination -- and a sandbox that died mid-probe is exactly
+      # what a breached resource cap looks like. Scoring it as a refusal would
+      # let a crashing mechanism pass every denial check.
+      {:sandbox_unreachable, reason} ->
+        {:sandbox_unreachable,
+         "the sandbox itself became unreachable while probing #{description} " <>
+           "(#{inspect(reason)}), so nothing was established about the boundary"}
+
+      other ->
+        {:no_probe,
+         "this mechanism's `context.connect` returned #{inspect(other)}, which is " <>
+           "not one of :connected | :refused | :timeout, so nothing was established"}
+    end
+  end
+
+  defp native_connect(_mechanism, _sandbox, _host, _port, _description), do: :no_native_probe
+
+  defp shell_connect(mechanism, sandbox, host, port, description) do
     attempt =
       "if command -v nc >/dev/null 2>&1; then " <>
         "nc -z -w #{@probe_timeout_s} #{host} #{port}; " <>
