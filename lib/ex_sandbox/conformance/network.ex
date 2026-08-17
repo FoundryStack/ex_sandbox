@@ -176,15 +176,32 @@ defmodule ExSandbox.Conformance.Network do
         probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}")
 
       :unknown ->
-        # ⚠️ Not `{:refused, _}`. A mechanism that exposes no address for its
-        # sandboxes would otherwise pass this check by being unaddressable,
-        # which is indistinguishable from having no boundary at all. This shape
-        # falls through to `require_refused/2`'s inconclusive clause.
-        {:no_address,
-         "this mechanism's sandbox `context` carries no `:address` -- " <>
-           "`{host, port}` the sandbox listens on -- so one sandbox cannot " <>
-           "attempt to reach another, and 003-FR-002 cannot be established by " <>
-           "declining to try. Populate `context.address`."}
+        # ⚠️ The third outcome, NOT a contract violation -- and the container run
+        # is what made the difference visible.
+        #
+        # Not a pass, for the reason below: a mechanism that exposes no address
+        # would otherwise clear this check by being unaddressable, which is
+        # indistinguishable from having no boundary at all.
+        #
+        # But not a breach either. `FR-011e` makes the handle a declaration a
+        # mechanism owes the suite, and an undeclared handle means "this
+        # mechanism has not built the boundary yet", which is a different fact
+        # from "this mechanism's boundary leaked". Reporting it as a violation
+        # sent a reader to look for a defect that is not there -- the BEAM
+        # mechanism runs under `--unshare-net` and genuinely has no address to
+        # publish until `T060a` gives it one.
+        #
+        # The census is where this matters: `failed=` gates an exit code and
+        # demands investigation, `unavailable=` records a known gap.
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          "this mechanism's sandbox `context` carries no `:address` -- " <>
+            "`{host, port}` the sandbox listens on -- so one sandbox cannot " <>
+            "attempt to reach another and `003-FR-002` cannot be established " <>
+            "by declining to try.\n\n" <>
+            "This is not a pass: an unaddressable sandbox is indistinguishable " <>
+            "from one with no boundary. Populate `context.address` (`FR-011e`)."
+        )
     end
   end
 
@@ -306,15 +323,19 @@ defmodule ExSandbox.Conformance.Network do
         attempt_policy_write(mechanism, sandbox, handle)
 
       :undeclared ->
-        {:no_policy_handle,
-         "this mechanism's sandbox `context` carries no `:policy_handle` -- a " <>
-           "path or command naming where the egress allowlist is enforced -- so " <>
-           "`FR-011b` cannot be checked. It is not enough for the widening to " <>
-           "fail: on a host without root, every attempt fails for reasons having " <>
-           "nothing to do with the boundary, and a check that accepted that " <>
-           "would pass against a mechanism with no policy at all. Populate " <>
-           "`context.policy_handle` with the path the mechanism's allowlist is " <>
-           "read from."}
+        # Third outcome, for the same reason as `:address` above: an undeclared
+        # handle is an unfinished mechanism, not a violated guarantee.
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          "this mechanism's sandbox `context` carries no `:policy_handle` -- a " <>
+            "path naming where the egress allowlist is enforced -- so `FR-011b` " <>
+            "cannot be checked.\n\n" <>
+            "It is not enough for the widening attempt to fail: on a host " <>
+            "without root every attempt fails for reasons having nothing to do " <>
+            "with the boundary, and a check that accepted that would pass " <>
+            "against a mechanism with no policy at all. Populate " <>
+            "`context.policy_handle` (`FR-011e`)."
+        )
     end
   end
 

@@ -98,26 +98,41 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
              """
     end
 
-    test "no denial check reports the third outcome" do
-      # `capability_unavailable` is for a host that cannot enforce, not for a
-      # mechanism that does not confine. A porous mechanism reaching that
-      # outcome has found a way to be neither passed nor failed.
+    test "no denial check that could run reports the third outcome" do
+      # ⚠️ Scoped to the checks `PorousMechanism` gives the suite enough to
+      # attempt, and the scoping is the point.
+      #
+      # That mechanism declares no `:address` and no `:policy_handle`, so those
+      # two checks report the third outcome -- correctly. A mechanism that never
+      # claimed to confine the network has not violated a guarantee it never
+      # made (`FR-011e`), and reporting an undeclared handle as a breach sends a
+      # reader looking for a defect that is not there.
+      #
+      # The checks it *can* attempt must still fail. And the case this scoping
+      # would otherwise let through -- a mechanism that declares the handles and
+      # confines nothing anyway -- is covered by `OpenNetworkMechanism` below,
+      # which is the reason that fixture exists.
       results = network_results(ExSandbox.PorousMechanism)
 
-      wrongly_unavailable =
-        Enum.flat_map(@denial_checks, &matching(results.unavailable, &1))
+      attemptable = [
+        "reaching the platform's own listening port is refused",
+        "a destination outside the environment's allowlist is refused"
+      ]
+
+      wrongly_unavailable = Enum.flat_map(attemptable, &matching(results.unavailable, &1))
 
       assert wrongly_unavailable == [],
              """
              These network checks reported "host capability unavailable" against a
-             mechanism that confines nothing:
+             mechanism that confines nothing, and had everything they needed to
+             attempt the act:
 
                #{Enum.map_join(wrongly_unavailable, "\n  ", &inspect/1)}
 
-             The third outcome means the *host* could not demonstrate the
-             guarantee. A mechanism that lets every connection through has
-             demonstrated the opposite, and reporting it as undemonstrated hides
-             a real violation behind an honest-sounding label.
+             The third outcome is for a boundary that could not be *probed*. A
+             mechanism that let the connection through has demonstrated the
+             opposite, and reporting it as undemonstrated hides a real violation
+             behind an honest-sounding label.
              """
     end
 
@@ -148,6 +163,58 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
              It must report `capability_unavailable`: declaring no permitted
              destinations is an unfinished mechanism, not a violated guarantee,
              and the difference has to stay visible in the census.
+             """
+    end
+  end
+
+  describe "against a mechanism that declares a boundary and enforces none" do
+    # ⚠️ The shape the scoping above would otherwise let through, and the reason
+    # `OpenNetworkMechanism` exists. It publishes `:address`, `:permitted`,
+    # `:policy_handle`, and a `:connect` that reports success unconditionally --
+    # so every "the mechanism did not declare it" excuse is gone and the group
+    # has to produce a verdict on the guarantee itself.
+    test "every denial check fails, and none reports the third outcome" do
+      results = network_results(ExSandbox.OpenNetworkMechanism)
+
+      wrongly_passed = Enum.flat_map(@denial_checks, &matching(results.passed, &1))
+      wrongly_unavailable = Enum.flat_map(@denial_checks, &matching(results.unavailable, &1))
+
+      assert wrongly_passed == [],
+             """
+             These network checks PASSED against a mechanism whose `connect`
+             reports success for every destination:
+
+               #{Enum.map_join(wrongly_passed, "\n  ", &inspect/1)}
+             """
+
+      assert wrongly_unavailable == [],
+             """
+             These network checks reported "host capability unavailable" against a
+             mechanism that DECLARED its handles and then let every connection
+             through:
+
+               #{Enum.map_join(wrongly_unavailable, "\n  ", &inspect/1)}
+
+             Once a mechanism declares a boundary, failing to enforce it is a
+             violation and nothing else. The third outcome here would file a
+             real breach under the same label as an unfinished mechanism.
+             """
+    end
+
+    test "the permitted-direction check passes" do
+      # The one check this mechanism should clear: it declares a permitted
+      # destination and reaches it. A group that failed here would be unable to
+      # distinguish "reaches what it should" from "reaches everything", and
+      # `FR-011d` needs both halves to be separately observable.
+      results = network_results(ExSandbox.OpenNetworkMechanism)
+
+      assert matching(results.passed, @permitted_check) != [],
+             """
+             The permitted-direction check did not pass against a mechanism that
+             declares a permitted destination and connects to it.
+
+             Failures: #{inspect(matching(results.failures, @permitted_check))}
+             Unavailable: #{inspect(matching(results.unavailable, @permitted_check))}
              """
     end
   end
