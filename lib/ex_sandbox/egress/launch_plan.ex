@@ -3,27 +3,35 @@ defmodule ExSandbox.Egress.LaunchPlan do
   The ordered steps that put a tenant process inside a policed namespace
   (005 T060a3, `contracts/egress.md` §Lifecycle).
 
+  ## The order, and why it inverted
+
+  The first version of this module created a named namespace, configured it,
+  and had the tenant join it — all before the tenant started. **That order is
+  not reachable**: `pasta` cannot join a namespace made by `ip netns add`
+  (measured, `egress-path-measurements.md` defect 3), and a tenant inside
+  `pasta`'s namespace has no `CAP_NET_ADMIN` to configure it from within
+  (defect 4). The reachable order is:
+
+  1. **launch** — `pasta` creates the namespace, configures it, and starts the
+     tenant inside it,
+  2. **find the holder** — the tenant's pid, *not* pasta's (see
+     `ExSandbox.Egress.Pasta`),
+  3. **police** — the host installs the redirect into that namespace.
+
+  ⚠️ **The tenant is running, unpoliced, between steps 1 and 3.** That window
+  is real and cannot be closed by reordering, because the namespace does not
+  exist until the tenant is in it. It is closed instead by what `pasta` gives
+  the namespace: the tenant's only route out is `pasta` itself, and until the
+  redirect lands, `Egress.Acceptor` is not listening, so a connection in that
+  window reaches nothing. The window fails *closed*, and
+  `ExSandbox.Egress.Verification` exists to confirm that rather than assume it.
+
   ## Why this is a plan rather than a launch
 
-  `ExSandbox.Egress.Netns` builds commands and deliberately does not run them.
-  This composes them into an order and deliberately does not run them either.
-  The value of stopping here is that the *ordering* — the part that cannot be
-  checked by inspecting any single command — becomes testable on a host where
-  none of these commands can execute, which is every developer machine that is
-  not Linux.
-
-  ## What replaces `--unshare-net`, and why it is not simply dropped
-
-  `--unshare-net` gives the tenant a namespace with **no interfaces**. The
-  policed namespace is configured *before* the tenant starts, so the tenant
-  must **join** it rather than unshare a new one.
-
-  ⚠️ Leaving `--unshare-net` in place alongside the join is the failure worth
-  naming: `bwrap` would put the tenant in a fresh empty namespace instead of the
-  configured one. The policy would be installed correctly, on a namespace
-  nothing uses, and every denial check would still pass — because an empty
-  namespace denies everything too. `build/3` therefore removes the flag rather
-  than expecting a caller to have done it.
+  It composes commands and does not run them. The value of stopping here is
+  that the *ordering* — the part that cannot be checked by inspecting any
+  single command — becomes testable on a host where none of these commands can
+  execute, which is every developer machine that is not Linux.
 
   ## Why a missing `--unshare-net` is refused
 
@@ -31,6 +39,11 @@ defmodule ExSandbox.Egress.LaunchPlan do
   confined the network, it has no way to tell "already converted" from "never
   confined", and the second is a command that would launch a tenant with the
   host's own network. Refusing is the only answer that cannot be wrong.
+
+  ⚠️ `--unshare-net` is *removed*, not supplemented. Keeping it would put the
+  tenant in a fresh **empty** namespace while `pasta` configured a different
+  one — isolation restored silently, policy discarded, and every denial check
+  still green, because an empty namespace denies everything too.
   """
 
   alias ExSandbox.Egress.Netns
@@ -40,21 +53,21 @@ defmodule ExSandbox.Egress.LaunchPlan do
   @type refusal :: :no_network_confinement | :no_pool_port
 
   @type t :: %__MODULE__{
-          netns_name: String.t(),
           source_key: Policy.source_key(),
-          setup_steps: [[String.t()]],
+          pidfile: String.t(),
           pasta_command: [String.t()],
-          tenant_command: [String.t()]
+          tenant_command: [String.t()],
+          pool_port: :inet.port_number()
         }
 
-  defstruct [:netns_name, :source_key, :setup_steps, :pasta_command, :tenant_command]
+  defstruct [:source_key, :pidfile, :pasta_command, :tenant_command, :pool_port]
 
   @doc """
-  Builds the ordered plan for one sandbox, or refuses.
+  Builds the plan for one sandbox, or refuses.
 
   `tenant_command` is the fully composed confinement command — the output of
-  `ExSandbox.Hardening.Linux.build_command/2` — which this rewrites to join the
-  policed namespace instead of unsharing an empty one.
+  `ExSandbox.Hardening.Linux.build_command/2` — which this rewrites to run
+  under `pasta` instead of unsharing an empty namespace.
   """
   @spec build(Policy.source_key(), :inet.port_number(), [String.t()], keyword()) ::
           {:ok, t()} | {:error, refusal()}
@@ -62,8 +75,8 @@ defmodule ExSandbox.Egress.LaunchPlan do
 
   def build(_source_key, pool_port, _tenant_command, _opts)
       when not is_integer(pool_port) or pool_port <= 0 do
-    # ⚠️ A pool that failed to bind reports port 0. A redirect to port 0 sends
-    # the namespace's traffic nowhere, which from inside the sandbox is
+    # ⚠️ An acceptor that failed to bind reports port 0. A redirect to port 0
+    # sends the namespace's traffic nowhere, which from inside the sandbox is
     # indistinguishable from a correctly denied destination -- so the denial
     # checks pass and the reachability checks fail for a reason no one would
     # look for here.
@@ -72,15 +85,16 @@ defmodule ExSandbox.Egress.LaunchPlan do
 
   def build(source_key, pool_port, tenant_command, opts) when is_list(tenant_command) do
     if "--unshare-net" in tenant_command do
-      name = Keyword.get(opts, :netns_name, netns_name(source_key))
+      inner = Enum.reject(tenant_command, &(&1 == "--unshare-net"))
+      pidfile = Keyword.get(opts, :pidfile, default_pidfile(source_key))
 
       {:ok,
        %__MODULE__{
-         netns_name: name,
          source_key: source_key,
-         setup_steps: setup_steps(name, source_key, pool_port, opts),
-         pasta_command: Netns.pasta_command(netns_path(name), opts),
-         tenant_command: join_netns(tenant_command, name)
+         pidfile: pidfile,
+         pasta_command: Netns.pasta_command(pidfile, inner),
+         tenant_command: inner,
+         pool_port: pool_port
        }}
     else
       {:error, :no_network_confinement}
@@ -88,48 +102,29 @@ defmodule ExSandbox.Egress.LaunchPlan do
   end
 
   @doc """
-  The namespace name for a sandbox's /30.
+  The redirect steps for a plan, once the namespace holder is known.
 
-  Derived from the address rather than from the sandbox id: the /30 is what the
-  policy is keyed by, so a name derived from it cannot drift from the identity
-  the pool enforces against.
+  ⚠️ Deliberately **not** a field on the struct. The holder pid does not exist
+  when the plan is built — the namespace it names is created by running the
+  plan. A field would have to be `nil` at build time and filled in later, and
+  the failure mode of that shape is a plan whose steps were composed against
+  `nil` and quietly target the wrong namespace.
+
+  Requiring the pid as an argument means there is no way to ask for these
+  commands without having one.
   """
-  @spec netns_name(Policy.source_key()) :: String.t()
-  def netns_name({a, b, c, d}), do: "sb-#{a}-#{b}-#{c}-#{d}"
-
-  @doc "Where the kernel exposes a named namespace."
-  @spec netns_path(String.t()) :: String.t()
-  def netns_path(name), do: "/var/run/netns/#{name}"
-
-  # Each step is run *inside* the namespace, so every one carries the name --
-  # which is also what the test asserts, because a plan that configures one
-  # namespace and launches into another installs a correct policy on a
-  # namespace nothing uses.
-  defp setup_steps(name, source_key, pool_port, opts) do
-    [["ip", "netns", "add", name]] ++
-      Enum.map(Netns.setup_commands(source_key, pool_port, opts), fn command ->
-        ["ip", "netns", "exec", name] ++ command
-      end)
+  @spec redirect_steps(t(), pos_integer()) :: [[String.t()]]
+  def redirect_steps(%__MODULE__{pool_port: pool_port}, holder_pid) do
+    Netns.redirect_commands(holder_pid, pool_port)
   end
 
-  # ⚠️ `--unshare-net` is *removed*, not merely supplemented. See the moduledoc:
-  # keeping it would place the tenant in a fresh empty namespace while the
-  # policy sat on the configured one, and nothing downstream could tell.
-  defp join_netns(tenant_command, name) do
-    tenant_command
-    |> Enum.reject(&(&1 == "--unshare-net"))
-    |> replace_bwrap_netns(name)
-  end
+  @doc """
+  Where `pasta` records its host-side pid for this sandbox.
 
-  # `bwrap` joins an existing namespace with `--userns-block-fd`-style plumbing
-  # in some versions; the portable spelling is to run the whole confinement
-  # under `ip netns exec`, which sets the namespace before `bwrap` starts.
-  #
-  # Chosen over a `bwrap`-native flag deliberately: `--netns` is not present in
-  # every packaged `bwrap`, and a flag that is silently ignored by an older
-  # build would leave the tenant in the host's namespace while the command
-  # still looked correct.
-  defp replace_bwrap_netns(tenant_command, name) do
-    ["ip", "netns", "exec", name] ++ tenant_command
-  end
+  ⚠️ The file contains **pasta's** pid, not the tenant's. See
+  `ExSandbox.Egress.Pasta` for why the difference is a silent catastrophe
+  rather than a detail.
+  """
+  @spec default_pidfile(Policy.source_key()) :: String.t()
+  def default_pidfile({a, b, c, d}), do: "/var/run/axonn-pasta-#{a}-#{b}-#{c}-#{d}.pid"
 end
