@@ -233,7 +233,19 @@ defmodule ExSandbox.Conformance.Helpers do
   @spec build_sandbox(keyword()) :: ExSandbox.Sandbox.t()
   def build_sandbox(overrides \\ []) do
     defaults = [
-      id: "conformance-" <> Integer.to_string(System.unique_integer([:positive])),
+      # ⚠️ Unique across *VM runs*, not just within one. `System.unique_integer/1`
+      # alone resets to a low range at every VM start, and a sandbox id becomes a
+      # systemd scope unit name (`Hardening.Linux.scope_unit_name/1`) that
+      # outlives the BEAM. Measured in the isolation container: "Unit
+      # sandbox-conformance-7874.scope was already loaded or has a fragment
+      # file", and the sandbox failed to boot -- a leftover scope from an earlier
+      # run colliding with a reused counter.
+      #
+      # It appeared once and failed no assertion, which is what makes it worth
+      # fixing now: intermittent provisioning failures in a suite whose whole
+      # subject is provisioning read as mechanism defects.
+      id:
+        "conformance-#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}",
       owner_ref: "conformance-owner",
       template_ref: "conformance-template",
       cpu_limit: 500,
