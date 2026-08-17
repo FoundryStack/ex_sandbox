@@ -231,21 +231,39 @@ defmodule ExSandbox.Conformance.Isolation do
     end
   end
 
-  @doc "Attempts to enumerate the host's process table from inside."
+  @doc """
+  Attempts to enumerate the host's process table from inside.
+
+  ⚠️ This counted processes and called anything under 30 "confined". The
+  threshold is a proxy for the property, and the two disagree on exactly the
+  host this suite runs on: the isolation container holds systemd, a shell and
+  the BEAM -- well under 30 -- so `PorousMechanism`, which runs `ps` in the
+  host's own shell inside no namespace at all, was scored as confined. The
+  check passed against a mechanism that isolates nothing, and the meta-test
+  caught it (005 T060f). Same defect as `attempt_self_halt`: a guard that reads
+  correctly and returns green on the very path it exists to catch.
+
+  Ask the question directly instead. The platform's own OS process is
+  guaranteed to exist on the host and guaranteed *not* to appear in a confined
+  pid namespace, so looking for it by pid is a fact about the boundary rather
+  than a guess about table size -- and it holds on a host with three processes
+  or three hundred.
+  """
   def attempt_host_process_list(mechanism, sandbox) do
-    case exec(mechanism, sandbox, "ps -e -o comm=") do
+    platform_pid = System.pid()
+
+    case exec(mechanism, sandbox, "ps -p #{platform_pid} -o pid= 2>&1; echo rc=$?") do
       {:no_runner, _} = no_runner ->
         no_runner
 
       {:ok, output} ->
-        lines = output |> String.split("\n", trim: true) |> length()
-
-        # A confined pid namespace shows a handful of processes; a host's table
-        # shows dozens. The threshold is coarse because the distinction is.
-        if lines > 30 do
-          {:succeeded, "#{lines} processes visible -- this is the host's process table"}
+        if String.contains?(output, "rc=0") and String.contains?(output, platform_pid) do
+          {:succeeded,
+           "the platform's own OS process (pid #{platform_pid}) is visible from " <>
+             "inside the sandbox -- this is the host's process table, not a " <>
+             "confined one"}
         else
-          {:refused, {:confined_process_table, lines}}
+          {:refused, {:platform_process_invisible, String.trim(output)}}
         end
 
       {:error, reason} ->
