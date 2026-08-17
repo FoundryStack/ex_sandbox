@@ -26,7 +26,25 @@ defmodule ExSandbox.Application do
       # ⚠️ That is a known gap, not a settled design: both are in-memory, so a
       # host restart forgets every live sandbox's policy while the sandboxes
       # keep running. Reconstructing them is T060a6's reclamation work.
-      ExSandbox.Egress.Allocator
+      ExSandbox.Egress.Allocator,
+
+      # The acceptor pool every sandbox's traffic is redirected to (005 T060a1).
+      #
+      # ⚠️ Started **after** the registry, and the order is not cosmetic: the
+      # pool consults the registry on its first connection, and `:one_for_one`
+      # starts children in the order listed. A pool that outlived its registry
+      # would default-deny -- correct, but for the wrong reason and silently.
+      #
+      # ⚠️ This was missing until T060a3b, and its absence was undetectable.
+      # `LaunchPlan` installs a redirect to this pool's port; with nothing
+      # listening there, the redirect points at a dead port, and from inside the
+      # sandbox that is indistinguishable from a destination denied by policy.
+      # Every denial check in the conformance suite would pass while no
+      # allowlist was enforced by anything at all. The only outward symptom
+      # would be permitted destinations failing too, which reads as a boundary
+      # that is slightly too strict rather than as an enforcement point that
+      # does not exist -- the `--unshare-net` shape, one layer further out.
+      ExSandbox.Egress.Pool
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
