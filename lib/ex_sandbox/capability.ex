@@ -390,7 +390,29 @@ defmodule ExSandbox.Capability do
   # filesystem with `--ro-bind`/`--bind`. Probing a flag the launch never uses
   # answers about the wrong thing even when it happens to return the right
   # boolean.
-  defp binds_root?, do: bwrap_runs?([])
+  #
+  # ⚠️ `--unshare-user`, and this was FLAGLESS until T060a10 -- the third
+  # instance of this feature's recurring defect, a probe of a command the
+  # platform never runs. The comment below still says `binds_root?/0`
+  # "deliberately stays flagless: it asks whether plain root binding works".
+  # That question is not the one this capability answers. `confinement_args/2`
+  # always passes `--unshare-user`, so the flagless form measured a launch that
+  # does not exist.
+  #
+  # It stayed invisible while the census container ran `privileged: true`,
+  # because privilege is exactly what makes the two forms agree. Measured the
+  # moment privilege was narrowed to `systempaths=unconfined` (T060a10):
+  #
+  #     bwrap --ro-bind / / true                  -> rc=1 "Creating new namespace failed"
+  #     bwrap --unshare-user --ro-bind / / true   -> rc=0
+  #
+  # ⚠️ Note the DIRECTION, which is why this one was survivable and the
+  # `probe_mount_namespace/0` defect was not. This failed toward *refusing* a
+  # host that can in fact confine -- a false unavailable, which costs coverage
+  # but never claims a boundary that is absent. `ExSandbox.CapabilityTest`'s
+  # agreement guard is what surfaced it, by noticing the two probes for one
+  # capability had split.
+  defp binds_root?, do: bwrap_runs?(["--unshare-user"])
 
   # ⚠️ `--unshare-user` is not optional, and omitting it measured the wrong thing.
   #
@@ -404,9 +426,11 @@ defmodule ExSandbox.Capability do
   # The mechanism always passes `--unshare-user`, so the bare form was not a
   # conservative check but a check of a command the platform never runs.
   #
-  # ⚠️ `binds_root?/0` above deliberately stays flagless: it asks whether plain
-  # root binding works, which is a different question and must not acquire a
-  # user namespace it does not need.
+  # ⚠️ `binds_root?/0` above passes `--unshare-user` for this same reason. It
+  # used to stay flagless on the argument that "plain root binding" was a
+  # different question; T060a10 measured that it is not a question the launch
+  # ever asks, and the flagless form disagreed with `Hardening.Linux` the moment
+  # the census stopped running privileged.
   defp unshares?(flag), do: bwrap_runs?(["--unshare-user", flag])
 
   defp bwrap_runs?(flags) do

@@ -142,7 +142,7 @@ defmodule ExSandbox.Hardening.Linux do
   never reported as `:ok`.
   """
   @spec verify_applied(integer()) ::
-          {:ok, map()} | {:error, :not_applied | :unverifiable}
+          {:ok, map()} | {:error, {:not_applied, atom()} | :not_applied | :unverifiable}
   def verify_applied(os_pid) when is_integer(os_pid) do
     with {:ok, uid} <- read_uid(os_pid),
          {:ok, cgroup} <- read_cgroup(os_pid) do
@@ -162,20 +162,33 @@ defmodule ExSandbox.Hardening.Linux do
         disk_quota_mb: read_effective_disk_quota(os_pid)
       }
 
+      # ⚠️ Each branch names WHICH boundary was missing, rather than returning a
+      # bare `:not_applied` for all four. The bare form cost a full debugging
+      # cycle in T060a10: narrowing the census container's privilege turned five
+      # tests red with `hardening did not apply (:not_applied)` and nothing to
+      # say whether the uid, the cgroup, the mount namespace, or the netns was
+      # the one that failed -- four very different host problems behind one
+      # atom, distinguishable only by re-deriving them from outside.
+      #
+      # `verify_or_terminate/2` still refuses on any of them, so this widens the
+      # diagnosis without widening what is accepted.
       cond do
         # uid 0 means `setpriv` did not drop privilege -- the process is running
         # as root inside what is meant to be an unprivileged sandbox.
         uid == 0 ->
-          {:error, :not_applied}
+          {:error, {:not_applied, :uid_not_dropped}}
 
         # An unconstrained cgroup means `systemd-run` did not place the process
         # in its scope, which R2 lists as a real failure rather than a
         # hypothetical.
         applied.memory_limit_mb == :unlimited ->
-          {:error, :not_applied}
+          {:error, {:not_applied, :cgroup_unconstrained}}
 
-        not applied.mount_confined or not applied.netns_separated ->
-          {:error, :not_applied}
+        not applied.mount_confined ->
+          {:error, {:not_applied, :mount_not_confined}}
+
+        not applied.netns_separated ->
+          {:error, {:not_applied, :netns_not_separated}}
 
         true ->
           {:ok, applied}
