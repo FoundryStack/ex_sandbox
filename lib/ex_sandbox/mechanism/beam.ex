@@ -673,14 +673,38 @@ defmodule ExSandbox.Mechanism.Beam do
   # ⚠️ Three verdicts, not two. `:etimedout` is what a DROP policy looks like
   # from inside, and it must stay distinct from a rejection so the suite does
   # not have to rank REJECT above DROP (`005-FR-011f`).
+  # ⚠️ **A completed handshake is NOT evidence the destination was reached, and
+  # scoring it as such reported two breaches that never happened.**
+  #
+  # `Egress.Acceptor` is a *transparent* proxy: the redirect sends every
+  # outbound connection to it, so the TCP handshake always completes -- against
+  # the acceptor -- whether the destination is permitted or denied. On a
+  # refusal the acceptor closes the socket **without answering**, which is the
+  # required behaviour (`FR-011a`: a denied destination must be
+  # indistinguishable from an unreachable one, and `FR-011f` forbids ranking
+  # REJECT above DROP). Measured:
+  #
+  #     # a listener that accepts and immediately closes -- the refusal path
+  #     :gen_tcp.connect(~c"127.0.0.1", port, [], 2000)  #=> {:ok, #Port<0.4>}
+  #
+  # So the question has to change from "did the handshake complete?" to "did
+  # any DATA cross?" A permitted connection is relayed to the real destination
+  # and can carry bytes; a refused one is closed having carried none.
+  #
+  # ⚠️ The old probe was correct for every configuration it had been measured
+  # against. Under `--unshare-net` there was no acceptor and no listener, so
+  # `connect` genuinely failed and `:connected` genuinely meant reached. It
+  # became wrong the moment the boundary started *enforcing* rather than
+  # *isolating* -- the permit direction again.
   defp connect_from_sandbox(sandbox, host, port) do
     address = String.to_charlist(host)
     timeout = @connect_probe_timeout_ms
 
     case call(sandbox, :gen_tcp, :connect, [address, port, [], timeout], timeout * 2) do
       {:ok, {:ok, socket}} ->
+        verdict = reached?(sandbox, socket, timeout)
         _ = call(sandbox, :gen_tcp, :close, [socket], timeout)
-        :connected
+        verdict
 
       {:ok, {:error, :timeout}} ->
         :timeout
@@ -696,6 +720,35 @@ defmodule ExSandbox.Mechanism.Beam do
       # fails rather than scoring a dead sandbox as a held boundary.
       {:error, reason} ->
         {:sandbox_unreachable, reason}
+    end
+  end
+
+  # Did the connection reach anything beyond the enforcement point?
+  #
+  # A refused connection is closed by the acceptor without a reply, so a read
+  # sees `:closed`. A permitted one is relayed to the real destination, which
+  # either sends something or holds the connection open -- both distinguishable
+  # from an immediate close.
+  #
+  # ⚠️ `:timeout` counts as REACHED, and that direction is deliberate. A
+  # destination that accepts and stays silent (most services wait for the
+  # client to speak first) is genuinely reached; only an immediate close says
+  # the enforcement point refused. Scoring silence as a refusal would be the
+  # false pass -- a real breach against a quiet service would read as a held
+  # boundary.
+  #
+  # ⚠️ Fails toward REACHED on anything ambiguous, for the same reason: this
+  # probe's errors must produce a *failing* check, never a passing one.
+  defp reached?(sandbox, socket, timeout) do
+    case call(sandbox, :gen_tcp, :recv, [socket, 0, timeout], timeout * 2) do
+      # An immediate close having sent nothing: the acceptor's refusal.
+      {:ok, {:error, :closed}} -> :refused
+      {:ok, {:error, :econnreset}} -> :refused
+      # Data came back, or the peer held the connection open. Reached.
+      {:ok, {:ok, _data}} -> :connected
+      {:ok, {:error, :timeout}} -> :connected
+      {:ok, {:error, _other}} -> :connected
+      {:error, reason} -> {:sandbox_unreachable, reason}
     end
   end
 
