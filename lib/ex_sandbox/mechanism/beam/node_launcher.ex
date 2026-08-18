@@ -304,7 +304,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # implementation of the rule.
   defp start_acceptor(plan, holder_pid, opts) do
     helper = Keyword.get(opts, :acceptor_helper, acceptor_helper_path())
-    verdict = Keyword.get(opts, :verdict_path, ExSandbox.Egress.Verdict.default_path())
+    # ⚠️ Read from the RUNNING server, not from configuration. A configured path
+    # names a socket that may not exist -- the same rule the pool's port already
+    # follows. If the two diverged the acceptor would be handed a path nothing
+    # is bound to, and since an unobtainable verdict is DENY, the sandbox would
+    # lose egress entirely while every denial check still passed.
+    verdict = Keyword.get_lazy(opts, :verdict_path, &running_verdict_path/0)
 
     command =
       ExSandbox.Egress.Acceptor.listener_command(
@@ -371,6 +376,16 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
         {:error, :mechanism_error}
     end
+  end
+
+  # The verdict socket the running server is actually bound to, falling back to
+  # the configured default only when the server cannot be reached -- in which
+  # case the launch is about to fail anyway, and failing with a path in the log
+  # beats failing with none.
+  defp running_verdict_path do
+    ExSandbox.Egress.Verdict.path()
+  catch
+    :exit, _ -> ExSandbox.Egress.Verdict.default_path()
   end
 
   @doc """
