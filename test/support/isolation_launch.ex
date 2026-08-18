@@ -77,7 +77,40 @@ defmodule ExSandbox.Test.IsolationLaunch do
   # than passing. The distinction that matters is visible-not-run versus
   # claimed-demonstrated; an erroring test is at least the former, and the
   # message says which capability is missing.
-  defp raise_skip(message), do: raise(ExSandbox.Test.IsolationLaunch.Unavailable, message)
+  #
+  # ⚠️ The message is framed by `Conformance.Group.not_demonstrated/1`, and that
+  # is the load-bearing part rather than a formatting nicety.
+  # `Conformance.Census` classifies an outcome as the third one by matching the
+  # marker that function produces, so a distinct exception type alone was not
+  # enough: these nineteen tests raised `Unavailable`, carried no marker, and
+  # were counted `failed`. Measured -- `passed=330 unavailable=0 failed=19`,
+  # where every one of the nineteen names a guarantee that did not stop holding
+  # and simply had no sandbox to be demonstrated in.
+  #
+  # Routing through the shared framing is also what keeps this from drifting:
+  # the census's own moduledoc argues the marker must have exactly one producer,
+  # and `ExSandbox.ConformanceExclusionsTest` fails if the wording moves.
+  defp raise_skip(message) do
+    # ⚠️ `Exception.exception/1` rather than the struct literal: the nested
+    # `Unavailable` module is defined below this function, and a `%Mod{}` literal
+    # is expanded at compile time, so it does not exist yet.
+    exception = ExSandbox.Test.IsolationLaunch.Unavailable.exception(message)
+
+    raise ExSandbox.Test.IsolationLaunch.Unavailable,
+          ExSandbox.Conformance.Group.not_demonstrated(exception)
+  end
+
+  defmodule RefusingMechanism do
+    @moduledoc """
+    A mechanism that refuses to provision, so `provision_or_skip/2`'s refusal
+    path can be driven for real in a test.
+
+    Exists because the alternative — asserting on a marker string the test
+    built itself — would keep passing if `raise_skip/1` stopped framing its
+    message, which is the exact defect the test pins.
+    """
+    def provision(_sandbox), do: {:error, :mechanism_error}
+  end
 
   defmodule Unavailable do
     @moduledoc """

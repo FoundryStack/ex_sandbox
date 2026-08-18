@@ -81,6 +81,54 @@ defmodule ExSandbox.Conformance.CensusTest do
     {:error, %ExUnit.AssertionError{message: "tenant code was not contained"}, []}
   end
 
+  describe "an isolation test that could not launch is the third outcome, not a defect" do
+    # ⚠️ The regression this pins was measured, not imagined: with
+    # `network_restriction` honestly reporting `false`, the container census
+    # read `passed=330 unavailable=0 failed=19`. All nineteen were
+    # `@tag :isolation` tests whose guarantees had not stopped holding -- there
+    # was simply no sandbox to demonstrate them in, because the mechanism
+    # correctly refused to launch one.
+    #
+    # `IsolationLaunch` already raised a *distinct exception type* for exactly
+    # this case, and that was not enough: the census classifies by the marker
+    # string, so a distinct type with an unmarked message counts as a defect.
+    # The type made the cause legible to a human reading the log and invisible
+    # to the counter that gates the exit code.
+    test "the raise from provision_or_skip carries the census marker" do
+      # Raised for real rather than hand-built. A test asserting on a string it
+      # constructed itself would keep passing if `raise_skip/1` stopped framing
+      # its message -- which is precisely the defect being pinned.
+      error =
+        assert_raise ExSandbox.Test.IsolationLaunch.Unavailable, fn ->
+          ExSandbox.Test.IsolationLaunch.provision_or_skip(
+            ExSandbox.Test.IsolationLaunch.RefusingMechanism,
+            %ExSandbox.Sandbox{id: "probe", owner_ref: "t", template_ref: "x"}
+          )
+        end
+
+      {counts, report} = census([test_finished({:failed, [{:error, error, []}]})])
+
+      assert counts["unavailable"] == 1,
+             "a test that could not launch must count as the third outcome, got:\n#{report}"
+
+      assert counts["failed"] == 0,
+             "a host limitation must not be reported as a breached guarantee, got:\n#{report}"
+    end
+
+    test "a genuine isolation failure is still counted as a defect" do
+      # The mirror case, and the one that makes the test above mean something.
+      # A classifier that called *everything* from these tests unavailable would
+      # satisfy the assertion above and destroy the suite -- the fail-open shape
+      # this whole census exists to prevent.
+      {counts, report} = census([test_finished({:failed, [real_failure()]})])
+
+      assert counts["failed"] == 1,
+             "a real breach must still be a failure, got:\n#{report}"
+
+      assert counts["unavailable"] == 0
+    end
+  end
+
   describe "the reporter cannot be silenced by the suite it reports on" do
     test "the destination is captured at init, not read at write time" do
       # The regression this pins, measured in the isolation container: reading
