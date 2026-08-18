@@ -126,15 +126,35 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  defp install_policy(exec, allowed) do
-    with {:ok, binding} <- acquire_binding(allowed),
+  @doc """
+  Turns an allowlist into a policed command, or refuses the launch.
+
+  Public for the same reason as `egress_allowlist/1`: this is a *decision* --
+  whether a tenant who cannot be given a policy is given a sandbox anyway -- and
+  `launch/2` runs on Linux and nowhere else. Left private, the rule would be
+  verifiable only on a host where the whole launch works.
+
+  ⚠️ **The rule is refuse, never downgrade**, and the downgrade is the dangerous
+  branch rather than the obvious one. A host that cannot supply a binding could
+  fall back to `--unshare-net` and produce a sandbox that reaches *nothing*,
+  which passes every denial check in the network group while the census reports
+  the group as demonstrated -- 005 T060a5's named false pass, and the same shape
+  as the `--unshare-net` trap this whole feature exists to close.
+
+  `acquire` is injectable so the refusal can be provoked without exhausting a
+  real pool; it defaults to `ExSandbox.Egress.Binding.acquire/1`.
+  """
+  @spec install_policy([ExSandbox.Egress.Policy.destination()], term(), (list() -> term())) ::
+          {:ok, term(), term(), term()} | {:error, atom()}
+  def install_policy(exec, allowed, acquire \\ &ExSandbox.Egress.Binding.acquire/1) do
+    with {:ok, binding} <- acquire_binding(allowed, acquire),
          {:ok, rewritten, plan} <- build_plan(binding, exec) do
       {:ok, rewritten, binding, plan}
     end
   end
 
-  defp acquire_binding(allowed) do
-    case ExSandbox.Egress.Binding.acquire(allowed) do
+  defp acquire_binding(allowed, acquire) do
+    case acquire.(allowed) do
       {:ok, binding} ->
         {:ok, binding}
 
