@@ -80,7 +80,6 @@ defmodule ExSandbox.Hardening.Linux do
   @netns_poll_attempts 40
   @netns_poll_interval_ms 50
 
-
   @doc """
   Probes what this host can actually enforce.
 
@@ -647,8 +646,18 @@ defmodule ExSandbox.Hardening.Linux do
   defp unshare_and_bwrap_compose? do
     case System.cmd(
            "unshare",
-           ["--user", "--map-root-user", "--net", "--", "bwrap", "--dev-bind", "/", "/", "--",
-            "/bin/true"],
+           [
+             "--user",
+             "--map-root-user",
+             "--net",
+             "--",
+             "bwrap",
+             "--dev-bind",
+             "/",
+             "/",
+             "--",
+             "/bin/true"
+           ],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true
@@ -817,14 +826,21 @@ defmodule ExSandbox.Hardening.Linux do
   # prove entry worked while running its `nsenter` *inside* the userns, which is
   # not the position the platform is actually in.
   #
-  # `--preserve-credentials` keeps the caller's uid rather than remapping to
-  # root, which is what `util-linux` requires when joining a userns this process
-  # is not already privileged in. RootlessKit passes the same pair for the same
-  # reason.
+  # ⚠️ `--preserve-credentials` was REMOVED here in lockstep with
+  # `Capability`'s copy, `Egress.Netns.nsenter/2` and `Egress.Acceptor`. This is
+  # the **fourth** site carrying these flags, and `ProbeComposabilityTest` is
+  # what found the last two -- exactly the "two independent implementations
+  # disagreeing" defect it was written for (005 T060a5c).
+  #
+  # Why it changed: under the split launch ordering (T060a4e) `pasta` runs after
+  # `setpriv`, so the namespace is owned by the **sandbox uid**. Preserving our
+  # own credentials into it leaves us with none there; omitting the flag remaps
+  # us to root inside the target userns, which is where `CAP_NET_ADMIN` comes
+  # from. Measured -- see `egress-path-measurements.md`.
   defp nsenter_succeeds?(pid) do
     case System.cmd(
            "nsenter",
-           ["-t", "#{pid}", "-n", "-U", "--preserve-credentials", "ip", "link"],
+           ["-t", "#{pid}", "-n", "-U", "ip", "link"],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true

@@ -50,7 +50,7 @@ defmodule ExSandbox.Egress.LaunchPlan do
   alias ExSandbox.Egress.Policy
 
   @typedoc "Why a plan could not be built."
-  @type refusal :: :no_network_confinement | :no_pool_port
+  @type refusal :: :no_network_confinement | :no_pool_port | :no_privilege_drop
 
   @type t :: %__MODULE__{
           source_key: Policy.source_key(),
@@ -84,21 +84,106 @@ defmodule ExSandbox.Egress.LaunchPlan do
   end
 
   def build(source_key, pool_port, tenant_command, opts) when is_list(tenant_command) do
-    if "--unshare-net" in tenant_command do
-      inner = Enum.reject(tenant_command, &(&1 == "--unshare-net"))
+    with true <- "--unshare-net" in tenant_command,
+         inner = Enum.reject(tenant_command, &(&1 == "--unshare-net")),
+         {:ok, {outer, uid, rest}} <- split_at_privilege_drop(inner) do
       pidfile = Keyword.get(opts, :pidfile, default_pidfile(source_key))
+      runas = Netns.runas_for_uid(uid)
 
       {:ok,
        %__MODULE__{
          source_key: source_key,
          pidfile: pidfile,
-         pasta_command: Netns.pasta_command(pidfile, inner),
+         pasta_command: outer ++ Netns.pasta_command(pidfile, rest, runas),
          tenant_command: inner,
          pool_port: pool_port
        }}
     else
-      {:error, :no_network_confinement}
+      false -> {:error, :no_network_confinement}
+      {:error, reason} -> {:error, reason}
     end
+  end
+
+  # The split, and why `pasta` is inserted rather than prefixed.
+  #
+  # ⚠️ This function exists because the obvious shape -- wrapping the whole
+  # confined command in `pasta` -- **cannot boot a tenant**, measured:
+  #
+  #     pasta -- systemd-run --scope setpriv --reuid=N bwrap … erlexec
+  #     -> Couldn't write to /proc/self/uid_map: Operation not permitted
+  #     -> setpriv: setresuid failed: Invalid argument
+  #     -> {:boot_failed, {:exit_status, 127}}
+  #
+  # `pasta` in spawn mode always creates its own user namespace, and as root
+  # with no subuid range it cannot write that namespace's `uid_map`. The map is
+  # left **empty**, so every process inside is uid 65534 and `setpriv --reuid`
+  # fails with `EINVAL` for *any* uid -- there is no other uid to become.
+  #
+  # So `pasta` goes **after** the privilege drop and **inside** the scope:
+  #
+  #     systemd-run --scope -p MemoryMax=… -- setpriv --reuid=N …
+  #       pasta --config-net --runas N:N -- bwrap … erlexec
+  #
+  # ⚠️ Both halves of that were measured, not reasoned, because both failure
+  # modes are invisible to a suite that tests only denial
+  # (`docker/launch-ordering-probe.sh`, recorded in
+  # `egress-path-measurements.md`):
+  #
+  #   * `pasta` composes after the drop: `uid_map = 0 112526 1`, its own netns.
+  #   * the scope's caps still bind across **two** intervening execs: a 192MB
+  #     allocation under a 64M cap is SIGKILLed. `005` R9b is the recorded case
+  #     of a cap applied with the right number and silently lost across an exec,
+  #     and this shape adds two more of them.
+  #
+  # ⚠️ A command with no privilege drop is **refused**, never prefixed as a
+  # fallback. Falling back would reintroduce the unbootable ordering on exactly
+  # the hosts where the split failed, and it would do so silently -- and a
+  # command that never dropped privilege is one whose tenant runs as root, which
+  # is a worse thing to launch than nothing at all.
+  defp split_at_privilege_drop(inner) do
+    case Enum.split_while(inner, &(&1 != "setpriv")) do
+      {_outer, []} ->
+        {:error, :no_privilege_drop}
+
+      {outer, ["setpriv" | _] = drop_and_rest} ->
+        case split_after_drop_args(drop_and_rest) do
+          {:ok, drop_args, rest, uid} -> {:ok, {outer ++ drop_args, uid, rest}}
+          :error -> {:error, :no_privilege_drop}
+        end
+    end
+  end
+
+  # `setpriv`'s own flags all begin with `-`; the first argument that does not is
+  # the program it execs, which is where `pasta` must be inserted.
+  #
+  # The uid is read back out of `--reuid=N` rather than passed in, so `--runas`
+  # cannot disagree with the uid actually being dropped to. A mismatch there does
+  # not fail loudly: `pasta` would map a uid the tenant never becomes, and the
+  # namespace would come up owned by nobody in particular.
+  defp split_after_drop_args(["setpriv" | rest]) do
+    {flags, program} = Enum.split_while(rest, &String.starts_with?(&1, "-"))
+
+    with [_ | _] <- program,
+         {:ok, uid} <- reuid_from(flags) do
+      {:ok, ["setpriv" | flags], program, uid}
+    else
+      _ -> :error
+    end
+  end
+
+  defp reuid_from(flags) do
+    Enum.find_value(flags, :error, fn flag ->
+      case flag do
+        "--reuid=" <> value ->
+          case Integer.parse(value) do
+            {uid, ""} -> {:ok, uid}
+            _ -> nil
+          end
+
+        _ ->
+          nil
+      end
+    end)
   end
 
   @doc """
@@ -126,5 +211,34 @@ defmodule ExSandbox.Egress.LaunchPlan do
   rather than a detail.
   """
   @spec default_pidfile(Policy.source_key()) :: String.t()
-  def default_pidfile({a, b, c, d}), do: "/var/run/axonn-pasta-#{a}-#{b}-#{c}-#{d}.pid"
+  def default_pidfile({a, b, c, d}),
+    do: Path.join(pidfile_dir(), "axonn-pasta-#{a}-#{b}-#{c}-#{d}.pid")
+
+  # ⚠️ NOT `/var/run`, and the reason is a direct consequence of the split
+  # ordering (T060a4e).
+  #
+  # While `pasta` wrapped the whole command it ran **as root**, so a root-owned
+  # `/var/run` was writable and this path worked. Inserting `pasta` after
+  # `setpriv` means it now runs as the *sandbox uid*, and the first container run
+  # after the reorder failed with:
+  #
+  #     Couldn't open PID file /var/run/axonn-pasta-10-0-0-0.pid: Permission denied
+  #     [error] sandbox node failed to boot: {:boot_failed, {:exit_status, 1}}
+  #
+  # ⚠️ This is exactly the class of consequence that command inspection cannot
+  # find. Every ordering assertion in the egress suite passed against the
+  # command that produced this, because the command was *right* -- what changed
+  # was which uid executed one of its parts, and no amount of reading the
+  # argument list reveals that. It took running the launch.
+  #
+  # `/tmp` is world-writable with the sticky bit, so the dropped uid can create
+  # its file and no other uid can replace it. The BEAM (still root) reads it
+  # back. `Policy.source_key/1` makes the name unique per sandbox, so two
+  # sandboxes cannot collide on one file -- which would be worse than a
+  # permission error, since the host would then search the wrong process's
+  # children and find nothing, reading as an architectural refusal.
+  defp pidfile_dir do
+    Application.get_env(:ex_sandbox, :egress, [])
+    |> Keyword.get(:pidfile_dir, "/tmp")
+  end
 end

@@ -239,10 +239,28 @@ defmodule ExSandbox.Egress.Netns do
   sb0: No such device`. Neither is needed — `pasta` picks the host's default
   route interface, which is the one with a route out.
   """
-  @spec pasta_command(String.t(), [String.t()]) :: [String.t()]
-  def pasta_command(pidfile, [_ | _] = tenant_command) do
-    [pasta_path(), "--config-net", "--runas", "0", "-P", pidfile, "--"] ++ tenant_command
+  @spec pasta_command(String.t(), [String.t()], String.t()) :: [String.t()]
+  def pasta_command(pidfile, [_ | _] = tenant_command, runas \\ "0") do
+    [pasta_path(), "--config-net", "--runas", runas, "-P", pidfile, "--"] ++ tenant_command
   end
+
+  @doc """
+  The `--runas` value for a uid, as `pasta` spells it.
+
+  ⚠️ `--runas 0` is correct only when `pasta` runs **as root**. Under the split
+  ordering (`LaunchPlan.build/4`) it runs after `setpriv` has already dropped to
+  the sandbox uid, and there `--runas 0` fails outright:
+
+      Can't set GID to 0: Operation not permitted
+
+  and `--runas 0:0` **hangs** rather than erroring, which is worse -- a launch
+  that never returns rather than one that fails. A matching non-zero
+  `uid:gid` pair is the only value measured to work after the drop, and it
+  produces `uid_map = 0 <uid> 1` (see `egress-path-measurements.md`).
+  """
+  @spec runas_for_uid(non_neg_integer()) :: String.t()
+  def runas_for_uid(0), do: "0"
+  def runas_for_uid(uid) when is_integer(uid) and uid > 0, do: "#{uid}:#{uid}"
 
   # ⚠️ An **absolute path**, and the bare name `"pasta"` was a real defect
   # (005 T060a).
@@ -292,6 +310,31 @@ defmodule ExSandbox.Egress.Netns do
   # is the reading this call site originally encoded. It is not the BEAM's
   # position. `ExSandbox.Capability.can_enter_foreign_netns?/0` probes the form
   # written here, so probe and mechanism cannot drift apart again silently.
+  # ⚠️ **`--preserve-credentials` was REMOVED, and the measurement above is not
+  # wrong -- its subject moved.** That measurement was taken against a holder
+  # whose user namespace was **root-owned**, which is what `pasta` produced while
+  # it wrapped the whole command and therefore ran as root. Under the split
+  # ordering (T060a4e) `pasta` runs after `setpriv`, so the namespace it creates
+  # is owned by the **sandbox uid**, and carrying our own credentials in lands us
+  # there with no capabilities at all:
+  #
+  #     holder uid: 112526, holder userns: user:[4026534623]
+  #     nsenter -t <holder> -n -U --preserve-credentials nft add table ip nat
+  #       -> Error: Could not process rule: Operation not permitted   rc=1
+  #     nsenter -t <holder> -n -U nft add table ip nat
+  #       -> rc=0
+  #
+  # Without the flag we are remapped to root *inside the target userns*, which is
+  # where the `CAP_NET_ADMIN` for `nft` has to come from. The `-U` itself is
+  # still load-bearing for the original reason: the netns is a descendant of that
+  # userns, so it cannot be joined without joining its owner.
+  #
+  # ⚠️ **This form is measured to fail from a non-root caller**
+  # (`nsenter: setgroups failed: Operation not permitted`), and that matters for
+  # `013-FR-006b`, which requires an unprivileged execution plane. It is recorded
+  # rather than papered over: the privileged container this runs in today would
+  # certify a fix that the unprivileged deployment cannot use, so the remaining
+  # gap is a known one with a measurement attached rather than a surprise later.
   defp nsenter(pid, command),
-    do: ["nsenter", "-t", "#{pid}", "-n", "-U", "--preserve-credentials"] ++ command
+    do: ["nsenter", "-t", "#{pid}", "-n", "-U"] ++ command
 end

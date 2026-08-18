@@ -161,10 +161,11 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # position. So the tuple is flattened on the way in and reassembled on the way
   # out, with the plan's own head becoming the new program.
   #
-  # The reassembly matters: the plan prefixes `ip netns exec <name>`, so the
-  # program `:peer` spawns is now `ip`, not `systemd-run`. Rebuilding the tuple
-  # from `plan.tenant_command` rather than keeping the original `prog` is what
-  # makes that true -- keeping it would exec `systemd-run` with `ip`'s arguments.
+  # The reassembly matters because the plan may change which binary runs first.
+  # Rebuilding the tuple from the plan's own head rather than keeping the
+  # original `prog` is what keeps that correct as the ordering changes: under
+  # the split ordering the head is `systemd-run` again, but it was `pasta` while
+  # pasta wrapped the whole command, and neither is hardcoded here.
   defp build_plan(binding, {prog, args}) do
     flat = [prog | args]
 
@@ -282,7 +283,19 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         {:ok, acceptor_os_pid}
 
       {:error, reason} ->
-        _ = terminate(launched)
+        # ⚠️ `launched.peer`, not `launched`. `terminate/2` takes the peer PID;
+        # handed the whole map it raises `ArgumentError: not a pid` from
+        # `Process.alive?/1` -- and it raises it on the **cleanup path of a
+        # failure**, so the original `reason` is destroyed and replaced by a
+        # crash inside the code meant to recover from it.
+        #
+        # ⚠️ Latent since this branch was written, and unreachable until now:
+        # policing is only attempted when a launch gets far enough to be
+        # policed, which before T060a4e it never did. The first container run
+        # after the tenant started booting turned every network check into an
+        # `ArgumentError` naming `is_process_alive`, which reads as a defect in
+        # the conformance suite rather than a one-word error here.
+        _ = terminate(launched.peer)
         if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
         {:error, reason}
     end
@@ -520,11 +533,19 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   @doc """
   Rebuilds `{prog, args}` from a plan's `pasta_command`.
 
-  ⚠️ The program becomes `pasta`, not `systemd-run` and not `bwrap`. Keeping
-  the original program while taking the plan's arguments produces a command
-  that reads correctly in a log line and execs the wrong binary -- and because
-  the arguments still *contain* every hardening flag, a test that greps the
-  joined string for `--unshare-net` or the scope name would pass.
+  ⚠️ Always the plan's own head, never the original program. Keeping the
+  original while taking the plan's arguments produces a command that reads
+  correctly in a log line and execs the wrong binary -- and because the
+  arguments still *contain* every hardening flag, a test that greps the joined
+  string for `--unshare-net` or the scope name would pass.
+
+  ⚠️ Which binary that head names **changed** with the split ordering, and the
+  change is invisible here on purpose. `pasta` used to wrap the whole command,
+  so the head was `pasta`; it is now inserted after `setpriv`, so the head is
+  `systemd-run` once more. Reading the head off the plan rather than deciding
+  it here is what let that move without this function knowing -- and a version
+  that hardcoded either name would have been correct when written and silently
+  wrong afterwards.
   """
   @spec exec_from_plan(ExSandbox.Egress.LaunchPlan.t()) :: {String.t(), [String.t()]}
   def exec_from_plan(%ExSandbox.Egress.LaunchPlan{pasta_command: [prog | args]}) do

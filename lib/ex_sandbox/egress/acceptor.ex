@@ -114,20 +114,27 @@ defmodule ExSandbox.Egress.Acceptor do
           Policy.source_key()
         ) :: [String.t()]
   def listener_command(holder_pid, port, helper_path, verdict_path, source_key) do
-    # ⚠️ `-U --preserve-credentials`, not a bare `-n`. The BEAM stands outside
-    # the platform user namespace that owns this netns, and from there `-n`
-    # alone is refused -- see `ExSandbox.Egress.Netns` for the measurement of
-    # both forms from both vantage points. Without these flags the acceptor
-    # never starts, the redirect points at a port nothing is listening on, and
-    # from inside the sandbox that is indistinguishable from a correctly denied
-    # destination: every denial check passes and egress is simply broken.
+    # ⚠️ `-U`, not a bare `-n`. The BEAM stands outside the platform user
+    # namespace that owns this netns, and from there `-n` alone is refused --
+    # see `ExSandbox.Egress.Netns` for the measurement of both forms from both
+    # vantage points. Without it the acceptor never starts, the redirect points
+    # at a port nothing is listening on, and from inside the sandbox that is
+    # indistinguishable from a correctly denied destination: every denial check
+    # passes and egress is simply broken.
+    #
+    # ⚠️ `--preserve-credentials` was removed here in lockstep with
+    # `Netns.nsenter/2` and `Capability`'s probe. This was the **third** copy of
+    # the same flags, and it was found by `ProbeComposabilityTest` rather than
+    # by the grep that updated the other two -- had it been missed, the redirect
+    # and the listener would have disagreed about which credentials to carry
+    # into the namespace, and the resulting silence would have looked exactly
+    # like a working allowlist.
     [
       "nsenter",
       "-t",
       "#{holder_pid}",
       "-n",
       "-U",
-      "--preserve-credentials",
       helper_path,
       "#{port}",
       verdict_path,

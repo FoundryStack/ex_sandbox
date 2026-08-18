@@ -26,7 +26,22 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
   alias ExSandbox.Mechanism.Beam.NodeLauncher
   alias ExSandbox.Sandbox
 
-  @confined ["systemd-run", "--scope", "bwrap", "--unshare-net", "erlexec"]
+  @confined [
+    "/usr/bin/systemd-run",
+    "--scope",
+    "--unit=sandbox-x.scope",
+    "-p",
+    "MemoryMax=128M",
+    "setpriv",
+    "--reuid=4242",
+    "--regid=4242",
+    "--clear-groups",
+    "--no-new-privs",
+    "bwrap",
+    "--unshare-net",
+    "--die-with-parent",
+    "erlexec"
+  ]
 
   defp sandbox(context) do
     %Sandbox{
@@ -71,20 +86,30 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
       # and execs the wrong binary -- and because the arguments still *contain*
       # every hardening flag, a test that greps the joined string for
       # `--unshare-net` or the scope name would pass.
-      # ⚠️ Basename, plus an absolute path. `:peer` spawns this via
-      # `spawn_executable`, which does NO `PATH` lookup, so the bare name
-      # `"pasta"` -- which this assertion used to require -- made every policed
-      # launch die with `:enoent`. Asserting equality with the bare name did not
-      # merely miss that defect, it *pinned* it.
-      assert Path.basename(prog) == "pasta"
+      # ⚠️ Asserted as a RELATIONSHIP to the plan, never as a literal name, and
+      # the history of this line is why. It first required the bare name
+      # `"pasta"` -- which did not merely miss the `spawn_executable` defect,
+      # it *pinned* it, since `:peer` does no `PATH` lookup and every policed
+      # launch died with `:enoent`. It was then loosened to an absolute path
+      # with basename `pasta`, which pinned the *wrapping* ordering just as
+      # firmly: under the split (T060a4e) pasta is mid-chain and the head is
+      # `systemd-run` once more.
+      #
+      # Both times the literal was correct when written and became the thing
+      # blocking the fix. What must actually hold is that the program exec'd is
+      # the head of the plan's own command -- true under every ordering, and
+      # false for exactly the defect this test exists to catch.
+      assert [^prog | _] = plan.pasta_command
 
       assert String.starts_with?(prog, "/"),
              "`:peer` spawns this program with `spawn_executable`, which does " <>
                "no PATH lookup; a bare name fails with :enoent (got #{inspect(prog)})"
 
-      refute prog == "systemd-run",
-             "the plan runs the tenant under `pasta`; keeping the original " <>
-               "program would exec systemd-run with pasta's arguments"
+      # The substitution the test forbids: taking the plan's arguments while
+      # keeping a program the plan did not name.
+      refute prog == "bwrap",
+             "the plan's head must be exec'd, not an inner binary paired with " <>
+               "the plan's arguments"
     end
 
     test "the confinement survives the rewrite" do
@@ -96,9 +121,33 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
       # The namespace is joined *and* the tenant is still confined. A rewrite
       # that dropped the bwrap half would police the network of a sandbox with
       # no filesystem or privilege confinement at all.
-      assert "bwrap" in full
-      assert "erlexec" in full
-      assert "systemd-run" in full
+      #
+      # ⚠️ Compared by BASENAME. Programs are resolved to absolute paths so
+      # `:peer` can spawn them, and an equality test against the bare name fails
+      # for a resolution that is correct -- which is how the last two of these
+      # assertions came to pin a defect instead of catching one.
+      basenames = Enum.map(full, &Path.basename/1)
+
+      for required <- ["systemd-run", "setpriv", "pasta", "bwrap", "erlexec"] do
+        assert required in basenames,
+               "#{required} must survive the rewrite; got #{inspect(basenames)}"
+      end
+
+      # ⚠️ Presence is not enough, and this is the assertion the earlier version
+      # lacked. All five binaries were present in the UNBOOTABLE ordering too --
+      # what made it unbootable was `setpriv` landing *inside* pasta's namespace.
+      # A test that only checks membership passes against the command that cannot
+      # launch a tenant at all.
+      order = fn name -> Enum.find_index(basenames, &(&1 == name)) end
+
+      assert order.("systemd-run") < order.("setpriv"),
+             "the scope must stay outermost or its caps are never applied"
+
+      assert order.("setpriv") < order.("pasta"),
+             "the drop must precede pasta or setresuid fails in an empty uid_map"
+
+      assert order.("pasta") < order.("bwrap"),
+             "the tenant must run inside pasta's namespace"
 
       refute "--unshare-net" in full,
              "`--unshare-net` must be removed, not supplemented: it would put " <>

@@ -53,8 +53,8 @@ defmodule ExSandbox.Egress.NetnsTest do
       # sandbox's redirect there -- it succeeds, warns about nothing, and
       # leaves the tenant unpoliced while the host acquires a stray NAT rule.
       for command <- commands do
-        assert Enum.take(command, 6) ==
-                 ["nsenter", "-t", "4242", "-n", "-U", "--preserve-credentials"],
+        assert Enum.take(command, 5) ==
+                 ["nsenter", "-t", "4242", "-n", "-U"],
                "a policy command that does not enter the namespace configures the host: " <>
                  Enum.join(command, " ")
       end
@@ -74,12 +74,12 @@ defmodule ExSandbox.Egress.NetnsTest do
       #
       #   caller OUTSIDE the platform userns (the BEAM's position):
       #     nsenter -t <holder> -n ...                          -> REFUSED
-      #     nsenter -t <holder> -n -U --preserve-credentials ... -> OK
+      #     nsenter -t <holder> -n -U ... -> OK
       #
       # A bare `-n` here fails closed in the worst way: the redirect is never
       # installed, so the tenant runs unpoliced while every denial check passes.
       for command <- commands do
-        assert "-U" in command and "--preserve-credentials" in command,
+        assert "-U" in command,
                "bare `-n` is refused from outside the owning userns: " <>
                  Enum.join(command, " ")
       end
@@ -150,13 +150,13 @@ defmodule ExSandbox.Egress.NetnsTest do
       # "fixed" by deleting it.
       # ⚠️ The program is *located*, not read from a fixed offset. This assertion
       # was `Enum.at(command, 4)` and broke when the userns-join flags
-      # (`-U --preserve-credentials`) were added ahead of it -- a correct change
+      # (`-U`) were added ahead of it -- a correct change
       # failing a correct test because the test encoded an argument position.
       # Dropping the `nsenter` flags finds the first real program either way.
       for command <- commands do
         program =
           command
-          |> Enum.drop_while(&(&1 != "--preserve-credentials"))
+          |> Enum.drop_while(&(&1 != "-U"))
           |> Enum.drop(1)
           |> List.first()
 

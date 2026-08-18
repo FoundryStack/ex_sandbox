@@ -26,9 +26,32 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
   @key {10, 0, 0, 0}
   @port 18_080
 
+  # ⚠️ Mirrors what `Hardening.Linux.compose/3` actually emits, `setpriv` group
+  # included. The earlier fixture omitted it, and that omission is why the
+  # unbootable ordering survived every one of these tests: a plan built from a
+  # command with no privilege drop cannot exhibit the defect that only appears
+  # when a drop lands inside pasta's namespace. `LaunchDecisionsTest` pins the
+  # fixture against the real composer so it cannot drift back.
+  @confined [
+    "/usr/bin/systemd-run",
+    "--scope",
+    "--unit=sandbox-x.scope",
+    "-p",
+    "MemoryMax=128M",
+    "setpriv",
+    "--reuid=4242",
+    "--regid=4242",
+    "--clear-groups",
+    "--no-new-privs",
+    "bwrap",
+    "--unshare-net",
+    "--die-with-parent",
+    "erlexec"
+  ]
+
   describe "the plan's shape" do
     setup do
-      {:ok, plan} = LaunchPlan.build(@key, @port, ["bwrap", "--unshare-net", "erlexec"])
+      {:ok, plan} = LaunchPlan.build(@key, @port, @confined)
       %{plan: plan}
     end
 
@@ -45,12 +68,55 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       # The inversion. An earlier design had the tenant `ip netns exec` into a
       # pre-built namespace; `pasta` cannot attach to one made that way
       # (measured: `Failed to join network namespace: Permission denied`).
-      assert Path.basename(hd(plan.pasta_command)) == "pasta"
-      assert String.starts_with?(hd(plan.pasta_command), "/"),
+      pasta = Enum.find(plan.pasta_command, &(Path.basename(&1) == "pasta"))
+      assert pasta, "the command must run the tenant under pasta"
+
+      assert String.starts_with?(pasta, "/"),
              "must be a path :peer can spawn, not a bare name"
 
       tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
-      assert tenant == plan.tenant_command
+      assert List.last(tenant) == List.last(plan.tenant_command)
+    end
+
+    test "pasta is inserted AFTER the privilege drop, not wrapped around it", %{plan: plan} do
+      # ⚠️ The whole of T060a4e. Wrapping the command in `pasta` puts `setpriv`
+      # inside pasta's spawn-mode userns, whose `uid_map` is empty -- so
+      # `setresuid` fails with EINVAL for any uid and the tenant never boots.
+      # Measured; it is not a theoretical ordering preference.
+      pasta_at = Enum.find_index(plan.pasta_command, &(Path.basename(&1) == "pasta"))
+      setpriv_at = Enum.find_index(plan.pasta_command, &(&1 == "setpriv"))
+      scope_at = Enum.find_index(plan.pasta_command, &(Path.basename(&1) == "systemd-run"))
+
+      assert scope_at < setpriv_at,
+             "systemd-run must stay outermost or the scope's caps are never applied"
+
+      assert setpriv_at < pasta_at,
+             "setpriv must run BEFORE pasta or setresuid fails inside an empty uid_map"
+    end
+
+    test "pasta's --runas names the same uid setpriv drops to", %{plan: plan} do
+      # A mismatch here does not fail loudly: pasta would map a uid the tenant
+      # never becomes, and the namespace comes up owned by nobody in particular.
+      # ⚠️ `--runas 0` after a drop is measured to fail outright, and `--runas
+      # 0:0` as root **hangs** rather than erroring -- a launch that never
+      # returns is worse than one that fails.
+      assert "--reuid=4242" in plan.pasta_command
+
+      runas_value =
+        plan.pasta_command
+        |> Enum.drop_while(&(&1 != "--runas"))
+        |> Enum.at(1)
+
+      assert runas_value == "4242:4242"
+    end
+
+    test "a command with no privilege drop is refused rather than prefixed" do
+      # ⚠️ Falling back to the wrapping shape would reintroduce the unbootable
+      # ordering on exactly the hosts where the split failed -- silently. And a
+      # command that never drops privilege launches its tenant as root, which is
+      # worse than launching nothing.
+      no_drop = ["/usr/bin/systemd-run", "--scope", "bwrap", "--unshare-net", "erlexec"]
+      assert {:error, :no_privilege_drop} = LaunchPlan.build(@key, @port, no_drop)
     end
 
     test "the pidfile pasta writes is the one the plan names", %{plan: plan} do

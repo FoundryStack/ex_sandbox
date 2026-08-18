@@ -157,24 +157,40 @@ defmodule ExSandbox.Conformance.Network do
   inside is uid 65534 and `setpriv --reuid` fails for **any** uid. See
   `egress-path-measurements.md`.
 
-  ⚠️ **Why this is a flag and not a silent revert.** The failures above are
-  *honest* — the mechanism genuinely cannot build the boundary, and the suite is
-  right to refuse to report one. But they abort the credentials phase before the
-  isolation phase runs at all, so leaving them on costs every other measurement
-  in the census and gives nothing back. The flag keeps the capability one line
-  away and keeps the reason written down, rather than deleting the work and
-  rediscovering it.
+  ⚠️ **Why this was a flag and not a silent revert.** The failures above were
+  *honest* — the mechanism genuinely could not build the boundary, and the suite
+  was right to refuse to report one. But they aborted the credentials phase
+  before the isolation phase ran at all, so leaving them on cost every other
+  measurement in the census and gave nothing back. The flag kept the capability
+  one line away and kept the reason written down, rather than deleting the work
+  and rediscovering it.
+
+  ## The default is now ON (T060a4e resolved)
+
+  The blocker above is fixed: `LaunchPlan.build/4` inserts `pasta` **after** the
+  privilege drop rather than wrapping the command in it, so `setpriv` runs in
+  the host's fully mapped namespace and the tenant boots. Both halves of that
+  ordering were measured, not argued (`docker/launch-ordering-probe.sh`): pasta
+  composes after the drop (`uid_map = 0 <uid> 1`), and the scope's `MemoryMax`
+  still SIGKILLs a 192MB allocation at a 64M cap across **two** intervening
+  execs.
+
+  With the launch bootable, the trade reverses. Off is now the setting that
+  costs measurement: the checks report the third outcome forever, and the permit
+  direction — the only half that can distinguish an allowlist from blanket
+  denial — is never exercised. The flag remains, because turning it off is how
+  a host that genuinely cannot police egress keeps the rest of the census.
 
   ⚠️ **It is deliberately NOT an exclusion** (`012-FR-011`). Off, the checks
   report `capability_unavailable` — visible in the census, counted against the
   baseline, and impossible to mistake for a pass. A mechanism gets no credit for
   the checks it does not run.
 
-      config :ex_sandbox, :conformance, allowlist_enabled: true
+      config :ex_sandbox, :conformance, allowlist_enabled: false
   """
   @spec suite_context() :: map()
   def suite_context do
-    if Keyword.get(conformance_config(), :allowlist_enabled, false) do
+    if Keyword.get(conformance_config(), :allowlist_enabled, true) do
       %{network_allowlist: [permitted_address()]}
     else
       %{}

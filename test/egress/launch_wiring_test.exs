@@ -32,7 +32,22 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
   alias ExSandbox.Egress.Binding
   alias ExSandbox.Egress.LaunchPlan
 
-  @confined ["bwrap", "--unshare-net", "--die-with-parent", "erlexec"]
+  @confined [
+    "/usr/bin/systemd-run",
+    "--scope",
+    "--unit=sandbox-x.scope",
+    "-p",
+    "MemoryMax=128M",
+    "setpriv",
+    "--reuid=4242",
+    "--regid=4242",
+    "--clear-groups",
+    "--no-new-privs",
+    "bwrap",
+    "--unshare-net",
+    "--die-with-parent",
+    "erlexec"
+  ]
 
   describe "the plan replaces network isolation rather than adding to it" do
     test "a confined command is rewritten to join the policed namespace" do
@@ -42,12 +57,15 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
              "the tenant would unshare a fresh empty namespace while the policy sat on the configured one"
 
       # The tenant runs *under* pasta rather than joining a pre-built namespace.
-      assert [pasta | _] = plan.pasta_command
-      assert Path.basename(pasta) == "pasta"
-      assert String.starts_with?(pasta, "/"), "must be a path :peer can spawn"
+      # ⚠️ pasta is mid-chain, not at the head: it is inserted after `setpriv`
+      # so the drop happens in the host's fully mapped namespace rather than
+      # inside pasta's empty one (T060a4e, measured).
+      pasta = Enum.find(plan.pasta_command, &(Path.basename(&1) == "pasta"))
+      assert pasta, "the tenant must run under pasta"
+      assert String.starts_with?(pasta, "/"), "must be a path that can be exec'd"
 
       tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
-      assert tenant == plan.tenant_command
+      assert List.last(tenant) == List.last(plan.tenant_command)
     end
 
     test "an unconfined command is refused rather than policed" do

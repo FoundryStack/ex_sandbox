@@ -33,7 +33,6 @@ defmodule ExSandbox.Capability do
   @netns_poll_attempts 40
   @netns_poll_interval_ms 50
 
-
   @type name ::
           :resource_limits
           | :filesystem_confinement
@@ -501,8 +500,18 @@ defmodule ExSandbox.Capability do
   defp unshare_and_bwrap_compose? do
     case System.cmd(
            "unshare",
-           ["--user", "--map-root-user", "--net", "--", "bwrap", "--dev-bind", "/", "/", "--",
-            "/bin/true"],
+           [
+             "--user",
+             "--map-root-user",
+             "--net",
+             "--",
+             "bwrap",
+             "--dev-bind",
+             "/",
+             "/",
+             "--",
+             "/bin/true"
+           ],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true
@@ -653,7 +662,21 @@ defmodule ExSandbox.Capability do
     end
   end
 
-  # ⚠️ `-U --preserve-credentials` is load-bearing: `-n` alone is REFUSED.
+  # ⚠️ `-U` is load-bearing: `-n` alone is REFUSED.
+  #
+  # ⚠️ `--preserve-credentials` was REMOVED here in lockstep with
+  # `Egress.Netns.nsenter/2`, and the two MUST stay in lockstep -- a probe that
+  # answers about a different command than the mechanism runs reports the wrong
+  # capability while looking entirely correct, which is the `005` R9b shape and
+  # what `capability_test.exs` asserts against.
+  #
+  # Why it changed: under the split launch ordering (T060a4e) `pasta` runs after
+  # `setpriv`, so the namespace it creates is owned by the **sandbox uid** rather
+  # than root. Preserving our own credentials into that namespace leaves us with
+  # no capabilities there (`nft` -> `Operation not permitted`); omitting the flag
+  # remaps us to root inside the target userns, which is where the
+  # `CAP_NET_ADMIN` must come from. Measured; see
+  # `egress-path-measurements.md`.
   #
   # `setns()` into a netns requires `CAP_SYS_ADMIN` in the user namespace that
   # **owns** it. The platform holds that capability inside the userns it created,
@@ -678,7 +701,7 @@ defmodule ExSandbox.Capability do
   defp nsenter_succeeds?(pid) do
     case System.cmd(
            "nsenter",
-           ["-t", "#{pid}", "-n", "-U", "--preserve-credentials", "ip", "link"],
+           ["-t", "#{pid}", "-n", "-U", "ip", "link"],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true

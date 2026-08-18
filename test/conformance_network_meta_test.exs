@@ -508,8 +508,25 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       :ok
     end
 
-    test "is off by default, so the group reports the third outcome rather than failing" do
+    test "is ON by default, so the checks measure a boundary rather than skipping" do
+      # ⚠️ The default INVERTED once T060a4e landed, and the direction matters.
+      # It was off while the policed launch could not boot: on, all five network
+      # checks failed honestly with `:mechanism_error`, but they aborted the
+      # credentials phase before the isolation phase ran, costing every other
+      # measurement in the census for nothing gained.
+      #
+      # With the launch bootable (`systemd-run -- setpriv -- pasta -- bwrap`,
+      # measured) the trade reverses: off is now the setting that costs
+      # measurement, because the checks report the third outcome forever and the
+      # permit direction -- the only half that can tell an allowlist from
+      # blanket denial -- is never exercised.
       restore_conformance_env(nil)
+
+      assert %{network_allowlist: [_ | _]} = ExSandbox.Conformance.Network.suite_context()
+    end
+
+    test "can still be turned off explicitly, and off is honoured" do
+      Application.put_env(:ex_sandbox, :conformance, allowlist_enabled: false)
 
       assert ExSandbox.Conformance.Network.suite_context() == %{}
     end
@@ -532,7 +549,10 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       # A mechanism gets no credit for a check it did not run. The assertion is
       # on the census-visible outcome rather than on the flag, because that is
       # the property that matters.
-      restore_conformance_env(nil)
+      # ⚠️ Set explicitly rather than relying on the default, which now carries
+      # an allowlist. This test is about what OFF does, so it must actually be
+      # off -- reading the default here would silently stop testing the flag.
+      Application.put_env(:ex_sandbox, :conformance, allowlist_enabled: false)
 
       results = network_results(ExSandbox.PorousMechanism)
 

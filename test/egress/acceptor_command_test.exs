@@ -32,21 +32,24 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
       # `docker run --device /dev/net/tun`. From outside the platform user
       # namespace -- which is where the BEAM stands, `/proc/self/ns/user`
       # differing from the holder's -- a bare `-n` is REFUSED and
-      # `-n -U --preserve-credentials` succeeds.
+      # `-n -U` succeeds.
       #
       # The failure this guards is silent rather than loud: no acceptor means
       # the redirect points at a port nothing listens on, which from inside the
       # sandbox is indistinguishable from a correctly denied destination. Every
       # denial check would pass while egress was simply broken.
       assert "-U" in command
-      assert "--preserve-credentials" in command
+      # ⚠️ Absent, deliberately: the holder's userns is owned by the sandbox uid
+      # under the split ordering, so credentials must be remapped rather than
+      # preserved or the listener never binds.
+      refute "--preserve-credentials" in command
     end
 
     test "the helper and its arguments follow the nsenter flags", %{command: command} do
       assert "/opt/axonn/nsacceptor" in command
 
       helper_index = Enum.find_index(command, &(&1 == "/opt/axonn/nsacceptor"))
-      flag_index = Enum.find_index(command, &(&1 == "--preserve-credentials"))
+      flag_index = Enum.find_index(command, &(&1 == "-U"))
 
       assert helper_index > flag_index,
              "the helper must be the command nsenter runs, not an argument to nsenter"

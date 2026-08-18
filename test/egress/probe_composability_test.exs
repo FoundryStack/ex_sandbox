@@ -220,7 +220,9 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
     test "the sandbox netns is created INSIDE one platform userns, not beside it",
          %{sources: sources} do
       for source <- sources do
-        [_, entry] = String.split(source, "defp attempt_foreign_netns_entry(unshare) do", parts: 2)
+        [_, entry] =
+          String.split(source, "defp attempt_foreign_netns_entry(unshare) do", parts: 2)
+
         body = entry |> String.split("\n  end", parts: 2) |> hd()
 
         # The outer namespace is created once, with a uid map, and the inner
@@ -276,7 +278,7 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
 
         # Measured, same host, same pid:
         #   nsenter -t <pid> -n ip link                          -> EPERM
-        #   nsenter -t <pid> -n -U --preserve-credentials ...    -> OK
+        #   nsenter -t <pid> -n -U ...                          -> OK
         #
         # The BEAM runs OUTSIDE the sandbox userns, so it holds nothing there
         # until it joins. Dropping `-U` does not weaken the probe subtly -- it
@@ -285,9 +287,15 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
                "the BEAM is outside the sandbox userns; entering the netns " <>
                  "without joining its owning userns is refused"
 
-        assert body =~ "--preserve-credentials",
-               "util-linux requires it when joining a userns the caller is not " <>
-                 "already privileged in"
+        # ⚠️ The flag must be ABSENT, and asserting its absence is the point.
+        # Under the split launch ordering (T060a4e) `pasta` runs after `setpriv`,
+        # so the namespace it creates is owned by the sandbox uid; preserving our
+        # own credentials into it leaves us with no capabilities there and `nft`
+        # fails with `Operation not permitted`. Re-adding the flag would restore
+        # a command that reads correctly and cannot install the redirect.
+        refute body =~ "--preserve-credentials",
+               "credentials must be remapped to the target userns's root, not " <>
+                 "preserved -- the holder is owned by the sandbox uid now"
       end
     end
   end
