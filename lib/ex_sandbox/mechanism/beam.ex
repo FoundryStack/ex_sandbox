@@ -543,10 +543,27 @@ defmodule ExSandbox.Mechanism.Beam do
       #   5. `:refused` is scored as **the boundary holding**.
       #
       # `003-FR-002` would read as demonstrated against a mechanism that never
-      # attempted a crossing. The honest tuple is the sandbox's own listener,
-      # which does not exist until the netns install gives it one (T060a3b).
-      # Until then the string keeps `FR-022` satisfied while the network group
-      # reports the third outcome -- which is the true state.
+      # attempted a crossing.
+      #
+      # ⚠️ **Corrected (T060a4, 2026-08-18): a real listener does NOT make the
+      # tuple honest, and the reasoning above stopped one step short.** It reads
+      # as "publish the tuple once the sandbox has a listener", and measurement
+      # says otherwise: **pasta assigns every netns the host's own address**.
+      # Two sandboxes both come up as `172.17.0.2`, so a connect to that address
+      # from sandbox A lands on **A's own listener** while B never accepts
+      # (measured twice, `egress-path-measurements.md`).
+      #
+      # So the tuple would not be a handle naming *this* sandbox from anywhere
+      # else, and the peer check's verdict -- either way -- would describe a
+      # sandbox talking to itself. `:refused` scored as the boundary holding is
+      # the same false pass as before, arriving by a different route.
+      #
+      # This is not a gap awaiting work. `FR-011c` is satisfied **structurally**:
+      # sandbox B's address is not an address sandbox A can name, which is a
+      # stronger guarantee than a rule that must stay correct. The check
+      # correctly reports the third outcome, because the crossing it wants to
+      # attempt is not merely forbidden -- it is unnameable. `BeamContextTest`
+      # pins the tuple out.
       address: "peer:" <> sandbox.id,
       exec: fn command -> exec_in_sandbox(sandbox, command) end,
       connect: fn host, port -> connect_from_sandbox(sandbox, host, port) end

@@ -107,6 +107,44 @@ defmodule ExSandbox.Mechanism.BeamContextTest do
              "the host's :connect survived: every network check would probe the host's function, not this sandbox"
     end
 
+    test ":address is not the {host, port} tuple the network group dials" do
+      # ⚠️ This is a **deliberate withholding**, and the reason measurement
+      # gives is stronger than the one originally recorded.
+      #
+      # `Conformance.Network.sandbox_address/2` matches only `{host, port}`, so
+      # publishing a tuple is what moves the peer-reachability check off the
+      # third outcome. It would also make that check meaningless, for a reason
+      # that is a property of pasta rather than of anything this project can
+      # fix:
+      #
+      #   **every pasta netns is assigned the host's own address.** Measured
+      #   twice (`egress-path-measurements.md`): two sandboxes both come up as
+      #   `172.17.0.2`, and A's connect to that address lands on **A's own
+      #   listener** while B never accepts.
+      #
+      # So a tuple of a sandbox's address is not an address that names *that*
+      # sandbox from anywhere else. Whatever the check then reported --
+      # `:refused` scored as the boundary holding, or `:connected` scored as a
+      # breach -- would be a fact about A talking to itself.
+      #
+      # The originally recorded reason (`{"peer", id}` fails to resolve, and
+      # `:refused` is scored as the boundary holding) is true and was never the
+      # whole story: it suggests the tuple becomes correct once a real listener
+      # exists. It does not. `FR-011c` is satisfied *structurally* -- B's
+      # address is not an address A can name -- which is a stronger guarantee
+      # than a rule, and precisely why the check cannot be made to demonstrate
+      # it by dialling.
+      provisioned = simulate_mechanism_context_build(sandbox(@host_context))
+
+      refute match?({_host, _port}, Map.get(provisioned.context, :address)),
+             "publishing {host, port} makes the peer check dial an address that " <>
+               "resolves to the DIALLING sandbox's own listener, so its verdict " <>
+               "describes a sandbox talking to itself rather than a boundary"
+
+      assert is_binary(Map.get(provisioned.context, :address)),
+             "`003-FR-022` still asks that a started sandbox carry an address"
+    end
+
     test "a nil host context still yields the mechanism's own keys" do
       # `context` defaults to `nil`, not `%{}` -- a merge that assumes a map
       # would crash every mechanism-only provision, which is most of the suite.
