@@ -182,6 +182,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         # So the namespace is created *by starting the tenant in it*, and the
         # policy is installed afterwards by `police/2`. See
         # `egress-path-measurements.md` defects 3 and 4.
+        _ = clear_stale_pidfile(plan)
         {:ok, exec_from_plan(plan), plan}
 
       {:error, reason} ->
@@ -301,6 +302,30 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
+  # Removes a previous sandbox's pidfile before `pasta` tries to write one.
+  #
+  # ⚠️ **Not tidiness -- without it a recycled /30 cannot launch at all.** The
+  # pidfile is named from the source key, which the allocator *recycles*, while
+  # `sandbox_uid/1` hashes the sandbox **id**, which does not. So the second
+  # sandbox to hold a given /30 usually runs as a different uid, and `/tmp` is
+  # sticky: it cannot replace a file owned by someone else. Measured in the
+  # isolation phase, after the credentials phase had already used 10.0.0.0:
+  #
+  #     Couldn't open PID file /tmp/axonn-pasta-10-0-0-0.pid: Permission denied
+  #     [error] sandbox node failed to boot: {:boot_failed, {:exit_status, 1}}
+  #
+  # ⚠️ The removal is done by the **platform**, which is root, precisely because
+  # the launching uid cannot do it. And it must happen before every launch
+  # rather than only on destroy: a crashed run leaves the file behind, and the
+  # next sandbox on that /30 would inherit the failure with no way to clear it.
+  defp clear_stale_pidfile(%ExSandbox.Egress.LaunchPlan{pidfile: pidfile}) do
+    case File.rm(pidfile) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> Logger.warning("egress: stale pidfile #{pidfile}: #{inspect(reason)}")
+    end
+  end
+
   # `pasta` writes its host-side pid here. ⚠️ That pid is NOT the namespace
   # holder -- `police/2` searches its children for the one whose network
   # namespace differs from ours. See `ExSandbox.Egress.Pasta`.
@@ -365,6 +390,39 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     await_acceptor(port, plan)
   end
 
+  # Forwards the acceptor's own diagnostics into the platform's log.
+  #
+  # ⚠️ Deliberately a separate process that only reads. It must not be able to
+  # affect the launch: the acceptor is serving the sandbox by this point, and a
+  # crash in the code that *reads about* it must not take down the thing being
+  # read about.
+  defp drain_acceptor(port, plan) do
+    parent = self()
+
+    spawn(fn ->
+      Port.connect(port, self())
+      send(parent, :drain_ready)
+      drain_loop(port, plan)
+    end)
+
+    receive do
+      :drain_ready -> :ok
+    after
+      1_000 -> :ok
+    end
+  end
+
+  defp drain_loop(port, plan) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        Logger.warning("egress acceptor #{inspect(plan.source_key)}: #{line}")
+        drain_loop(port, plan)
+
+      {^port, {:exit_status, status}} ->
+        Logger.error("egress acceptor #{inspect(plan.source_key)} exited (status #{status})")
+    end
+  end
+
   # ⚠️ Waits for the acceptor to say it is listening rather than assuming it.
   # Returning `:ok` optimistically would install the redirect against a port
   # that may never open, which fails closed but silently -- the sandbox loses
@@ -379,6 +437,13 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
           # after the namespace holder was killed the acceptor was still alive
           # and still holding the dead netns open, so a destroy that forgot it
           # would leak both.
+          # ⚠️ The acceptor's output after this line used to be discarded --
+          # nothing read the port again, so a per-connection failure inside
+          # `nsacceptor.py` (an unobtainable verdict, an upstream connect that
+          # cannot be made) went to a mailbox no one drained. That is the one
+          # place a permitted destination failing would announce itself, and
+          # its silence cost several cycles of guessing at the layer below.
+          _ = drain_acceptor(port, plan)
           {:ok, os_pid_of(port)}
         else
           await_acceptor(port, plan)

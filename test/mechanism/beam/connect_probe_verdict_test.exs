@@ -87,6 +87,81 @@ defmodule ExSandbox.Mechanism.Beam.ConnectProbeVerdictTest do
       :gen_tcp.close(socket)
     end
 
+    test "the probe expression returns :refused for accept-then-close" do
+      # ⚠️ Evaluated here rather than only in the sandbox, because this probe has
+      # shipped WRONG TWICE and both times it took a container run to find out:
+      # once as a closure the sandbox cannot load (`{:fun_not_loadable, _}`), and
+      # once split across two `:peer.call`s, where the socket's owning process
+      # died between the connect and the recv so EVERY destination read as
+      # `:closed`. Neither was visible from reading it.
+      {l, port} = listener()
+
+      spawn(fn ->
+        {:ok, s} = :gen_tcp.accept(l)
+        :gen_tcp.close(s)
+      end)
+
+      exprs = ExSandbox.Mechanism.Beam.probe_exprs(~c"127.0.0.1", port, 1_000)
+      assert {:value, :refused, _} = :erl_eval.exprs(exprs, [])
+    end
+
+    test "the probe expression returns :connected when data comes back" do
+      {l, port} = listener()
+
+      spawn(fn ->
+        {:ok, s} = :gen_tcp.accept(l)
+        :gen_tcp.send(s, "ORIGIN-REPLY")
+        Process.sleep(300)
+        :gen_tcp.close(s)
+      end)
+
+      exprs = ExSandbox.Mechanism.Beam.probe_exprs(~c"127.0.0.1", port, 1_000)
+      assert {:value, :connected, _} = :erl_eval.exprs(exprs, [])
+    end
+
+    test "the probe expression returns :connected for an open-but-silent peer" do
+      # The case that makes `:timeout` mean REACHED: 1.1.1.1:443 and most other
+      # services never speak first, and scoring their silence as a refusal would
+      # let a real breach against a quiet service read as a held boundary.
+      {l, port} = listener()
+
+      holder =
+        spawn(fn ->
+          {:ok, s} = :gen_tcp.accept(l)
+          Process.sleep(3_000)
+          :gen_tcp.close(s)
+        end)
+
+      exprs = ExSandbox.Mechanism.Beam.probe_exprs(~c"127.0.0.1", port, 300)
+      assert {:value, :connected, _} = :erl_eval.exprs(exprs, [])
+      Process.exit(holder, :kill)
+    end
+
+    test "the probe expression returns :refused when nothing is listening" do
+      {l, port} = listener()
+      :gen_tcp.close(l)
+
+      exprs = ExSandbox.Mechanism.Beam.probe_exprs(~c"127.0.0.1", port, 500)
+      assert {:value, :refused, _} = :erl_eval.exprs(exprs, [])
+    end
+
+    test "the probe uses only OTP modules, so a bare erl can run it" do
+      # ⚠️ `check_funs_loadable/3` refuses a closure whose defining module the
+      # sandbox cannot load, and the sandbox runs a bare `erl`. Shipping this as
+      # a fun turned all three network checks into
+      # `{:sandbox_unreachable, {:fun_not_loadable, ExSandbox.Mechanism.Beam}}`.
+      exprs = ExSandbox.Mechanism.Beam.probe_exprs(~c"127.0.0.1", 1, 100)
+
+      modules =
+        exprs
+        |> :erlang.term_to_binary()
+        |> :erlang.binary_to_term()
+        |> inspect(limit: :infinity)
+
+      refute modules =~ "ExSandbox",
+             "the probe must not reference this project's modules"
+    end
+
     test "a silent-but-open destination reads as TIMEOUT, not as closed" do
       # ⚠️ Why `:timeout` must count as REACHED. Most services wait for the
       # client to speak first, so silence on an open connection is the normal

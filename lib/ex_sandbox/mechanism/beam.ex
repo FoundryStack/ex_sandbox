@@ -700,56 +700,106 @@ defmodule ExSandbox.Mechanism.Beam do
     address = String.to_charlist(host)
     timeout = @connect_probe_timeout_ms
 
-    case call(sandbox, :gen_tcp, :connect, [address, port, [], timeout], timeout * 2) do
-      {:ok, {:ok, socket}} ->
-        verdict = reached?(sandbox, socket, timeout)
-        _ = call(sandbox, :gen_tcp, :close, [socket], timeout)
+    # ⚠️ **Connect, probe and close happen inside ONE `:peer.call`, and that is
+    # not a tidiness preference -- splitting them makes the probe report
+    # `:refused` for every destination on earth.**
+    #
+    # Each `:peer.call` runs in a *fresh process* on the sandbox node, and a
+    # `gen_tcp` socket is owned by the process that opened it: when that process
+    # exits, the socket is closed. So a connect in one call followed by a recv
+    # in the next always sees `{:error, :closed}` -- not because the peer closed
+    # anything, but because the owner died between the two calls.
+    #
+    # Measured against a genuinely reachable, genuinely permitted destination
+    # with the boundary working end to end:
+    #
+    #     connect in call A, recv in call B  -> {:error, :closed}   (WRONG)
+    #     connect and recv in ONE call       -> {:error, :timeout}  (reached)
+    #
+    # A direct connect from the same namespace succeeded at the same moment
+    # (`DIRECT-OK`), and the verdict server answered `PERMIT` for the same
+    # source key -- so every layer was working and only the probe disagreed.
+    case call(sandbox, :erl_eval, :exprs, [probe_exprs(address, port, timeout), []], timeout * 3) do
+      {:ok, {:value, verdict, _bindings}} when verdict in [:connected, :refused, :timeout] ->
         verdict
-
-      {:ok, {:error, :timeout}} ->
-        :timeout
-
-      {:ok, {:error, :etimedout}} ->
-        :timeout
-
-      {:ok, {:error, _reason}} ->
-        :refused
 
       # The sandbox itself became unreachable, which says nothing about the
       # destination. Reported as neither, so the group's inconclusive clause
       # fails rather than scoring a dead sandbox as a held boundary.
       {:error, reason} ->
         {:sandbox_unreachable, reason}
+
+      other ->
+        {:sandbox_unreachable, other}
     end
   end
 
-  # Did the connection reach anything beyond the enforcement point?
+  # The probe, as an expression the sandbox node evaluates in one process.
   #
-  # A refused connection is closed by the acceptor without a reply, so a read
-  # sees `:closed`. A permitted one is relayed to the real destination, which
-  # either sends something or holds the connection open -- both distinguishable
-  # from an immediate close.
+  # ⚠️ **Not a fun.** A closure defined here belongs to `ExSandbox.Mechanism.Beam`,
+  # and the sandbox runs a bare `erl` that cannot load this project's modules --
+  # `check_funs_loadable/3` correctly refuses it with `{:fun_not_loadable, _}`,
+  # which the suite then reports as the sandbox becoming unreachable. Measured:
+  # shipping this probe as a fun turned all three network checks into
+  # `{:sandbox_unreachable, {:fun_not_loadable, ExSandbox.Mechanism.Beam}}`.
   #
-  # ⚠️ `:timeout` counts as REACHED, and that direction is deliberate. A
-  # destination that accepts and stays silent (most services wait for the
-  # client to speak first) is genuinely reached; only an immediate close says
-  # the enforcement point refused. Scoring silence as a refusal would be the
-  # false pass -- a real breach against a quiet service would read as a held
-  # boundary.
+  # Parsed and evaluated on the far side instead, so nothing but OTP is needed
+  # there -- the same constraint that rules out `Node` and every Elixir module
+  # in this probe.
   #
-  # ⚠️ Fails toward REACHED on anything ambiguous, for the same reason: this
-  # probe's errors must produce a *failing* check, never a passing one.
-  defp reached?(sandbox, socket, timeout) do
-    case call(sandbox, :gen_tcp, :recv, [socket, 0, timeout], timeout * 2) do
-      # An immediate close having sent nothing: the acceptor's refusal.
-      {:ok, {:error, :closed}} -> :refused
-      {:ok, {:error, :econnreset}} -> :refused
-      # Data came back, or the peer held the connection open. Reached.
-      {:ok, {:ok, _data}} -> :connected
-      {:ok, {:error, :timeout}} -> :connected
-      {:ok, {:error, _other}} -> :connected
-      {:error, reason} -> {:sandbox_unreachable, reason}
-    end
+  # ⚠️ **A completed handshake is NOT evidence the destination was reached.**
+  # `Egress.Acceptor` is a *transparent* proxy: the redirect sends every
+  # outbound connection to it, so the handshake always completes -- against the
+  # acceptor -- whether the destination is permitted or denied. On a refusal the
+  # acceptor closes without answering, which is what `FR-011a` requires (a
+  # denied destination must be indistinguishable from an unreachable one) and
+  # what `FR-011f` protects (no ranking REJECT above DROP). Measured:
+  #
+  #     # a listener that accepts and immediately closes -- the refusal path
+  #     :gen_tcp.connect(~c"127.0.0.1", port, [], 2000)  #=> {:ok, #Port<0.4>}
+  #
+  # So the question is "did anything cross?", not "did the handshake complete?"
+  #
+  # ⚠️ The probe **speaks first**. Most services -- 1.1.1.1:443 among them --
+  # wait for the client before saying anything, so a read-only probe cannot
+  # distinguish a reached-but-quiet destination from a refused one within its
+  # bound.
+  #
+  # ⚠️ `timeout` counts as REACHED, deliberately. A destination that accepts and
+  # stays silent is genuinely reached; only an immediate close says the
+  # enforcement point refused. Scoring silence as a refusal would be the false
+  # pass -- a real breach against a quiet service would read as a held boundary.
+  @doc false
+  # Public only so `connect_probe_verdict_test.exs` can evaluate the probe
+  # against real listeners on the host. The expression is built here and
+  # evaluated on the sandbox node, so nothing else can check that the two agree
+  # -- and this probe has already shipped wrong twice (as a fun the sandbox
+  # cannot load, and split across two calls so the socket's owner died between
+  # them), both times found in a container rather than here.
+  def probe_exprs(address, port, timeout) do
+    source = """
+    case gen_tcp:connect(#{:io_lib.format(~c"~w", [address])}, #{port}, \
+    [binary, {active, false}], #{timeout}) of
+      {ok, S} ->
+        gen_tcp:send(S, <<0>>),
+        V = case gen_tcp:recv(S, 0, #{timeout}) of
+              {error, closed} -> refused;
+              {error, econnreset} -> refused;
+              {ok, _} -> connected;
+              {error, timeout} -> connected;
+              {error, _} -> connected
+            end,
+        gen_tcp:close(S),
+        V;
+      {error, timeout} -> timeout;
+      {error, etimedout} -> timeout;
+      {error, _} -> refused
+    end.
+    """
+
+    {:ok, tokens, _} = source |> String.to_charlist() |> :erl_scan.string()
+    {:ok, exprs} = :erl_parse.parse_exprs(tokens)
+    exprs
   end
 
   # ⚠️ `PATH` is set explicitly. The sandbox's environment is built by `env -i`

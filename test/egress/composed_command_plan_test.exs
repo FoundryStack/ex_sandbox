@@ -151,6 +151,28 @@ defmodule ExSandbox.Egress.ComposedCommandPlanTest do
              "pasta must be told the same path the launcher later reads"
     end
 
+    test "the pidfile name is keyed by the /30, which the allocator RECYCLES" do
+      # ⚠️ The property that makes a stale-file sweep necessary. The pidfile is
+      # named from the source key, which is recycled; `sandbox_uid/1` hashes the
+      # sandbox **id**, which is not. So the second sandbox on a given /30
+      # usually runs as a different uid, and `/tmp` is sticky -- it cannot
+      # replace another uid's file. Measured in the isolation phase after the
+      # credentials phase had used the same /30:
+      #
+      #     Couldn't open PID file /tmp/axonn-pasta-10-0-0-0.pid: Permission denied
+      #     {:boot_failed, {:exit_status, 1}}
+      {:ok, a} = LaunchPlan.build({10, 0, 0, 4}, @port, composed())
+      {:ok, b} = LaunchPlan.build({10, 0, 0, 4}, @port, composed())
+
+      assert a.pidfile == b.pidfile,
+             "two sandboxes on the same /30 share a pidfile, so a stale one blocks the next"
+
+      {:ok, c} = LaunchPlan.build({10, 0, 0, 8}, @port, composed())
+
+      refute a.pidfile == c.pidfile,
+             "different /30s must not collide, or the host searches the wrong process"
+    end
+
     test "the network confinement is replaced rather than kept" do
       {:ok, plan} = LaunchPlan.build(@key, @port, composed())
 
