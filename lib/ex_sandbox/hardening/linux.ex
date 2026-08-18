@@ -658,14 +658,30 @@ defmodule ExSandbox.Hardening.Linux do
     _ -> false
   end
 
-  # Half two, and the one that is actually load-bearing: this process can enter
-  # a network namespace **it did not create**, which is what installing the
-  # redirect and attaching `pasta` both require.
+  # Half two, and the one that is actually load-bearing: a network namespace
+  # created as a **descendant of a user namespace this process owns** can be
+  # entered, which is what installing the `nft` redirect and attaching `pasta`
+  # both require.
   #
-  # ⚠️ Probed against a namespace created by a *separate* process, never against
-  # one this process made. Entering your own namespace always succeeds and would
-  # make this check vacuous -- it would pass on precisely the hosts it exists to
-  # reject.
+  # ⚠️ **The sequence is the whole point, and an earlier version of this probe
+  # had it backwards.** It spawned `unshare --user --map-root-user --net`, which
+  # creates a *sibling* user namespace, and then tried to enter the netns inside
+  # it. That is refused -- `setns()` into a netns owned by another user namespace
+  # needs `CAP_SYS_ADMIN` **in that owning userns** -- and the refusal was read
+  # as "this host cannot police egress". It is not a host limitation; it is the
+  # wrong order of operations, and the production design never performs it.
+  #
+  # The order this probes is the one the mechanism uses, and the one rootless
+  # Podman, RootlessKit and slirp4netns all use: create **one** user namespace,
+  # then create each sandbox netns as a **descendant** of it with `--net` alone
+  # (never `--user` again). `cap_capable_helper()` walks upward -- "if you have a
+  # capability in a parent user ns, then you have it over all children user
+  # namespaces as well" -- so the platform holds `CAP_SYS_ADMIN` over those
+  # namespaces because it **made** them, with no privilege granted by the host.
+  #
+  # ⚠️ Still probed against a namespace created by a *separate* process. Entering
+  # a namespace this process made directly would be vacuous: it always succeeds,
+  # so it would pass on precisely the hosts this exists to reject.
   defp can_enter_foreign_netns? do
     case System.find_executable("unshare") do
       nil ->
@@ -676,18 +692,46 @@ defmodule ExSandbox.Hardening.Linux do
     end
   end
 
+  # ⚠️ `--user --map-root-user` wraps the **outer** shell, and the inner
+  # `unshare --net` deliberately omits `--user`. Adding it back is the exact
+  # regression described above: the netns would land in a sibling userns and the
+  # entry would be refused on a host that can run the design perfectly well.
+  #
+  # ⚠️ **The port's own pid is the WRONG process to watch, and reading it was a
+  # real defect here.** `Port.info(:os_pid)` names the outer shell, which stays
+  # in the platform's network namespace -- only its *grandchild* enters the new
+  # one. Measured while building this: the outer pid reported the host netns
+  # while pids two levels down held `net:[4026532696]`, so `foreign_netns?/1`
+  # was permanently false and the probe answered `false` on a host the shell
+  # equivalent had just proved capable.
+  #
+  # Failing toward `false` is the safe direction, which is exactly why it was
+  # worth catching: it is invisible in the census, reading as the honest third
+  # outcome rather than as a broken probe.
+  #
+  # So the inner shell **publishes the pid that actually holds the namespace**
+  # on stdout, and the probe waits for that line rather than guessing.
   defp attempt_foreign_netns_entry(unshare) do
     holder =
       Port.open({:spawn_executable, unshare}, [
         :binary,
         :exit_status,
-        args: ["--user", "--map-root-user", "--net", "--", "/bin/sh", "-c", "sleep 5"]
+        :stderr_to_stdout,
+        line: 64,
+        args: [
+          "--user",
+          "--map-root-user",
+          "--",
+          "/bin/sh",
+          "-c",
+          "unshare --net -- /bin/sh -c 'echo $$; sleep 5' & wait"
+        ]
       ])
 
     try do
-      case Port.info(holder, :os_pid) do
-        {:os_pid, pid} -> await_foreign_netns(pid, @netns_poll_attempts)
-        _ -> false
+      case await_holder_pid(holder, @netns_poll_attempts) do
+        {:ok, pid} -> await_foreign_netns(pid, @netns_poll_attempts)
+        :error -> false
       end
     after
       Port.close(holder)
@@ -696,6 +740,26 @@ defmodule ExSandbox.Hardening.Linux do
     _ -> false
   catch
     _, _ -> false
+  end
+
+  # The pid printed by the process that entered the namespace. Bounded, and a
+  # non-numeric or absent line is a `false` rather than a crash -- this runs on
+  # hosts where `unshare` may refuse for reasons the probe exists to report.
+  defp await_holder_pid(_port, 0), do: :error
+
+  defp await_holder_pid(port, attempts) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        case Integer.parse(String.trim(line)) do
+          {pid, ""} -> {:ok, pid}
+          _ -> await_holder_pid(port, attempts - 1)
+        end
+
+      {^port, {:exit_status, _}} ->
+        :error
+    after
+      @netns_poll_interval_ms -> await_holder_pid(port, attempts - 1)
+    end
   end
 
   # ⚠️ Polled, never read once. `Port.open` returns as soon as the process is
@@ -735,8 +799,34 @@ defmodule ExSandbox.Hardening.Linux do
     end
   end
 
+  # ⚠️ `-U --preserve-credentials` is load-bearing: `-n` alone is REFUSED.
+  #
+  # `setns()` into a netns requires `CAP_SYS_ADMIN` in the user namespace that
+  # **owns** it. The platform holds that capability inside the userns it created,
+  # but a process that has not joined that userns holds nothing there -- so
+  # entering the netns without also entering its owning userns fails, even
+  # though the very same process created both. Measured, same host, same pid:
+  #
+  #     nsenter -t <pid> -n ip link                          -> EPERM
+  #     nsenter -t <pid> -n -U --preserve-credentials ip link -> OK
+  #
+  # ⚠️ This is the constraint that makes the whole design work rather than a
+  # detail: the BEAM runs **outside** the sandbox userns, so every namespace
+  # operation the platform performs -- attaching `pasta`, installing the `nft`
+  # redirect -- must join the userns as well. An earlier shell probe appeared to
+  # prove entry worked while running its `nsenter` *inside* the userns, which is
+  # not the position the platform is actually in.
+  #
+  # `--preserve-credentials` keeps the caller's uid rather than remapping to
+  # root, which is what `util-linux` requires when joining a userns this process
+  # is not already privileged in. RootlessKit passes the same pair for the same
+  # reason.
   defp nsenter_succeeds?(pid) do
-    case System.cmd("nsenter", ["-t", "#{pid}", "-n", "ip", "link"], stderr_to_stdout: true) do
+    case System.cmd(
+           "nsenter",
+           ["-t", "#{pid}", "-n", "-U", "--preserve-credentials", "ip", "link"],
+           stderr_to_stdout: true
+         ) do
       {_output, 0} -> true
       _ -> false
     end
@@ -778,8 +868,25 @@ defmodule ExSandbox.Hardening.Linux do
     _ -> false
   end
 
+  # ⚠️ `--unshare-user` is not optional here, and omitting it measured the wrong
+  # thing for the whole life of this probe.
+  #
+  # Without it, `bwrap` builds its mount namespace in the **host's** user
+  # namespace, which needs `CAP_SYS_ADMIN` -- so this returned `false` on every
+  # unprivileged host and the capability looked absent. Measured on the same
+  # host, same binary, one flag apart:
+  #
+  #     bwrap --unshare-net --ro-bind / / true                  -> EPERM
+  #     bwrap --unshare-user --unshare-net --ro-bind / / true    -> OK
+  #
+  # A process in a user namespace it created itself holds a full capability set
+  # within it, which is exactly why the second form works. The mechanism always
+  # passes `--unshare-user` (see `hardening_args/0`), so the first form was not
+  # a conservative check -- it was a check of a command the platform never runs.
   defp can_unshare?(flag) do
-    case System.cmd("bwrap", [flag, "--ro-bind", "/", "/", "true"], stderr_to_stdout: true) do
+    case System.cmd("bwrap", ["--unshare-user", flag, "--ro-bind", "/", "/", "true"],
+           stderr_to_stdout: true
+         ) do
       {_output, 0} -> true
       _ -> false
     end

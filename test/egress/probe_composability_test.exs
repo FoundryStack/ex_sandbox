@@ -197,4 +197,98 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
                "that decides whether the tenant can be policed at all"
     end
   end
+
+  describe "the probe measures the sequence the mechanism actually performs" do
+    # ⚠️ Both assertions here pin a flag whose ABSENCE produced a false `false`:
+    # the probe reported `network_restriction: false` on a host that runs the
+    # design perfectly well. That direction is the dangerous one to leave
+    # untested, because an under-claiming probe is invisible in the census --
+    # it reads as the honest third outcome rather than as a broken check.
+    setup do
+      %{
+        sources:
+          Enum.map(
+            [
+              "lib/ex_sandbox/hardening/linux.ex",
+              "lib/ex_sandbox/capability.ex"
+            ],
+            &File.read!/1
+          )
+      }
+    end
+
+    test "the sandbox netns is created INSIDE one platform userns, not beside it",
+         %{sources: sources} do
+      for source <- sources do
+        [_, entry] = String.split(source, "defp attempt_foreign_netns_entry(unshare) do", parts: 2)
+        body = entry |> String.split("\n  end", parts: 2) |> hd()
+
+        # The outer namespace is created once, with a uid map, and the inner
+        # `unshare` takes `--net` ALONE. An inner `--user` would put the netns
+        # in a sibling user namespace, where `setns()` is correctly refused --
+        # which is precisely the measurement that made this path look
+        # "unobtainable by construction" for two sessions.
+        assert body =~ "--map-root-user",
+               "the platform must own a user namespace; without one it holds no " <>
+                 "CAP_SYS_ADMIN over the netns it creates"
+
+        assert body =~ "unshare --net",
+               "the sandbox netns must be created as a DESCENDANT of that userns"
+
+        refute body =~ "unshare --net --user",
+               "an inner --user recreates the sibling-userns shape this probe " <>
+                 "exists to distinguish from a genuine host limitation"
+      end
+    end
+
+    # ⚠️ This test exists because the equivalent SABOTAGE SURVIVED the whole
+    # suite. Removing `--unshare-user` from the bwrap probe left all 331 tests
+    # green: on macOS `bwrap` is absent, so the branch never runs, and in the
+    # container the flag's absence only *under*-claims. It is the fourth
+    # instance of the same species as the unsupervised pool, the unreferenced
+    # `Binding`, and the unwired relay -- a defect no host-side test can reach,
+    # so it is pinned at the source instead.
+    test "bwrap is probed with the flags the mechanism actually launches with",
+         %{sources: sources} do
+      for source <- sources do
+        # Both copies express this differently -- `can_unshare?/1` in the
+        # hardening module, `unshares?/1` in `Capability` -- so match on the
+        # command construction rather than on a function name.
+        probes =
+          Regex.scan(~r/defp (?:can_unshare\?|unshares\?)\(flag\)(?:,\s*do:)?(.{0,400})/s, source)
+
+        assert probes != [], "neither copy defines a bwrap unshare probe"
+
+        for [_, body] <- probes do
+          assert body =~ "--unshare-user",
+                 "without --unshare-user, bwrap builds its mount namespace in the " <>
+                   "HOST userns and needs CAP_SYS_ADMIN -- so this probes a command " <>
+                   "the mechanism never runs and reports false on every " <>
+                   "unprivileged host"
+        end
+      end
+    end
+
+    test "entering the netns also joins the userns that owns it", %{sources: sources} do
+      for source <- sources do
+        [_, nsenter] = String.split(source, "defp nsenter_succeeds?(pid) do", parts: 2)
+        body = nsenter |> String.split("\n  end", parts: 2) |> hd()
+
+        # Measured, same host, same pid:
+        #   nsenter -t <pid> -n ip link                          -> EPERM
+        #   nsenter -t <pid> -n -U --preserve-credentials ...    -> OK
+        #
+        # The BEAM runs OUTSIDE the sandbox userns, so it holds nothing there
+        # until it joins. Dropping `-U` does not weaken the probe subtly -- it
+        # makes it answer `false` everywhere.
+        assert body =~ "\"-U\"",
+               "the BEAM is outside the sandbox userns; entering the netns " <>
+                 "without joining its owning userns is refused"
+
+        assert body =~ "--preserve-credentials",
+               "util-linux requires it when joining a userns the caller is not " <>
+                 "already privileged in"
+      end
+    end
+  end
 end
