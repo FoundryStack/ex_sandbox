@@ -90,6 +90,7 @@ defmodule ExSandbox.Egress.Verdict do
 
     case :gen_tcp.listen(0, listen_opts) do
       {:ok, listener} ->
+        :ok = permit_acceptor(path)
         {:ok, %{listener: listener, path: path, registry: registry}, {:continue, :accept}}
 
       {:error, reason} ->
@@ -111,6 +112,49 @@ defmodule ExSandbox.Egress.Verdict do
 
   @impl true
   def handle_call(:path, _from, state), do: {:reply, state.path, state}
+
+  # ⚠️ **The acceptor is NOT root, and without this every verdict fails.**
+  #
+  # `nsacceptor.py` runs inside the sandbox's namespace, which under the split
+  # launch ordering (T060a4e) is entered *after* `setpriv` -- so it runs as the
+  # sandbox uid. The BEAM binds this socket as root, and a unix socket inherits
+  # mode `0755` from the process umask, which denies `connect(2)` to every other
+  # uid.
+  #
+  # `ask_platform/4` treats any failure to obtain a verdict as a refusal, which
+  # is correct and is what makes this so quiet: every destination is denied,
+  # **every denial check passes**, and the only symptom is the permitted
+  # destination being unreachable. Measured (`docker/verdict-socket-probe.py`):
+  #
+  #     mode 0755, uid 0  -> sandbox uid: PermissionError [Errno 13]
+  #     mode 0666         -> sandbox uid: GOT:PERMIT
+  #
+  # ⚠️ **Why widening the mode is safe here, and where the isolation actually
+  # comes from.** It is *not* the file mode -- it is the path. The socket lives
+  # under `/var/run`, outside anything `bwrap` binds into the sandbox, so tenant
+  # code cannot see it at all no matter what its mode says. The processes this
+  # opens it to are ones already running on the host, which is where the
+  # acceptor is. A tenant that could reach this path would already have escaped
+  # the mount namespace, and at that point the mode is not what is protecting
+  # anything.
+  #
+  # ⚠️ And reaching it grants nothing on its own: the protocol answers a
+  # question, it does not take an instruction. A caller can ask whether a source
+  # key may reach a destination; it cannot *widen* an allowlist, which is
+  # `FR-011b` and is enforced by `Registry` holding the only copy.
+  defp permit_acceptor(path) do
+    case File.chmod(path, 0o666) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        # Refused rather than tolerated. Continuing would start a verdict server
+        # no acceptor can reach, converting every sandbox's egress into blanket
+        # denial while the platform reports itself healthy.
+        raise "egress: could not make the verdict socket reachable by the " <>
+                "acceptor at #{path}: #{inspect(reason)}"
+    end
+  end
 
   @doc "The path this verdict server is bound to."
   @spec path(GenServer.server()) :: String.t()

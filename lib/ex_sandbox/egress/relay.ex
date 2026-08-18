@@ -44,6 +44,8 @@ defmodule ExSandbox.Egress.Relay do
 
   require Logger
 
+  alias ExSandbox.Egress.Netns
+
   @typedoc "Where a permitted connection is headed."
   @type destination :: {:inet.ip4_address(), :inet.port_number()}
 
@@ -70,9 +72,13 @@ defmodule ExSandbox.Egress.Relay do
   def splice(sandbox_socket, {address, port}, opts \\ []) do
     connect_timeout = Keyword.get(opts, :connect_timeout_ms, @connect_timeout_ms)
 
-    case :gen_tcp.connect(address, port, [:binary, active: false], connect_timeout) do
+    case :gen_tcp.connect(address, port, connect_opts(), connect_timeout) do
       {:ok, destination_socket} ->
-        pump(sandbox_socket, destination_socket, Keyword.get(opts, :idle_timeout_ms, @idle_timeout_ms))
+        pump(
+          sandbox_socket,
+          destination_socket,
+          Keyword.get(opts, :idle_timeout_ms, @idle_timeout_ms)
+        )
 
       {:error, reason} ->
         # ⚠️ Closed, not left open. `decide/3` permitted this destination, so
@@ -90,6 +96,50 @@ defmodule ExSandbox.Egress.Relay do
     end
   end
 
+  # ⚠️ **`SO_MARK`, and without it the permitted half of the allowlist cannot
+  # work at all.**
+  #
+  # This connect happens *inside the sandbox's own network namespace*, which is
+  # the namespace whose `nat output` hook redirects **all** outbound TCP to this
+  # very acceptor. So the relay's upstream connect is caught by the redirect it
+  # exists to serve, and the acceptor talks to itself.
+  #
+  # `Netns.redirect_commands/2` already installs the exemption --
+  # `meta mark 42 return`, placed first so it is evaluated before the redirect --
+  # and its comment states that the acceptor sets the mark on its own upstream
+  # socket. **Nothing did.** `acceptor_mark/0` was referenced only by the rule
+  # that exempts it: the escape hatch was built and never used.
+  #
+  # Measured both ways in the sandbox's namespace, with a real origin behind a
+  # real acceptor (`docker/acceptor-mark-probe.py`):
+  #
+  #     without SO_MARK: TENANT-GOT:RELAY-ERR:TimeoutError   <- talks to itself
+  #     with    SO_MARK: TENANT-GOT:ORIGIN-REPLY
+  #
+  # ⚠️ The symptom is a PERMITTED destination timing out, which reads as an
+  # unreachable network rather than as a broken enforcement point -- and **every
+  # denial check still passes**, because denial is unaffected. That is why it
+  # survived: the deny half looked perfect, and the deny half is what a
+  # denial-only suite measures. `Netns` predicted this exact failure in prose
+  # and the code still shipped without the mark.
+  #
+  # `:raw` because OTP exposes no named option for `SO_MARK`: level `SOL_SOCKET`
+  # (1), option `SO_MARK` (36), a 32-bit native-endian integer.
+  @doc """
+  The options `splice/3` passes to `:gen_tcp.connect/4`.
+
+  Public **only** so `acceptor_mark_wiring_test.exs` can assert that the
+  `SO_MARK` set here is the one the redirect exempts. Asserting on a duplicate
+  literal in the test would pass while the socket carried something else, which
+  is precisely the defect being guarded against.
+  """
+  @spec upstream_connect_opts() :: [:gen_tcp.connect_option()]
+  def upstream_connect_opts, do: connect_opts()
+
+  defp connect_opts do
+    [:binary, active: false, raw: {1, 36, <<Netns.acceptor_mark()::native-32>>}]
+  end
+
   # Both directions are driven by two processes over blocking `recv`, rather
   # than one process over `active: :once` messages.
   #
@@ -103,7 +153,9 @@ defmodule ExSandbox.Egress.Relay do
   defp pump(sandbox_socket, destination_socket, idle_timeout) do
     parent = self()
 
-    outbound = spawn_link(fn -> copy(sandbox_socket, destination_socket, idle_timeout, parent) end)
+    outbound =
+      spawn_link(fn -> copy(sandbox_socket, destination_socket, idle_timeout, parent) end)
+
     inbound = spawn_link(fn -> copy(destination_socket, sandbox_socket, idle_timeout, parent) end)
 
     # Either direction ending ends the connection. Waiting for *both* would hold
