@@ -13,7 +13,16 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
   until the host ran out of one of them. That is a slow failure with a cause far
   from its effect, which is the kind this suite exists to catch early.
   """
-  use ExUnit.Case, async: true
+  # ⚠️ `async: false`. These tests spawn real OS processes and assert on their
+  # liveness, and the isolation suite runs 28 cases concurrently -- several of
+  # which launch and reap sandbox processes of their own. The
+  # "terminates a running process" case failed in the container and passed on
+  # macOS for exactly that reason: a `kill -0` liveness check reads global state
+  # that a concurrent test can disturb.
+  #
+  # Serial is the honest fix. Retrying harder would have hidden a real race
+  # behind a longer timeout.
+  use ExUnit.Case, async: false
 
   alias ExSandbox.Mechanism.Beam.NodeLauncher
 
@@ -99,7 +108,9 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
     code == 0
   end
 
-  defp eventually(fun, attempts \\ 50) do
+  # Bounded wait rather than a fixed sleep: SIGTERM delivery is asynchronous, so
+  # asserting immediately after `kill` is a race in the other direction.
+  defp eventually(fun, attempts \\ 100) do
     Enum.reduce_while(1..attempts, false, fn _, _ ->
       if fun.() do
         {:halt, true}
