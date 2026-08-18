@@ -437,22 +437,106 @@ defmodule ExSandbox.Capability do
   # namespace rather than replacing it. The previous version ran pasta's spawn
   # mode, which fails for a reason about the mode rather than the tools.
   defp policed_launch_composable? do
+    # ⚠️ This probe must attempt the **whole** path, and the reason is a defect
+    # this function already carried in its first netns-first version.
+    #
+    # That version ran only `unshare --user --map-root-user --net -- bwrap …`
+    # and reported `true` whenever the tenant could be built. Measured under
+    # default `docker run` (`CapEff=00000000a80425fb`): that command **succeeds**
+    # and the path is still unpoliceable —
+    #
+    #     unshare -Urn -- bwrap --dev-bind / / -- /bin/true   -> rc=0
+    #     nsenter -t <holder> -n ip link
+    #       -> nsenter: reassociate to namespaces failed: Operation not permitted
+    #     pasta --config-net --runas 0 --netns /proc/<holder>/ns/net
+    #       -> Couldn't switch to pasta namespaces: Operation not permitted
+    #
+    # `setns()` into a network namespace **owned by another user namespace**
+    # requires `CAP_SYS_ADMIN` *in that owning userns*, which the platform
+    # process does not have over a namespace the tenant created. So the tenant
+    # is confined and the host cannot reach in to install the redirect or attach
+    # `pasta` — the isolated-but-unpoliced state, reported as available.
+    #
+    # ⚠️ That is an **over-claiming** probe, the precise failure mode this
+    # feature exists to remove: every denial check passes against a sandbox that
+    # reaches nothing, so the census would report the network group demonstrated.
+    # Confining the tenant is the half that is easy and the half that proves
+    # nothing.
+    #
+    # So the operation probed is the one that actually decides it: can this
+    # process **enter** a namespace it did not create, which is what installing
+    # the `nft` redirect and attaching `pasta` both require.
+    with true <- unshare_and_bwrap_compose?(),
+         true <- can_enter_foreign_netns?() do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  # Half one: a tenant can be both namespaced and confined.
+  defp unshare_and_bwrap_compose? do
     case System.cmd(
            "unshare",
-           [
-             "--user",
-             "--map-root-user",
-             "--net",
-             "--",
-             "bwrap",
-             "--dev-bind",
-             "/",
-             "/",
-             "--",
-             "/bin/true"
-           ],
+           ["--user", "--map-root-user", "--net", "--", "bwrap", "--dev-bind", "/", "/", "--",
+            "/bin/true"],
            stderr_to_stdout: true
          ) do
+      {_output, 0} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  # Half two, and the one that is actually load-bearing: this process can enter
+  # a network namespace **it did not create**, which is what installing the
+  # redirect and attaching `pasta` both require.
+  #
+  # ⚠️ Probed against a namespace created by a *separate* process, never against
+  # one this process made. Entering your own namespace always succeeds and would
+  # make this check vacuous -- it would pass on precisely the hosts it exists to
+  # reject.
+  defp can_enter_foreign_netns? do
+    holder =
+      Port.open({:spawn_executable, System.find_executable("unshare")}, [
+        :binary,
+        :exit_status,
+        args: ["--user", "--map-root-user", "--net", "--", "/bin/sh", "-c", "sleep 5"]
+      ])
+
+    try do
+      case Port.info(holder, :os_pid) do
+        {:os_pid, pid} ->
+          # `unshare` execs the shell in the new namespaces, so the pid is the
+          # holder. Confirmed by comparing inodes rather than trusting it: a
+          # namespace that merely looks configured cannot fool an inode check,
+          # and targeting the wrong pid would install the redirect into the host.
+          foreign_netns?(pid) and nsenter_succeeds?(pid)
+
+        _ ->
+          false
+      end
+    after
+      Port.close(holder)
+    end
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
+  end
+
+  defp foreign_netns?(pid) do
+    with {:ok, theirs} <- File.read_link("/proc/#{pid}/ns/net"),
+         {:ok, ours} <- File.read_link("/proc/self/ns/net") do
+      theirs != ours
+    else
+      _ -> false
+    end
+  end
+
+  defp nsenter_succeeds?(pid) do
+    case System.cmd("nsenter", ["-t", "#{pid}", "-n", "ip", "link"], stderr_to_stdout: true) do
       {_output, 0} -> true
       _ -> false
     end
