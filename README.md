@@ -1,19 +1,15 @@
 # ExSandbox
 
-Isolated execution sandboxes, as a library with no host-application concepts.
+Isolated execution sandboxes library with no host-application concepts.
 
 `ex_sandbox` is a **composition and evidence layer over operating-system facilities**, not a new
 isolation mechanism. Nothing here invents containment: cgroup v2, user and mount namespaces,
 `setpriv` and `bwrap` do the confining. What this library adds is composing them correctly,
 refusing to run when it cannot, and **producing evidence** that the boundary is real.
 
-> ⚠️ **Not published.** `012-FR-013` (release as a versioned package) is deferred until after the
-> first working sandbox, which is now done — but publication has not happened. There is no Hex
-> package; the `mix.exs` snippet the scaffold used to show here would not resolve.
-
 ## Dependencies
 
-`:telemetry`, and nothing else. `012-FR-001` forbids Ash, any web framework, and Axonn itself; the
+`:telemetry`, and nothing else. The
 Elixir floor is `~> 1.14` deliberately, so consumers are not forced onto the platform's version.
 Both properties are enforced by tests rather than by convention — see `dependency_tree_test.exs`
 and `boundary_enforcement_test.exs`.
@@ -42,7 +38,7 @@ that catches it, which is why the gate is load-bearing rather than stylistic.
 `ExSandbox`, `ExSandbox.Mechanism`, `ExSandbox.Sandbox`, `ExSandbox.Capability`,
 `ExSandbox.Hardening`, `ExSandbox.Conformance`, `ExSandbox.Proxy`, `ExSandbox.Telemetry`, and
 `ExSandbox.Conformance.{Lifecycle, Isolation, ResourceLimits, Helpers, Group}` — the last group
-public *by consequence*, since `use ExSandbox.Conformance` expands into calls on them inside the
+public _by consequence_, since `use ExSandbox.Conformance` expands into calls on them inside the
 consumer's own module.
 
 **A module not on that list is private, whether or not it is namespaced `Internal`**
@@ -65,7 +61,7 @@ missing. A partially confined tenant is worse than none, because it looks contai
 defect four times: a probe testing an easier operation than the real one reports a capability the
 host does not have, and every launch then dies — or worse, succeeds unconfined. Privilege is what
 hides it, since the easy and the hard form agree until privilege is removed.
-`CapabilityBuildParityTest` pins this by asserting on the probe's *source* rather than by running
+`CapabilityBuildParityTest` pins this by asserting on the probe's _source_ rather than by running
 it, because running it on a privileged host returns `true` either way.
 
 ## The conformance suite
@@ -97,4 +93,4 @@ docker compose -f docker/compose.isolation.yml up --build \
 `:isolation` and `:reclamation` tags are excluded there — visibly not run, rather than passing
 vacuously. The container is a real Linux host with systemd as PID 1 and all five capabilities
 genuinely constructed; it has found more than a dozen defects in code that passed everything
-locally, including a launch path that failed on *every* Linux host.
+locally, including a launch path that failed on _every_ Linux host.
