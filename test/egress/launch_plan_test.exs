@@ -45,7 +45,9 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       # The inversion. An earlier design had the tenant `ip netns exec` into a
       # pre-built namespace; `pasta` cannot attach to one made that way
       # (measured: `Failed to join network namespace: Permission denied`).
-      assert hd(plan.pasta_command) == "pasta"
+      assert Path.basename(hd(plan.pasta_command)) == "pasta"
+      assert String.starts_with?(hd(plan.pasta_command), "/"),
+             "must be a path :peer can spawn, not a bare name"
 
       tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
       assert tenant == plan.tenant_command

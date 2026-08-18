@@ -71,7 +71,16 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
       # and execs the wrong binary -- and because the arguments still *contain*
       # every hardening flag, a test that greps the joined string for
       # `--unshare-net` or the scope name would pass.
-      assert prog == "pasta"
+      # ⚠️ Basename, plus an absolute path. `:peer` spawns this via
+      # `spawn_executable`, which does NO `PATH` lookup, so the bare name
+      # `"pasta"` -- which this assertion used to require -- made every policed
+      # launch die with `:enoent`. Asserting equality with the bare name did not
+      # merely miss that defect, it *pinned* it.
+      assert Path.basename(prog) == "pasta"
+
+      assert String.starts_with?(prog, "/"),
+             "`:peer` spawns this program with `spawn_executable`, which does " <>
+               "no PATH lookup; a bare name fails with :enoent (got #{inspect(prog)})"
 
       refute prog == "systemd-run",
              "the plan runs the tenant under `pasta`; keeping the original " <>

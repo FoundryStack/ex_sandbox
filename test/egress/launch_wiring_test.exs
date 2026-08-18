@@ -42,7 +42,9 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
              "the tenant would unshare a fresh empty namespace while the policy sat on the configured one"
 
       # The tenant runs *under* pasta rather than joining a pre-built namespace.
-      assert ["pasta" | _] = plan.pasta_command
+      assert [pasta | _] = plan.pasta_command
+      assert Path.basename(pasta) == "pasta"
+      assert String.starts_with?(pasta, "/"), "must be a path :peer can spawn"
 
       tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
       assert tenant == plan.tenant_command

@@ -100,6 +100,11 @@ defmodule ExSandbox.Egress.Netns do
   # Any non-zero value works; this one is arbitrary and stable.
   @acceptor_mark 42
 
+  # Where `pasta` lives on the target base image (verified at `/usr/bin/pasta`).
+  # Used only when `PATH` lookup fails, so a misconfigured host fails naming a
+  # path it looked for. See `pasta_path/0`.
+  @pasta_fallback "/usr/bin/pasta"
+
   @spec redirect_commands(pos_integer(), :inet.port_number()) :: [[String.t()]]
   def redirect_commands(holder_pid, pool_port)
       when is_integer(holder_pid) and holder_pid > 0 do
@@ -236,8 +241,35 @@ defmodule ExSandbox.Egress.Netns do
   """
   @spec pasta_command(String.t(), [String.t()]) :: [String.t()]
   def pasta_command(pidfile, [_ | _] = tenant_command) do
-    ["pasta", "--config-net", "--runas", "0", "-P", pidfile, "--"] ++ tenant_command
+    [pasta_path(), "--config-net", "--runas", "0", "-P", pidfile, "--"] ++ tenant_command
   end
+
+  # ⚠️ An **absolute path**, and the bare name `"pasta"` was a real defect
+  # (005 T060a).
+  #
+  # This list becomes the head of `LaunchPlan.tenant_command`, which
+  # `NodeLauncher` hands to `:peer` as the program to spawn. `:peer` uses
+  # `:erlang.open_port({:spawn_executable, prog}, ...)`, and
+  # **`spawn_executable` does no `PATH` lookup** -- it wants a path to a file.
+  # With a bare name every policed launch died with:
+  #
+  #     ** (ErlangError) Erlang error: :enoent:
+  #        * 1st argument: invalid port name
+  #        :erlang.open_port({:spawn_executable, ~c"pasta"}, ...)
+  #
+  # ⚠️ Why every probe missed it. `docker/wired-egress-e2e.sh`,
+  # `netns-first-e2e.sh` and the rest run the emitted commands **through a
+  # shell**, and a shell resolves `PATH`. So the mechanism's own commands were
+  # correct everywhere they had been measured, and wrong on the one path that
+  # actually launches a tenant. It surfaced only when the conformance suite
+  # gained an allowlist and started taking the policed branch -- the permit
+  # direction again, which is where every defect in this feature has hidden.
+  #
+  # `Hardening.Linux.systemd_run_path/0` already resolves its program this way
+  # for the same reason; the pasta prefix was added later and missed the rule.
+  # The fallback keeps the failure naming a path that was looked for rather than
+  # a bare name that says nothing about where it was sought.
+  defp pasta_path, do: System.find_executable("pasta") || @pasta_fallback
 
   # ⚠️ `-U --preserve-credentials` is load-bearing and `-n` alone is REFUSED
   # from the BEAM's vantage. Measured on `docker-isolation:latest` under plain
