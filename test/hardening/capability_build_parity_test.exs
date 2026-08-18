@@ -94,6 +94,62 @@ defmodule ExSandbox.Hardening.CapabilityBuildParityTest do
     args
   end
 
+  test "the mount-confinement probe attempts the flags the launch actually uses" do
+    # ⚠️ Parity of *presence* is not enough, and this is the hole the rest of
+    # this file did not cover.
+    #
+    # `has_filesystem_confinement?/1` above checks that the built command
+    # contains a bind. It passed the whole time `probe_mount_namespace/0` was
+    # testing `bwrap --unshare-net` while `confinement_args/2` launched with
+    # `--unshare-pid --proc /proc` -- a strictly harder operation. On a
+    # privileged host both succeed, so nothing showed. On an UNPRIVILEGED host
+    # (the `013-FR-006b` shape) the probe's form succeeds and the launch's form
+    # fails:
+    #
+    #     bwrap --unshare-user --unshare-net --ro-bind / / true      -> rc=0
+    #     bwrap --unshare-user --unshare-pid --proc /proc ...        -> rc=1
+    #       "Can't mount proc on /newroot/proc: Operation not permitted"
+    #
+    # The census then reported `filesystem_confinement: ok`, `available?: true`,
+    # and **every launch died** with `{:boot_failed, {:exit_status, 1}}` -- six
+    # failures and `unavailable` 7 -> 14, measured. An over-claiming probe turns
+    # "this host cannot do it" into a launch that crashes, instead of into the
+    # third outcome the census can report honestly.
+    #
+    # This asserts on the probe's SOURCE rather than by running it, deliberately:
+    # running it can only report what this host happens to allow, and on a
+    # privileged host (or on macOS) that is `true` either way -- which is
+    # precisely the blindness that let the drift survive.
+    source = File.read!("lib/ex_sandbox/hardening/linux.ex")
+
+    [_, probe_body] = String.split(source, "defp can_confine_mounts? do", parts: 2)
+    [probe_body, _] = String.split(probe_body, "\n  end", parts: 2)
+
+    launch_flags = built_args()
+
+    required =
+      ["--unshare-pid", "--proc"]
+      |> Enum.filter(&(&1 in launch_flags))
+
+    assert required != [],
+           "expected the launch to confine mounts with --unshare-pid/--proc; " <>
+             "if that changed, this test and `can_confine_mounts?/0` must change with it"
+
+    missing = Enum.reject(required, &String.contains?(probe_body, &1))
+
+    assert missing == [],
+           """
+           `can_confine_mounts?/0` does not attempt #{inspect(missing)}, but the
+           launch command built by `confinement_args/2` uses it.
+
+           A probe that attempts an EASIER operation than the launch reports a
+           capability the host may not have. Unprivileged, that is exactly what
+           happened: probe green, every launch dead.
+
+           Either probe the flags the launch uses, or stop using them.
+           """
+  end
+
   test "every probed capability has a construction entry" do
     # Guards the map above. Without this, adding a sixth probe and forgetting to
     # describe its construction would make the parity test below silently skip

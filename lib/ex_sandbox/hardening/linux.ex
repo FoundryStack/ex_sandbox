@@ -539,7 +539,29 @@ defmodule ExSandbox.Hardening.Linux do
   end
 
   defp probe_mount_namespace do
-    executable_present?("bwrap") and can_unshare?("--unshare-net")
+    # ⚠️ `--unshare-net` alone is NOT the check, and testing only it is the same
+    # defect `can_unshare?/1` below already documents one level down: a check of
+    # a command the platform never runs.
+    #
+    # `confinement_args/2` launches with `--proc /proc` **and** `--unshare-pid`,
+    # and that pair is strictly harder than `--unshare-net`. Measured on the
+    # census image (`docker/unprivileged-census-probe.sh` records the shape):
+    #
+    #     unprivileged  bwrap --unshare-user --unshare-net  --ro-bind / / true  -> rc=0
+    #     unprivileged  bwrap --unshare-user --unshare-pid --proc /proc ...     -> rc=1
+    #                   "Can't mount proc on /newroot/proc: Operation not permitted"
+    #     privileged    both forms                                              -> rc=0
+    #
+    # So on an unprivileged host the old probe reported `filesystem_confinement:
+    # ok`, `available?/0` returned true, and **every launch then failed** with
+    # `{:boot_failed, {:exit_status, 1}}`. That is an over-claiming probe, which
+    # `probe_network_policy/0` above spells out as the failure mode this module
+    # exists to remove: it converts "we cannot do this here" into a launch that
+    # dies, rather than into the third outcome the census can report honestly.
+    #
+    # It stayed invisible while the census container ran `privileged: true`,
+    # because privilege is exactly what makes the two forms agree (013-FR-006b).
+    executable_present?("bwrap") and can_confine_mounts?()
   end
 
   defp probe_network_policy do
@@ -901,6 +923,35 @@ defmodule ExSandbox.Hardening.Linux do
   # a conservative check -- it was a check of a command the platform never runs.
   defp can_unshare?(flag) do
     case System.cmd("bwrap", ["--unshare-user", flag, "--ro-bind", "/", "/", "true"],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  # The mount confinement the mechanism actually constructs.
+  #
+  # ⚠️ Mirrors `confinement_args/2`'s flags rather than a simpler subset. Kept
+  # beside `can_unshare?/1` so the two stay in step: if the launch's flags
+  # change, this probe has to change with them, and the comment above
+  # `probe_mount_namespace/0` records what it costs when they drift apart.
+  defp can_confine_mounts? do
+    case System.cmd(
+           "bwrap",
+           [
+             "--unshare-user",
+             "--unshare-net",
+             "--unshare-pid",
+             "--proc",
+             "/proc",
+             "--ro-bind",
+             "/",
+             "/",
+             "true"
+           ],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true
