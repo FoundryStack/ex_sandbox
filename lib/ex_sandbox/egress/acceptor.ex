@@ -140,8 +140,17 @@ defmodule ExSandbox.Egress.Acceptor do
       :permitted
   end
 
-  # The acceptor's own /30, expressed as an address `Policy.source_key/1` masks
-  # back to that /30 -- so the shared decision function is reached with the
-  # identity this acceptor was started for.
-  defp sandbox_address({a, b, c, d}), do: {a, b, c, d + 2}
+  @doc """
+  The acceptor's own /30, expressed as an address `Policy.source_key/1` masks
+  back to that /30 — so the shared decision function is reached with the
+  identity this acceptor was started for.
+
+  Public because `ExSandbox.Egress.Verdict` reconstructs the same address when
+  an acceptor names its sandbox on the wire. ⚠️ Two copies of this arithmetic
+  would be two things that must agree forever, and the symptom of them drifting
+  is a sandbox judged against a *neighbouring* sandbox's allowlist — a
+  cross-tenant policy error with no local sign of being wrong.
+  """
+  @spec sandbox_address(Policy.source_key()) :: :inet.ip4_address()
+  def sandbox_address({a, b, c, d}), do: {a, b, c, d + 2}
 end
