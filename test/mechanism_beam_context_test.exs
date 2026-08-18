@@ -126,6 +126,48 @@ defmodule ExSandbox.Mechanism.BeamContextTest do
     end
   end
 
+  describe "policy_handle (005 T060a4, FR-011b, FR-011e)" do
+    test "is absent for a sandbox that was never launched, so no policy exists to name" do
+      provisioned = simulate_mechanism_context_build(sandbox(@host_context))
+
+      refute Map.has_key?(provisioned.context, :policy_handle)
+    end
+
+    @tag :policy_handle
+    test "is absent rather than inherited when the host supplies one" do
+      # ⚠️ The same provenance rule `:permitted` and `:address` already carry.
+      # `attempt_widen_allowlist/2` scores an absent handle as the boundary
+      # HOLDING, so a host that could name any unreachable path would have
+      # `FR-011b` reported as demonstrated against a mechanism enforcing
+      # nothing -- the check's verdict supplied by the party it constrains.
+      provisioned =
+        simulate_mechanism_context_build(
+          sandbox(%{policy_handle: "/tmp/definitely-not-the-policy.sock"})
+        )
+
+      refute Map.has_key?(provisioned.context, :policy_handle)
+    end
+
+    test "an unlaunched sandbox makes the suite report the third outcome, not a pass" do
+      # ⚠️ The end-to-end consequence, asserted through the real check rather
+      # than by inspecting the key. `attempt_widen_allowlist/2` raises
+      # `CapabilityUnavailable` when the handle is undeclared -- honest, and
+      # counted in the census as a gap. The failure this pins is the opposite
+      # one: publish a handle for an `--unshare-net` sandbox and the check
+      # instead returns `{:refused, {:policy_not_visible, _}}`, scoring
+      # `FR-011b` as demonstrated for a sandbox that has no egress policy to
+      # widen in the first place.
+      provisioned = simulate_mechanism_context_build(sandbox(@host_context))
+
+      assert_raise ExSandbox.Conformance.CapabilityUnavailable, fn ->
+        ExSandbox.Conformance.Network.attempt_widen_allowlist(
+          ExSandbox.Mechanism.Beam,
+          provisioned
+        )
+      end
+    end
+  end
+
   # Mirrors `do_provision/1`'s context construction without launching a node.
   # `build_context/1` is private and the launch path refuses off Linux, so this
   # reproduces the one expression under test:

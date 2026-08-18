@@ -555,6 +555,55 @@ defmodule ExSandbox.Mechanism.Beam do
     host_context
     |> Map.merge(published)
     |> put_permitted()
+    |> put_policy_handle(sandbox)
+  end
+
+  # ⚠️ `:policy_handle` is published **only for a sandbox that actually has a
+  # policy**, and that condition is the whole correctness of the check it feeds
+  # (005 T060a4, `FR-011b`).
+  #
+  # `Conformance.Network.attempt_widen_allowlist/2` scores an *absent* handle
+  # inside the sandbox as `{:refused, {:policy_not_visible, handle}}` -- the
+  # boundary holding. So publishing a path unconditionally would score
+  # `FR-011b` as demonstrated for a sandbox launched under `--unshare-net`,
+  # which has no egress policy to widen in the first place. The check would be
+  # reporting that an unwritable policy is unwritable, having never established
+  # that a policy exists. That is the `--unshare-net` false pass in its purest
+  # form: the *absence* of a mechanism scoring as the presence of a boundary.
+  #
+  # Gating on `binding` is what makes it honest -- the row carries one only when
+  # `policed/2` installed a real allowlist. Without it the key is absent and the
+  # census keeps reporting the third outcome, which is the true state.
+  #
+  # ⚠️ The handle names the **verdict socket**, not a config file, because that
+  # is where the allowlist is actually enforced: `nsacceptor.py` holds no policy
+  # and asks `Egress.Verdict` over it for every connection. A tenant that could
+  # write there could answer its own questions. Measured in the isolation
+  # container against the real bind set (`/usr`, `/lib`, `/bin`, `/sbin`, plus
+  # the sandbox's own storage): the path reports ABSENT inside, and WIDENED when
+  # deliberately bound in -- so the check discriminates rather than passing
+  # because every write fails on an unprivileged host.
+  defp put_policy_handle(context, %Sandbox{} = sandbox) do
+    with {:ok, launched} <- lookup(sandbox.id),
+         true <- not is_nil(launched[:binding]),
+         {:ok, path} <- verdict_path() do
+      Map.put(context, :policy_handle, path)
+    else
+      _ -> Map.delete(context, :policy_handle)
+    end
+  end
+
+  # ⚠️ Asks the **running** server rather than reading config, for the same
+  # reason `af82afa` changed the acceptor: config records what the server was
+  # asked to bind, and a handle naming a path nothing listens on is a handle
+  # that is absent inside the sandbox for the wrong reason. `Verdict.path/1` is
+  # a `GenServer.call`, so it is guarded -- `context_for/1` runs on macOS too,
+  # where the egress supervision tree may not be up, and a crash there would
+  # fail the provision rather than omit a key.
+  defp verdict_path do
+    {:ok, ExSandbox.Egress.Verdict.path()}
+  catch
+    :exit, _ -> :error
   end
 
   # ⚠️ `:permitted` is published **only when the tenant's allowlist names a
