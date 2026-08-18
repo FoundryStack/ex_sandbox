@@ -108,7 +108,23 @@ defmodule ExSandbox.Egress.Acceptor do
   """
   @spec listener_command(pos_integer(), :inet.port_number(), String.t()) :: [String.t()]
   def listener_command(holder_pid, port, helper_path) do
-    ["nsenter", "-t", "#{holder_pid}", "-n", helper_path, "#{port}"]
+    # ⚠️ `-U --preserve-credentials`, not a bare `-n`. The BEAM stands outside
+    # the platform user namespace that owns this netns, and from there `-n`
+    # alone is refused -- see `ExSandbox.Egress.Netns` for the measurement of
+    # both forms from both vantage points. Without these flags the acceptor
+    # never starts, the redirect points at a port nothing is listening on, and
+    # from inside the sandbox that is indistinguishable from a correctly denied
+    # destination: every denial check passes and egress is simply broken.
+    [
+      "nsenter",
+      "-t",
+      "#{holder_pid}",
+      "-n",
+      "-U",
+      "--preserve-credentials",
+      helper_path,
+      "#{port}"
+    ]
   end
 
   @doc """

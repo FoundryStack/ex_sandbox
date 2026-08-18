@@ -187,5 +187,27 @@ defmodule ExSandbox.Egress.Netns do
     ["pasta", "--config-net", "--runas", "0", "-P", pidfile, "--"] ++ tenant_command
   end
 
-  defp nsenter(pid, command), do: ["nsenter", "-t", "#{pid}", "-n"] ++ command
+  # ⚠️ `-U --preserve-credentials` is load-bearing and `-n` alone is REFUSED
+  # from the BEAM's vantage. Measured on `docker-isolation:latest` under plain
+  # unprivileged `docker run --device /dev/net/tun`, both forms from both
+  # vantage points in one run:
+  #
+  #     caller OUTSIDE the platform userns (this is where the BEAM stands):
+  #       nsenter -t <holder> -n ip link                          -> REFUSED
+  #       nsenter -t <holder> -n -U --preserve-credentials ip link -> OK
+  #
+  # The netns is a descendant of the platform's user namespace, so entering it
+  # requires `CAP_SYS_ADMIN` *in that userns*. The BEAM is not in it --
+  # `/proc/self/ns/user` reads `user:[4026531837]` while the holder's reads
+  # `user:[4026534472]` -- so the netns must be joined together with the userns
+  # that owns it. `--preserve-credentials` keeps the caller's uid rather than
+  # remapping to the target's root.
+  #
+  # ⚠️ A shell probe run *inside* the platform userns measures the opposite
+  # (bare `-n` OK, `-U` refused, because it is already in that userns) and that
+  # is the reading this call site originally encoded. It is not the BEAM's
+  # position. `ExSandbox.Capability.can_enter_foreign_netns?/0` probes the form
+  # written here, so probe and mechanism cannot drift apart again silently.
+  defp nsenter(pid, command),
+    do: ["nsenter", "-t", "#{pid}", "-n", "-U", "--preserve-credentials"] ++ command
 end

@@ -53,8 +53,34 @@ defmodule ExSandbox.Egress.NetnsTest do
       # sandbox's redirect there -- it succeeds, warns about nothing, and
       # leaves the tenant unpoliced while the host acquires a stray NAT rule.
       for command <- commands do
-        assert Enum.take(command, 4) == ["nsenter", "-t", "4242", "-n"],
+        assert Enum.take(command, 6) ==
+                 ["nsenter", "-t", "4242", "-n", "-U", "--preserve-credentials"],
                "a policy command that does not enter the namespace configures the host: " <>
+                 Enum.join(command, " ")
+      end
+    end
+
+    test "entry joins the userns that owns the netns, not the netns alone", %{
+      commands: commands
+    } do
+      # ⚠️ Regression guard for a mechanism/probe divergence that ran the other
+      # way from the one `probe_composability_test.exs` catches. There the probe
+      # measured a sequence the mechanism never ran; here the mechanism ran a
+      # sequence the probe never measured, so `network_restriction` reported
+      # `ok` while every real `nsenter` would have been refused at runtime.
+      #
+      # Measured on `docker-isolation:latest`, unprivileged, both forms from
+      # both vantage points in one run:
+      #
+      #   caller OUTSIDE the platform userns (the BEAM's position):
+      #     nsenter -t <holder> -n ...                          -> REFUSED
+      #     nsenter -t <holder> -n -U --preserve-credentials ... -> OK
+      #
+      # A bare `-n` here fails closed in the worst way: the redirect is never
+      # installed, so the tenant runs unpoliced while every denial check passes.
+      for command <- commands do
+        assert "-U" in command and "--preserve-credentials" in command,
+               "bare `-n` is refused from outside the owning userns: " <>
                  Enum.join(command, " ")
       end
     end
@@ -122,8 +148,17 @@ defmodule ExSandbox.Egress.NetnsTest do
       # every rule here -- `nft add table ip nat` names the address family --
       # so a membership test fails against correct commands and would be
       # "fixed" by deleting it.
+      # ⚠️ The program is *located*, not read from a fixed offset. This assertion
+      # was `Enum.at(command, 4)` and broke when the userns-join flags
+      # (`-U --preserve-credentials`) were added ahead of it -- a correct change
+      # failing a correct test because the test encoded an argument position.
+      # Dropping the `nsenter` flags finds the first real program either way.
       for command <- commands do
-        program = Enum.at(command, 4)
+        program =
+          command
+          |> Enum.drop_while(&(&1 != "--preserve-credentials"))
+          |> Enum.drop(1)
+          |> List.first()
 
         assert program == "nft",
                "pasta configures the namespace; this must only police it: " <>
