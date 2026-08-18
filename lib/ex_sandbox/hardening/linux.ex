@@ -540,14 +540,25 @@ defmodule ExSandbox.Hardening.Linux do
     # which is not the same as *policy*. An allowlist needs a route that leads
     # somewhere we control (005 T060a, contracts/egress.md).
     #
-    # ⚠️ The third condition is the one measurement forced, and it is the
-    # reason this probe currently reports `false` on every host tried:
-    # **`pasta` and `bwrap` do not compose**. `pasta` starts its child with
-    # `CapEff=0` inside a user namespace whose mappings it could not write, and
-    # `bwrap` -- which must create a mount namespace, that being its entire
-    # job -- then fails with `No permissions to create new namespace`. Measured
-    # five ways, including `--unshare-user-try` and a pre-created userns fd;
-    # see `egress-path-measurements.md`.
+    # ⚠️ The third condition is the one measurement forced, and its meaning has
+    # been **corrected**. It previously read "`pasta` and `bwrap` do not
+    # compose", concluded from five attempts that all used `pasta`'s *spawn*
+    # mode (`pasta -- <cmd>`). In that mode pasta owns the user namespace, fails
+    # to write its `uid_map`, and hands the tenant `CapEff=0` -- from which
+    # `bwrap` cannot create the mount namespace that is its entire job. Every
+    # relaxation varied `bwrap`'s flags; none varied the mode, which is the
+    # thing that was actually wrong.
+    #
+    # They **do** compose in the netns-first order, measured end to end in
+    # `docker/netns-first-e2e.sh`: create the namespace, attach `pasta --netns`,
+    # then run `bwrap` inside it. Two facts make it work, and both are checked
+    # by `policed_launch_composable?/0` rather than assumed:
+    #
+    #   * `bwrap` does **not** create a network namespace unless `--unshare-net`
+    #     is passed -- it inherits the one it is launched in, so `pasta` never
+    #     has to spawn it.
+    #   * a process in a user namespace it created **itself** holds a full
+    #     capability set within it, which is exactly what `bwrap` needs.
     #
     # Reporting `true` here would be the exact failure this whole exercise
     # exists to remove. `require_permitted_reachable/2` scores a refusal as a
@@ -587,12 +598,31 @@ defmodule ExSandbox.Hardening.Linux do
   # last two for reasons no single bit explains. Running the composition is the
   # only check that cannot be fooled by a capability set that looks sufficient.
   defp policed_launch_composable? do
+    # ⚠️ The order under test is netns-**first**, and that is the whole
+    # correction. The previous implementation ran
+    # `pasta --config-net --runas 0 -- bwrap ...` -- pasta's spawn mode -- which
+    # fails for a reason that is about the mode rather than about the tools, and
+    # so reported `false` on every host including ones that can run the real
+    # path.
+    #
+    # ⚠️ `bwrap` is invoked **without** `--unshare-net`, deliberately. It must
+    # inherit the namespace `unshare -rn` created, not replace it. Adding that
+    # flag here would make this probe pass while measuring the
+    # isolated-but-unpoliced state -- a namespace with no route out, which is
+    # the exact condition this feature exists to end.
+    #
+    # ⚠️ Attempted rather than inferred, because the capability model here has
+    # already produced two wrong answers. `CapEff` is not the predicate:
+    # rootless Podman grants a full set inside its own user namespace,
+    # `--cap-drop=ALL` grants none, and default Docker grants a subset without
+    # `CAP_SYS_ADMIN`. Running the composition is the only check a
+    # sufficient-looking capability set cannot fool.
     case System.cmd(
-           "pasta",
+           "unshare",
            [
-             "--config-net",
-             "--runas",
-             "0",
+             "--user",
+             "--map-root-user",
+             "--net",
              "--",
              "bwrap",
              "--dev-bind",
@@ -607,8 +637,8 @@ defmodule ExSandbox.Hardening.Linux do
       _ -> false
     end
   rescue
-    # `pasta` absent is already covered by `pasta_usable?/0`; this guards the
-    # case where it exists but cannot be executed at all.
+    # `unshare` absent, or present and unrunnable. `pasta_usable?/0` already
+    # covers pasta itself.
     _ -> false
   end
 

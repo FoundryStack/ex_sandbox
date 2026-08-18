@@ -426,13 +426,23 @@ defmodule ExSandbox.Capability do
   # Docker grants a subset without `CAP_SYS_ADMIN` -- and `bwrap` fails in the
   # last two for reasons no single bit explains. Running the composition is the
   # only check that cannot be fooled by a capability set that looks sufficient.
+  # ⚠️ Must stay identical to `ExSandbox.Hardening.Linux`'s copy. These two
+  # probes answering differently about the same host is a defect this file has
+  # already carried once (005 T060a5c): `provision/2` consults this one and
+  # `require_hardening/0` the other, so a disagreement reports "this host cannot
+  # police egress" as a pile of phantom conformance failures with no cause
+  # attached.
+  #
+  # ⚠️ netns-**first**, and `bwrap` without `--unshare-net` so it inherits the
+  # namespace rather than replacing it. The previous version ran pasta's spawn
+  # mode, which fails for a reason about the mode rather than the tools.
   defp policed_launch_composable? do
     case System.cmd(
-           "pasta",
+           "unshare",
            [
-             "--config-net",
-             "--runas",
-             "0",
+             "--user",
+             "--map-root-user",
+             "--net",
              "--",
              "bwrap",
              "--dev-bind",
