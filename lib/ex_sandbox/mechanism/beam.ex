@@ -234,6 +234,16 @@ defmodule ExSandbox.Mechanism.Beam do
         # exceptional. `Binding.release/2` is itself idempotent (`003-FR-013`),
         # which is what makes a second destroy safe.
         if launched[:binding], do: :ok = ExSandbox.Egress.Binding.release(launched.binding)
+
+        # ⚠️ The acceptor does NOT die with the namespace it serves, and that is
+        # measured rather than assumed: after `kill -9` on the namespace holder
+        # the acceptor was still alive and `/proc/<acc>/ns/net` still named the
+        # same namespace -- so it was keeping a dead netns open. Without this,
+        # every destroy leaks one process and one namespace, forever.
+        #
+        # Idempotent like `Binding.release/2` (`003-FR-013`): killing a pid that
+        # is already gone is not an error, and a second destroy must be safe.
+        if launched[:acceptor_os_pid], do: NodeLauncher.stop_acceptor(launched.acceptor_os_pid)
         # The key the row was found under -- see `stop/1`. Forgetting
         # `sandbox.id` for a ref-resolved struct would terminate the node and
         # leave its row behind, which reconciliation would then see as an orphan

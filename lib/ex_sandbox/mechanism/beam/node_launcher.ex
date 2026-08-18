@@ -47,7 +47,17 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
           #
           # `nil` on a host with no egress path, which is the ordinary case on
           # macOS and the reason `destroy/1` must tolerate its absence.
-          binding: ExSandbox.Egress.Binding.t() | nil
+          binding: ExSandbox.Egress.Binding.t() | nil,
+          # ⚠️ The acceptor's OS pid, carried for the same reason as `binding`
+          # and against a worse failure. The acceptor is a detached process
+          # entered into the tenant's netns, and it does **not** die with the
+          # namespace holder -- measured: after `kill -9` on the holder the
+          # acceptor was still alive and still holding the dead namespace open
+          # (`/proc/<acc>/ns/net` unchanged). So every destroy would leak one
+          # process *and* keep one namespace alive, indefinitely.
+          #
+          # `nil` on a host with no egress path, as with `binding`.
+          acceptor_os_pid: integer() | nil
         }
 
   @doc """
@@ -72,9 +82,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          # and unpoliced. The window cannot be closed by reordering -- the
          # namespace does not exist until `pasta` starts the tenant in it -- so
          # it is closed by failing toward termination instead. See `police/2`.
-         :ok <- police_or_terminate(plan, launched, binding),
+         {:ok, acceptor_os_pid} <- police_or_terminate(plan, launched, binding),
          :ok <- verify_or_terminate(launched, sandbox) do
-      {:ok, Map.put(launched, :binding, binding)}
+      {:ok,
+       launched
+       |> Map.put(:binding, binding)
+       |> Map.put(:acceptor_os_pid, acceptor_os_pid)}
     end
   end
 
@@ -211,7 +224,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   left private it would be verified only where the whole launch works, which is
   the arrangement that let the context-discard defect survive.
   """
-  @spec police(ExSandbox.Egress.LaunchPlan.t(), keyword()) :: :ok | {:error, atom()}
+  @spec police(ExSandbox.Egress.LaunchPlan.t(), keyword()) ::
+          {:ok, integer() | nil} | {:error, atom()}
   def police(%ExSandbox.Egress.LaunchPlan{} = plan, opts \\ []) do
     pasta_pid = Keyword.fetch!(opts, :pasta_pid)
     finder = Keyword.get(opts, :finder, &ExSandbox.Egress.Pasta.find/2)
@@ -230,8 +244,9 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         # Measured directly while building `docker/acceptor-e2e.sh`: with the
         # acceptor bound in the wrong namespace the tenant got `ECONNREFUSED`,
         # which reads exactly like a working boundary.
-        with :ok <- starter.(plan, holder_pid, opts) do
-          runner.(ExSandbox.Egress.LaunchPlan.redirect_steps(plan, holder_pid))
+        with {:ok, acceptor_os_pid} <- starter.(plan, holder_pid, opts),
+             :ok <- runner.(ExSandbox.Egress.LaunchPlan.redirect_steps(plan, holder_pid)) do
+          {:ok, acceptor_os_pid}
         end
 
       {:error, reason} ->
@@ -259,12 +274,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # worse than failing -- an unenforced allowlist that the census records as a
   # demonstrated boundary, because every denial check passes for reasons that
   # have nothing to do with policy.
-  defp police_or_terminate(nil, _launched, _binding), do: :ok
+  defp police_or_terminate(nil, _launched, _binding), do: {:ok, nil}
 
   defp police_or_terminate(plan, launched, binding) do
     case police(plan, pasta_pid: pasta_pid(plan)) do
-      :ok ->
-        :ok
+      {:ok, acceptor_os_pid} ->
+        {:ok, acceptor_os_pid}
 
       {:error, reason} ->
         _ = terminate(launched)
@@ -345,7 +360,13 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     receive do
       {^port, {:data, {:eol, line}}} ->
         if String.starts_with?(line, "ACCEPTOR listening") do
-          :ok
+          # ⚠️ The OS pid, not the port. `destroy/1` must be able to kill this
+          # process, and a `Port` is a BEAM-side handle that dies with the
+          # calling process while the OS process it spawned does not. Measured:
+          # after the namespace holder was killed the acceptor was still alive
+          # and still holding the dead netns open, so a destroy that forgot it
+          # would leak both.
+          {:ok, os_pid_of(port)}
         else
           await_acceptor(port, plan)
         end
@@ -386,6 +407,45 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     ExSandbox.Egress.Verdict.path()
   catch
     :exit, _ -> ExSandbox.Egress.Verdict.default_path()
+  end
+
+  # The OS pid behind a port, or `nil` when the port has already closed.
+  defp os_pid_of(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} -> pid
+      nil -> nil
+    end
+  end
+
+  @doc """
+  Terminates a sandbox's acceptor, idempotently (`003-FR-013`).
+
+  ⚠️ Exists because the acceptor does **not** die with the namespace it serves.
+  Measured: after `kill -9` on the namespace holder the acceptor was still
+  running, and `/proc/<acceptor>/ns/net` still named the same namespace — so it
+  was holding a dead netns open. A destroy that forgot it would leak one process
+  and one namespace per sandbox, with no symptom until the host ran out of
+  either.
+
+  Killing a pid that is already gone is not an error: a second `destroy/1` must
+  be safe, and reclamation that fails on an already-reclaimed sandbox is
+  reclamation nobody can retry.
+  """
+  @spec stop_acceptor(integer() | nil) :: :ok
+  def stop_acceptor(nil), do: :ok
+
+  def stop_acceptor(os_pid) when is_integer(os_pid) do
+    # `System.cmd/3` rather than `Port`: there is no BEAM-side handle to this
+    # process any more -- the port that spawned it belonged to the launching
+    # process, which is long gone by the time `destroy/1` runs.
+    _ = System.cmd("kill", ["-TERM", "#{os_pid}"], stderr_to_stdout: true)
+    :ok
+  rescue
+    # A host without `kill` on PATH cannot reclaim, and saying so beats raising
+    # out of a destroy that has already released everything else.
+    error ->
+      Logger.warning("egress: could not stop acceptor #{os_pid} (#{inspect(error)})")
+      :ok
   end
 
   @doc """
