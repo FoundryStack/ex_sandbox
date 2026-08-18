@@ -6,10 +6,23 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
   ## The wrong implementation this is written against
 
   One that reports `network_restriction: true` because `bwrap`, `pasta`, and
-  `/dev/net/tun` are all present. Each part exists; the *composition* does not
-  work — `pasta` starts its child with `CapEff=0` in a user namespace whose
-  mappings it could not write, and `bwrap` then cannot create the mount
-  namespace that is its entire purpose.
+  `/dev/net/tun` are all present. Each part exists; the *composition* may not
+  work.
+
+  ⚠️ **There are two such wrong implementations, and the second was written
+  here before it was caught.** The first builds the answer from an inventory of
+  tools. The second attempts a composition — but the *wrong* one:
+
+      unshare --user --map-root-user --net -- bwrap --dev-bind / / -- /bin/true
+
+  That succeeds under default `docker run`, where the egress path is
+  nonetheless unpoliceable: the host cannot `setns()` into a namespace owned by
+  a user namespace it does not control, so `pasta` and the `nft` redirect are
+  both refused. Measured — see `egress-path-measurements.md`.
+
+  ⚠️ **Confining the tenant is the easy half and proves nothing.** The half that
+  decides the capability is whether the platform can *enter* a namespace it did
+  not create, because that is what installing the policy requires.
 
   ⚠️ **The danger is one-directional and worth naming.** An over-claiming probe
   does not produce a red suite. `require_permitted_reachable/2` scores a refusal
@@ -55,6 +68,49 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
              """
     end
 
+    test "the probe attempts entry into a namespace it did not create" do
+      # ⚠️ This is the half that decides the capability, and it is the half a
+      # plausible-looking probe omits. Measured under default `docker run`:
+      # `unshare -Urn -- bwrap ...` returns 0 while `nsenter` into that same
+      # namespace returns "reassociate to namespaces failed: Operation not
+      # permitted". A probe checking only the first reports a policed egress
+      # path on a host that has none.
+      #
+      # ⚠️ And it must be a **foreign** namespace. Entering one this process
+      # created itself always succeeds, so a probe that did that would pass on
+      # exactly the hosts it exists to reject -- vacuous in the one direction
+      # that matters.
+      source = File.read!("lib/ex_sandbox/hardening/linux.ex")
+
+      [_, composable] = String.split(source, "defp policed_launch_composable? do", parts: 2)
+      body = composable |> String.split("\n  end", parts: 2) |> hd()
+
+      assert body =~ "can_enter_foreign_netns?",
+             """
+             `policed_launch_composable?/0` no longer checks whether this host
+             can enter a network namespace it did not create.
+
+             Creating a confined namespace is not the capability. Installing the
+             `nft` redirect and attaching `pasta` both require `setns()` into
+             the tenant's namespace, which needs CAP_SYS_ADMIN in the user
+             namespace owning it. Without that check the probe reports `true`
+             for a sandbox that is isolated and unpoliced -- and every denial
+             check passes against it.
+             """
+
+      [_, enter] = String.split(source, "defp can_enter_foreign_netns? do", parts: 2)
+      enter_body = enter |> String.split("\n  end", parts: 2) |> hd()
+
+      assert enter_body =~ "foreign_netns?",
+             """
+             The entry probe no longer confirms the namespace is foreign.
+
+             Entering a namespace this process created itself always succeeds,
+             so dropping that check makes the probe pass on precisely the hosts
+             it exists to reject.
+             """
+    end
+
     test "composability is decided by running it, not by reading capabilities" do
       # ⚠️ `CapEff` has produced two wrong answers already: rootless Podman
       # grants a full set inside its own user namespace, `--cap-drop=ALL`
@@ -64,14 +120,28 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
       # cannot be fooled by a capability set that merely looks sufficient.
       source = File.read!("lib/ex_sandbox/hardening/linux.ex")
 
-      [_, composable] = String.split(source, "defp policed_launch_composable? do", parts: 2)
-      body = composable |> String.split("\n  end", parts: 2) |> hd()
+      # ⚠️ Read from the two helpers rather than from
+      # `policed_launch_composable?/0` itself, which now delegates to them. An
+      # earlier version of this assertion read only the delegating function and
+      # failed the moment the probe grew its second half -- correctly, since the
+      # `System.cmd` really had moved, but for a change that strengthened the
+      # probe rather than weakening it. What must be pinned is that *both* halves
+      # run a command; where the calls live is not the property.
+      [_, compose] = String.split(source, "defp unshare_and_bwrap_compose? do", parts: 2)
+      compose_body = compose |> String.split("\n  end", parts: 2) |> hd()
 
-      assert body =~ "System.cmd",
+      [_, nsenter] = String.split(source, "defp nsenter_succeeds?(pid) do", parts: 2)
+      nsenter_body = nsenter |> String.split("\n  end", parts: 2) |> hd()
+
+      assert compose_body =~ "System.cmd",
              "composability must be attempted, not inferred from a capability bitmask"
 
-      assert body =~ "bwrap",
+      assert compose_body =~ "bwrap",
              "the attempt must include the confinement half; pasta alone always succeeds"
+
+      assert nsenter_body =~ "System.cmd",
+             "namespace entry must be attempted, not inferred -- it is the half " <>
+               "that decides whether the tenant can be policed at all"
     end
   end
 end
