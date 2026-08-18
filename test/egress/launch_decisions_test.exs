@@ -64,7 +64,7 @@ defmodule ExSandbox.Egress.LaunchDecisionsTest do
     test "the plan's own head becomes the program, not the original one" do
       {:ok, plan} = LaunchPlan.build({10, 0, 0, 4}, 9999, @confined)
 
-      {prog, args} = NodeLauncher.exec_from_plan(plan)
+      {prog, _args} = NodeLauncher.exec_from_plan(plan)
 
       # ⚠️ The mistake this pins: keeping `systemd-run` as the program while
       # taking the plan's arguments. The command reads correctly in a log line
