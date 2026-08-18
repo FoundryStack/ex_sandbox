@@ -117,6 +117,53 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
              """
     end
 
+    test "both copies of the probe answer the same question" do
+      # ⚠️ `:network_restriction` is answered by two independent implementations,
+      # and them disagreeing is a defect this codebase has already carried
+      # (005 T060a5c). `ExSandbox.provision/2` consults `Capability`;
+      # `require_hardening/0` consults `Hardening.Linux`. When they disagreed,
+      # "this host cannot police egress" was reported as thirty phantom
+      # conformance failures with no cause attached -- checks like "halting the
+      # host from inside the sandbox is refused", which had not stopped being
+      # true.
+      #
+      # ⚠️ Pinned by a test rather than by a comment asking future edits to keep
+      # them in sync, because the last time it drifted the comment was already
+      # there. Compares the executable bodies with comments and blank lines
+      # stripped: the prose may differ, the operations attempted may not.
+      bodies =
+        for file <- ["lib/ex_sandbox/hardening/linux.ex", "lib/ex_sandbox/capability.ex"] do
+          source = File.read!(file)
+
+          for fun <- [
+                "defp unshare_and_bwrap_compose? do",
+                "defp attempt_foreign_netns_entry(unshare) do",
+                "defp await_foreign_netns(pid, attempts) do",
+                "defp nsenter_succeeds?(pid) do"
+              ] do
+            [_, tail] = String.split(source, fun, parts: 2)
+
+            tail
+            |> String.split("\n  end", parts: 2)
+            |> hd()
+            |> String.split("\n")
+            |> Enum.map(&String.trim/1)
+            |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
+          end
+        end
+
+      assert hd(bodies) == List.last(bodies),
+             """
+             The two `:network_restriction` probes have drifted.
+
+             `ExSandbox.provision/2` consults `Capability` and
+             `require_hardening/0` consults `Hardening.Linux`. If they answer
+             differently about the same host, a missing capability is reported
+             as a pile of conformance failures naming guarantees that never
+             stopped holding, with nothing pointing at the real cause.
+             """
+    end
+
     test "composability is decided by running it, not by reading capabilities" do
       # ⚠️ `CapEff` has produced two wrong answers already: rootless Podman
       # grants a full set inside its own user namespace, `--cap-drop=ALL`
