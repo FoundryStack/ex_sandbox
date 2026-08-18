@@ -155,7 +155,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   defp build_plan(binding, {prog, args}) do
     flat = [prog | args]
 
-    case ExSandbox.Egress.LaunchPlan.build(binding.source_key, pool_port(), flat) do
+    case ExSandbox.Egress.LaunchPlan.build(binding.source_key, acceptor_port(), flat) do
       {:ok, plan} ->
         # ⚠️ Nothing is *run* here any more, and that inversion is the whole of
         # the T060a3 rework. The old code executed `setup_steps` at this point,
@@ -408,13 +408,22 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end)
   end
 
-  # The pool the redirect points at. Read from the running pool rather than
-  # configured: a configured port answers about a listener that may not exist.
-  defp pool_port do
-    ExSandbox.Egress.Pool.port()
-  catch
-    :exit, _ -> 0
-  end
+  # The port this sandbox's acceptor will listen on, inside its own namespace.
+  #
+  # ⚠️ This used to read `ExSandbox.Egress.Pool.port()`, a HOST socket, and that
+  # was wrong in a way no host-side test could see. An `nft` `redirect` is DNAT
+  # to the local machine *as the namespace sees it*, so it can only ever reach a
+  # socket in that namespace -- measured, the tenant's connect returned OK and
+  # the host pool never saw the connection. The redirect must name a port in the
+  # sandbox's own namespace, which is where `start_acceptor/3` binds it.
+  #
+  # A fixed port is correct **because** each acceptor is alone in its namespace:
+  # nothing else can bind there and nothing else can route to it, so there is no
+  # collision to avoid between sandboxes. Allocating a distinct host port per
+  # sandbox would suggest a shared address space that does not exist here.
+  @acceptor_port 18_080
+
+  defp acceptor_port, do: @acceptor_port
 
   @doc """
   The allowlist a sandbox was provisioned with, or `[]`.

@@ -175,7 +175,12 @@ defmodule ExSandbox.Egress.NetnsTest do
       end
     end
 
-    defp rule(commands), do: Enum.find(commands, &("rule" in &1))
+    # ⚠️ Finds the REDIRECT rule specifically, not merely "a rule". Two `add
+    # rule` commands are now emitted -- the acceptor's mark exemption comes
+    # first -- and a plain `"rule" in &1` matched the exemption, so these
+    # assertions began describing the wrong command while still reading as
+    # correct.
+    defp rule(commands), do: Enum.find(commands, &("redirect" in &1))
   end
 
   describe "default_route?/1" do

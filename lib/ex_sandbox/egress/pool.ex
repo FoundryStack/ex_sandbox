@@ -37,6 +37,27 @@ defmodule ExSandbox.Egress.Pool do
   rejection, because the sandbox is not aware it is being proxied and has no
   frame in which to receive one. From inside, a denied destination behaves like
   an unreachable one — which is what `FR-011a` describes.
+  
+  ## ⚠️ The listener here is no longer in the egress path (2026-08-18)
+
+  `decide/3` is still the single implementation of "may this sandbox reach this
+  destination", and it is what `ExSandbox.Egress.Verdict` answers from. That
+  part is load-bearing and shared.
+
+  The **listener** is not. It binds `127.0.0.1` in the *host* namespace, and an
+  `nft` `redirect` is DNAT to the local machine as the namespace sees it — so it
+  can only ever reach a socket in that namespace. Measured: with this pool
+  listening on the host and the redirect installed in the sandbox's namespace,
+  the tenant's connect returned OK and this pool never saw the connection.
+  `ExSandbox.Egress.Acceptor` is where the traffic actually lands.
+
+  It is kept rather than deleted because `decide/3`, `handle_connection/2` and
+  the relay wiring are exercised by tests that would otherwise have nowhere to
+  run, and because the transport tests document the allowlist's behaviour on a
+  socket. But nothing redirects here any more, and a supervised listener that
+  nothing reaches is exactly the shape that reads as a working enforcement point
+  while enforcing nothing. If this comment outlives the tests that justify it,
+  the listener should go.
   """
 
   use GenServer

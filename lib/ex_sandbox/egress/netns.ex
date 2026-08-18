@@ -96,6 +96,10 @@ defmodule ExSandbox.Egress.Netns do
   unpoliced while the host acquires a stray NAT rule. `ExSandbox.Egress.Pasta`
   finds the holder by comparing namespace inodes for exactly this reason.
   """
+  # Marks the acceptor's own upstream sockets so the redirect can skip them.
+  # Any non-zero value works; this one is arbitrary and stable.
+  @acceptor_mark 42
+
   @spec redirect_commands(pos_integer(), :inet.port_number()) :: [[String.t()]]
   def redirect_commands(holder_pid, pool_port)
       when is_integer(holder_pid) and holder_pid > 0 do
@@ -109,6 +113,44 @@ defmodule ExSandbox.Egress.Netns do
         "nat",
         "output",
         "{ type nat hook output priority -100 ; }"
+      ]),
+      # ⚠️ The acceptor's OWN upstream must be exempted, and this rule must come
+      # FIRST -- `nft` evaluates in order, so a `return` placed after the
+      # redirect never runs.
+      #
+      # Without it the acceptor's own connect to the permitted destination is
+      # re-caught by the very redirect it exists to serve, and it talks to
+      # itself. Measured with a TCP upstream, with and without the exemption:
+      #
+      #   without: conn#1 ORIGINAL_DST=93.184.216.34:443
+      #            conn#2 ORIGINAL_DST=127.0.0.1:9100   <- its own upstream
+      #            conn#3 ... conn#4 ...  LOOP DETECTED
+      #   with:    conn#1 ORIGINAL_DST=93.184.216.34:443
+      #            upstream said b'ORIGIN-REPLY'  -> TENANT: got b'DONE'
+      #
+      # ⚠️ The symptom of the loop is a PERMITTED destination timing out, which
+      # reads as an unreachable network rather than as a broken enforcement
+      # point -- and every denial check still passes, because denial is
+      # unaffected. It survived the first end-to-end run for exactly that
+      # reason: the deny case looked perfect.
+      #
+      # ⚠️ `meta mark`, not `meta skuid`. `skuid` is the more obvious choice and
+      # is unusable here: the platform user namespace maps a single uid
+      # (`uid_map: 0 0 1`, and `/etc/subuid` has no entry), so there is no second
+      # identity to name. The mark is set by the acceptor on its own upstream
+      # socket via `SO_MARK`; tenant code cannot set it on the platform's behalf
+      # because it never touches that socket.
+      nsenter(holder_pid, [
+        "nft",
+        "add",
+        "rule",
+        "ip",
+        "nat",
+        "output",
+        "meta",
+        "mark",
+        "#{@acceptor_mark}",
+        "return"
       ]),
       # ⚠️ Matches **all** outbound TCP, not a port list. The allowlist is
       # enforced at the acceptor, which is the only component that knows the
@@ -142,6 +184,16 @@ defmodule ExSandbox.Egress.Netns do
       ])
     ]
   end
+
+  @doc """
+  The `SO_MARK` value the acceptor sets on its own upstream connections.
+
+  Exists so the redirect can skip them: without the exemption the acceptor's
+  connect to a permitted destination is caught by its own redirect and it talks
+  to itself, which surfaces as a permitted destination timing out.
+  """
+  @spec acceptor_mark() :: pos_integer()
+  def acceptor_mark, do: @acceptor_mark
 
   @doc """
   The command that reads a namespace's routing table.

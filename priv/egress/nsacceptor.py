@@ -33,6 +33,12 @@ import threading
 # exactly like a kernel that does not support the call.
 SO_ORIGINAL_DST = 80
 
+# Must match `ExSandbox.Egress.Netns.acceptor_mark/0`. ⚠️ If these drift, the
+# acceptor's upstream stops being exempt and it re-enters its own redirect --
+# a loop whose only symptom is permitted destinations timing out.
+ACCEPTOR_MARK = 42
+SO_MARK = 36  # SOL_SOCKET option; not exposed as socket.SO_MARK on all builds
+
 CONNECT_TIMEOUT = 5.0
 VERDICT_TIMEOUT = 5.0
 IDLE_TIMEOUT = 120.0
@@ -111,7 +117,19 @@ def handle(conn, verdict_path, source_key):
         return
 
     try:
-        upstream = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+        upstream = socket.socket()
+        # ⚠️ SO_MARK, without which this connect is caught by the very redirect
+        # this process serves and the acceptor talks to itself. `Netns` installs
+        # `meta mark <ACCEPTOR_MARK> return` ahead of the redirect to skip it.
+        #
+        # Measured: without the mark the acceptor sees its own upstream as a new
+        # connection (ORIGINAL_DST=127.0.0.1:9100, its own destination) and
+        # loops. The symptom is a PERMITTED destination timing out -- which
+        # reads as an unreachable network, not as a broken boundary, and leaves
+        # every denial check passing.
+        upstream.setsockopt(socket.SOL_SOCKET, SO_MARK, ACCEPTOR_MARK)
+        upstream.settimeout(CONNECT_TIMEOUT)
+        upstream.connect((host, port))
     except OSError:
         conn.close()
         return
