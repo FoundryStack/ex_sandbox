@@ -501,6 +501,53 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
     end
   end
 
+  describe "the allowlist flag (005 T060a4)" do
+    setup do
+      original = Application.get_env(:ex_sandbox, :conformance)
+      on_exit(fn -> restore_conformance_env(original) end)
+      :ok
+    end
+
+    test "is off by default, so the group reports the third outcome rather than failing" do
+      restore_conformance_env(nil)
+
+      assert ExSandbox.Conformance.Network.suite_context() == %{}
+    end
+
+    test "carries the allowlist when enabled, which is what makes the checks real" do
+      Application.put_env(:ex_sandbox, :conformance,
+        allowlist_enabled: true,
+        permitted_destination: {"permitted.internal", 8443}
+      )
+
+      assert ExSandbox.Conformance.Network.suite_context() == %{
+               network_allowlist: [{"permitted.internal", 8443}]
+             }
+    end
+
+    test "off is not an exclusion: the checks still report, they do not vanish" do
+      # ⚠️ `012-FR-011` forbids a consumer switching a check off. This flag does
+      # not do that -- with it off the group still RUNS and reports
+      # `capability_unavailable`, which the census counts against the baseline.
+      # A mechanism gets no credit for a check it did not run. The assertion is
+      # on the census-visible outcome rather than on the flag, because that is
+      # the property that matters.
+      restore_conformance_env(nil)
+
+      results = network_results(ExSandbox.PorousMechanism)
+
+      assert names(results) != [],
+             "the group vanished with the flag off, which would be an exclusion"
+
+      assert matching(results.unavailable, @permitted_check) != [],
+             """
+             With no allowlist the permitted-direction check must report the
+             third outcome. Silence here would be an exclusion wearing another
+             name.
+             """
+    end
+  end
+
   defp restore_conformance_env(nil), do: Application.delete_env(:ex_sandbox, :conformance)
   defp restore_conformance_env(value), do: Application.put_env(:ex_sandbox, :conformance, value)
 end

@@ -132,6 +132,55 @@ defmodule ExSandbox.Conformance.Network do
 
   defp conformance_config, do: Application.get_env(:ex_sandbox, :conformance, [])
 
+  @doc """
+  The `context` the group's sandboxes are built with.
+
+  ⚠️ **Opt-in, and the opt-in is a measured admission rather than caution.**
+
+  Carrying a `network_allowlist` is what makes the four checks in this group
+  real: `:permitted` is *derived* from it, so without one
+  `require_permitted_reachable/2` has nothing to dial and every check reports
+  the third outcome. The allowlist is therefore the whole point — and it is off
+  by default because on the BEAM mechanism it does not yet work.
+
+  **Measured** (isolation run `2026-08-18T09:37Z-97`, with the allowlist
+  unconditionally on): all five checks FAILED with
+  `could not provision: {:error, :mechanism_error}`, because a populated
+  allowlist makes `NodeLauncher` take the policed branch, and that branch cannot
+  currently boot a tenant:
+
+      Couldn't write to /proc/self/uid_map: Operation not permitted
+      setpriv: setresuid failed: Invalid argument
+      [error] sandbox node failed to boot: {:boot_failed, {:exit_status, 127}}
+
+  `pasta` in spawn mode creates a user namespace it cannot map, so every process
+  inside is uid 65534 and `setpriv --reuid` fails for **any** uid. See
+  `egress-path-measurements.md`.
+
+  ⚠️ **Why this is a flag and not a silent revert.** The failures above are
+  *honest* — the mechanism genuinely cannot build the boundary, and the suite is
+  right to refuse to report one. But they abort the credentials phase before the
+  isolation phase runs at all, so leaving them on costs every other measurement
+  in the census and gives nothing back. The flag keeps the capability one line
+  away and keeps the reason written down, rather than deleting the work and
+  rediscovering it.
+
+  ⚠️ **It is deliberately NOT an exclusion** (`012-FR-011`). Off, the checks
+  report `capability_unavailable` — visible in the census, counted against the
+  baseline, and impossible to mistake for a pass. A mechanism gets no credit for
+  the checks it does not run.
+
+      config :ex_sandbox, :conformance, allowlist_enabled: true
+  """
+  @spec suite_context() :: map()
+  def suite_context do
+    if Keyword.get(conformance_config(), :allowlist_enabled, false) do
+      %{network_allowlist: [permitted_address()]}
+    else
+      %{}
+    end
+  end
+
   # Bounds the host control probe. Deliberately short: it is a discrimination
   # question, not a latency measurement, and it is paid once per run.
   @control_timeout_ms 2_000
@@ -169,12 +218,7 @@ defmodule ExSandbox.Conformance.Network do
           # unchanged. The suite is right to fail there; the ordering would have
           # been wrong. It is correct now only because the policed launch path
           # exists.
-          sandbox =
-            build_sandbox(
-              context: %{
-                network_allowlist: [ExSandbox.Conformance.Network.permitted_address()]
-              }
-            )
+          sandbox = build_sandbox(context: ExSandbox.Conformance.Network.suite_context())
 
           case ExSandbox.provision(@mechanism, sandbox) do
             {:ok, provisioned} ->
