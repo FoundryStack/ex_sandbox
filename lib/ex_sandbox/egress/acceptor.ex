@@ -106,8 +106,14 @@ defmodule ExSandbox.Egress.Acceptor do
   tenant and nothing else can route to it, so `0.0.0.0` there is narrower than
   `127.0.0.1` on the host.
   """
-  @spec listener_command(pos_integer(), :inet.port_number(), String.t()) :: [String.t()]
-  def listener_command(holder_pid, port, helper_path) do
+  @spec listener_command(
+          pos_integer(),
+          :inet.port_number(),
+          String.t(),
+          String.t(),
+          Policy.source_key()
+        ) :: [String.t()]
+  def listener_command(holder_pid, port, helper_path, verdict_path, source_key) do
     # ⚠️ `-U --preserve-credentials`, not a bare `-n`. The BEAM stands outside
     # the platform user namespace that owns this netns, and from there `-n`
     # alone is refused -- see `ExSandbox.Egress.Netns` for the measurement of
@@ -123,7 +129,15 @@ defmodule ExSandbox.Egress.Acceptor do
       "-U",
       "--preserve-credentials",
       helper_path,
-      "#{port}"
+      "#{port}",
+      verdict_path,
+      # ⚠️ The sandbox names itself by the /30 it was PROVISIONED with, supplied
+      # here by the platform. It is never read off a connection: this acceptor
+      # serves one namespace and nothing else can reach it, so its identity is
+      # its own existence. Deriving identity from the peer would consult a value
+      # the tenant partly controls to answer a question already answered by
+      # connecting at all.
+      source_key_text(source_key)
     ]
   end
 
@@ -153,4 +167,7 @@ defmodule ExSandbox.Egress.Acceptor do
   """
   @spec sandbox_address(Policy.source_key()) :: :inet.ip4_address()
   def sandbox_address({a, b, c, d}), do: {a, b, c, d + 2}
+
+  # The wire form of a /30, as `ExSandbox.Egress.Verdict` parses it back.
+  defp source_key_text({a, b, c, d}), do: "#{a}.#{b}.#{c}.#{d}"
 end

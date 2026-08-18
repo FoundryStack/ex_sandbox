@@ -9,7 +9,16 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
   # checked only where the whole launch works.
   describe "listener_command/3" do
     setup do
-      %{command: Acceptor.listener_command(4242, 18_080, "/opt/axonn/nsacceptor")}
+      %{
+        command:
+          Acceptor.listener_command(
+            4242,
+            18_080,
+            "/opt/axonn/nsacceptor",
+            "/var/run/axonn-egress-verdict.sock",
+            {10, 0, 4, 0}
+          )
+      }
     end
 
     test "enters the target namespace by holder pid", %{command: command} do
@@ -33,8 +42,7 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
       assert "--preserve-credentials" in command
     end
 
-    test "the helper and its port follow the nsenter flags", %{command: command} do
-      assert List.last(command) == "18080"
+    test "the helper and its arguments follow the nsenter flags", %{command: command} do
       assert "/opt/axonn/nsacceptor" in command
 
       helper_index = Enum.find_index(command, &(&1 == "/opt/axonn/nsacceptor"))
@@ -42,6 +50,30 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
 
       assert helper_index > flag_index,
              "the helper must be the command nsenter runs, not an argument to nsenter"
+
+      assert Enum.drop(command, helper_index + 1) == [
+               "18080",
+               "/var/run/axonn-egress-verdict.sock",
+               "10.0.4.0"
+             ]
+    end
+
+    test "names the sandbox by the /30 it was provisioned with", %{command: command} do
+      # ⚠️ The identity is supplied by the platform, never derived from the
+      # connection. `ExSandbox.Egress.Verdict` parses this back to decide which
+      # allowlist applies, so a wrong or forgeable value here judges a sandbox
+      # against a NEIGHBOURING sandbox's policy -- a cross-tenant error with no
+      # local sign of being wrong.
+      assert "10.0.4.0" in command
+    end
+
+    test "carries the verdict socket, without which the acceptor denies everything", %{
+      command: command
+    } do
+      # The acceptor holds no policy: it asks. A missing or wrong path here is
+      # not a loud failure -- an unobtainable verdict is DENY, so the sandbox
+      # loses egress entirely while every denial check still passes.
+      assert "/var/run/axonn-egress-verdict.sock" in command
     end
 
     test "is an argv list, never an interpolated shell string", %{command: command} do

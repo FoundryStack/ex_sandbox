@@ -217,9 +217,22 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     finder = Keyword.get(opts, :finder, &ExSandbox.Egress.Pasta.find/2)
     runner = Keyword.get(opts, :runner, &run_steps/1)
 
+    starter = Keyword.get(opts, :acceptor_starter, &start_acceptor/3)
+
     case finder.(pasta_pid, opts) do
       {:ok, holder_pid} ->
-        runner.(ExSandbox.Egress.LaunchPlan.redirect_steps(plan, holder_pid))
+        # ⚠️ The acceptor starts BEFORE the redirect, and the order is the whole
+        # of it. A redirect installed first points at a port nothing is
+        # listening on, and from inside the sandbox that is indistinguishable
+        # from a destination correctly denied by policy -- every denial check
+        # passes while the allowlist is enforced by nothing.
+        #
+        # Measured directly while building `docker/acceptor-e2e.sh`: with the
+        # acceptor bound in the wrong namespace the tenant got `ECONNREFUSED`,
+        # which reads exactly like a working boundary.
+        with :ok <- starter.(plan, holder_pid, opts) do
+          runner.(ExSandbox.Egress.LaunchPlan.redirect_steps(plan, holder_pid))
+        end
 
       {:error, reason} ->
         # ⚠️ Refused, never defaulted to `pasta_pid`. That fallback is available,
@@ -274,6 +287,102 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       {:error, _} ->
         0
     end
+  end
+
+  # Starts this sandbox's acceptor inside its network namespace.
+  #
+  # ⚠️ One acceptor per namespace, not one pool for all sandboxes. That is not
+  # the design `013-FR-014c` first argued for, and the reason it changed is
+  # measured rather than preferred: an `nft` `redirect` is DNAT **to the local
+  # machine as the namespace sees it**, so it can only ever reach a socket in
+  # that namespace. A host-side pool cannot be reached by it at all -- measured,
+  # the tenant's connect returned OK and the pool never saw the connection.
+  #
+  # The blast-radius argument survives in substance: the acceptor holds no
+  # platform credential and **no policy**. It asks `ExSandbox.Egress.Verdict`
+  # over a socket the tenant cannot see, so `Pool.decide/3` remains the single
+  # implementation of the rule.
+  defp start_acceptor(plan, holder_pid, opts) do
+    helper = Keyword.get(opts, :acceptor_helper, acceptor_helper_path())
+    verdict = Keyword.get(opts, :verdict_path, ExSandbox.Egress.Verdict.default_path())
+
+    command =
+      ExSandbox.Egress.Acceptor.listener_command(
+        holder_pid,
+        plan.pool_port,
+        helper,
+        verdict,
+        plan.source_key
+      )
+
+    [prog | args] = command
+
+    # Started detached: the acceptor outlives this call by design -- it serves
+    # the namespace for the sandbox's whole life. `System.cmd/3` would block
+    # until it exited, which is never.
+    port =
+      Port.open({:spawn_executable, System.find_executable(prog)}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        line: 256,
+        args: args
+      ])
+
+    await_acceptor(port, plan)
+  end
+
+  # ⚠️ Waits for the acceptor to say it is listening rather than assuming it.
+  # Returning `:ok` optimistically would install the redirect against a port
+  # that may never open, which fails closed but silently -- the sandbox loses
+  # egress entirely and every denial check still passes.
+  defp await_acceptor(port, plan) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        if String.starts_with?(line, "ACCEPTOR listening") do
+          :ok
+        else
+          await_acceptor(port, plan)
+        end
+
+      {^port, {:exit_status, status}} ->
+        Logger.error("""
+        egress: the acceptor for #{inspect(plan.source_key)} exited before it \
+        began listening (status #{status}).
+
+        The tenant is running but nothing is listening at the address its
+        redirect would name, so it would lose egress entirely while every
+        denial check in the conformance suite still passed.
+        """)
+
+        {:error, :mechanism_error}
+    after
+      5_000 ->
+        _ = Port.close(port)
+
+        Logger.error("""
+        egress: the acceptor for #{inspect(plan.source_key)} did not begin \
+        listening within 5s.
+
+        Installing the redirect anyway would point it at a dead port, which from
+        inside the sandbox is indistinguishable from a correctly denied
+        destination.
+        """)
+
+        {:error, :mechanism_error}
+    end
+  end
+
+  @doc """
+  Where the namespace acceptor helper lives.
+
+  Public because a release that ships without it produces a launch failure whose
+  cause is a missing file, and naming that file is the difference between a
+  one-line fix and a namespace investigation.
+  """
+  @spec acceptor_helper_path() :: String.t()
+  def acceptor_helper_path do
+    Application.app_dir(:ex_sandbox, ["priv", "egress", "nsacceptor.py"])
   end
 
   defp run_steps(steps) do
