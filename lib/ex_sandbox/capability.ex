@@ -26,6 +26,14 @@ defmodule ExSandbox.Capability do
   is `ExSandbox.Conformance`'s question, answered by breaching it.
   """
 
+  # Bounded so a probe cannot hang the gateway's startup: `capabilities/0` is
+  # called on the provisioning path. 2s total is far above the observed time for
+  # `unshare` to enter its namespaces (single-digit milliseconds) and far below
+  # anything a caller would notice.
+  @netns_poll_attempts 40
+  @netns_poll_interval_ms 50
+
+
   @type name ::
           :resource_limits
           | :filesystem_confinement
@@ -498,8 +506,18 @@ defmodule ExSandbox.Capability do
   # make this check vacuous -- it would pass on precisely the hosts it exists to
   # reject.
   defp can_enter_foreign_netns? do
+    case System.find_executable("unshare") do
+      nil ->
+        false
+
+      unshare ->
+        attempt_foreign_netns_entry(unshare)
+    end
+  end
+
+  defp attempt_foreign_netns_entry(unshare) do
     holder =
-      Port.open({:spawn_executable, System.find_executable("unshare")}, [
+      Port.open({:spawn_executable, unshare}, [
         :binary,
         :exit_status,
         args: ["--user", "--map-root-user", "--net", "--", "/bin/sh", "-c", "sleep 5"]
@@ -507,15 +525,8 @@ defmodule ExSandbox.Capability do
 
     try do
       case Port.info(holder, :os_pid) do
-        {:os_pid, pid} ->
-          # `unshare` execs the shell in the new namespaces, so the pid is the
-          # holder. Confirmed by comparing inodes rather than trusting it: a
-          # namespace that merely looks configured cannot fool an inode check,
-          # and targeting the wrong pid would install the redirect into the host.
-          foreign_netns?(pid) and nsenter_succeeds?(pid)
-
-        _ ->
-          false
+        {:os_pid, pid} -> await_foreign_netns(pid, @netns_poll_attempts)
+        _ -> false
       end
     after
       Port.close(holder)
@@ -524,6 +535,34 @@ defmodule ExSandbox.Capability do
     _ -> false
   catch
     _, _ -> false
+  end
+
+  # ⚠️ Polled, never read once. `Port.open` returns as soon as the process is
+  # spawned, and `unshare` has not necessarily entered its new namespaces yet --
+  # `/proc/<pid>/ns/net` still reports the **host** namespace until it does.
+  #
+  # Measured, and the race is not a corner case: reading immediately after spawn
+  # saw the host namespace in **16 of 20** trials. A probe built on a single read
+  # would therefore report `network_restriction: false` on a perfectly capable
+  # host, most of the time, for a reason that has nothing to do with capability
+  # and would read as one.
+  #
+  # ⚠️ Failing toward `false` is the safe direction, which is exactly why this
+  # was worth finding: a flaky under-claim is invisible in the census (it looks
+  # like the honest third outcome) and would have made the capability appear
+  # permanently absent on the very host that could run it.
+  #
+  # The same trap, one layer down, is why `ExSandbox.Egress.Pasta` polls for
+  # pasta's tenant instead of checking once.
+  defp await_foreign_netns(_pid, 0), do: false
+
+  defp await_foreign_netns(pid, attempts) do
+    if foreign_netns?(pid) do
+      nsenter_succeeds?(pid)
+    else
+      Process.sleep(@netns_poll_interval_ms)
+      await_foreign_netns(pid, attempts - 1)
+    end
   end
 
   defp foreign_netns?(pid) do

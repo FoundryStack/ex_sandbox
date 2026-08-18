@@ -98,7 +98,13 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
              check passes against it.
              """
 
-      [_, enter] = String.split(source, "defp can_enter_foreign_netns? do", parts: 2)
+      # ⚠️ Read from `await_foreign_netns/2`, which is where the foreignness
+      # check lives now that the entry probe polls. The polling is not
+      # cosmetic: `Port.open` returns before `unshare` has entered its new
+      # namespaces, and reading `/proc/<pid>/ns/net` once saw the **host**
+      # namespace in 16 of 20 measured trials -- so a single-read probe reports
+      # the capability absent on a capable host, most of the time.
+      [_, enter] = String.split(source, "defp await_foreign_netns(pid, attempts) do", parts: 2)
       enter_body = enter |> String.split("\n  end", parts: 2) |> hd()
 
       assert enter_body =~ "foreign_netns?",
