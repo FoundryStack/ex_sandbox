@@ -40,6 +40,61 @@ defmodule ExSandbox.Egress.SupervisionTest do
            """
   end
 
+  test "the verdict server is running under the application supervisor" do
+    # ⚠️ Same failure shape as the pool's, one component further along, and
+    # equally silent. The per-namespace acceptors treat any unobtainable
+    # verdict as DENY -- correctly, since "allow when the check could not run"
+    # would make a dead platform indistinguishable from a permissive allowlist.
+    #
+    # But that means this server's absence does not fail loudly: it converts
+    # every sandbox's egress into blanket denial while every denial check in the
+    # conformance suite passes. That is the `--unshare-net` state wearing the
+    # appearance of an enforced allowlist.
+    children = Supervisor.which_children(ExSandbox.Supervisor)
+    ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
+
+    assert ExSandbox.Egress.Verdict in ids,
+           """
+           The egress verdict server is not supervised, so no per-namespace
+           acceptor can obtain a verdict.
+
+           Started: #{inspect(ids)}
+
+           Acceptors deny when they cannot ask, so this fails closed and
+           silently: every sandbox loses egress entirely while the suite stays
+           green, because a boundary that denies everything passes every denial
+           check.
+           """
+  end
+
+  test "the verdict server is bound to a socket that exists" do
+    # Not merely "a process is alive". A server whose bind failed could not
+    # answer, and the acceptors would deny everything without any local sign.
+    path = ExSandbox.Egress.Verdict.path()
+
+    assert File.exists?(path),
+           "the verdict server reports #{path} but nothing is bound there"
+  end
+
+  test "the verdict server answers over the wire it publishes" do
+    # ⚠️ The end-to-end check the two above cannot make. A supervised process
+    # bound to an existing path can still be unable to answer -- the reply
+    # framing bug did exactly that, and its symptom was every destination
+    # silently refused.
+    path = ExSandbox.Egress.Verdict.path()
+
+    {:ok, socket} =
+      :gen_tcp.connect({:local, path}, 0, [:binary, active: false, packet: :line])
+
+    :ok = :gen_tcp.send(socket, "10.0.99.0 example.com 443\n")
+    assert {:ok, reply} = :gen_tcp.recv(socket, 0, 2_000)
+    :gen_tcp.close(socket)
+
+    # DENY, because nothing is registered for that /30 -- the point is that a
+    # verdict came back at all, framed as a line the acceptor can read.
+    assert String.trim(reply) == "DENY"
+  end
+
   test "the running pool reports a real listening port" do
     # ⚠️ Not merely "a process is alive". A pool whose `listen/2` failed would
     # report port 0, and `LaunchPlan.build/4` refuses port 0 precisely because

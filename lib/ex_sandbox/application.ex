@@ -44,7 +44,23 @@ defmodule ExSandbox.Application do
       # would be permitted destinations failing too, which reads as a boundary
       # that is slightly too strict rather than as an enforcement point that
       # does not exist -- the `--unshare-net` shape, one layer further out.
-      ExSandbox.Egress.Pool
+      ExSandbox.Egress.Pool,
+
+      # Answers "may this sandbox reach this destination?" for the per-namespace
+      # acceptors (005 T060a1).
+      #
+      # ⚠️ Started **after** the registry for the same reason the pool is: it
+      # answers from `Pool.decide/3`, which reads the registry. A verdict server
+      # that outlived its registry would deny everything -- correct, but for the
+      # wrong reason and silently, because blanket denial passes every denial
+      # check in the conformance suite.
+      #
+      # ⚠️ The acceptors treat any unobtainable verdict as DENY. So this being
+      # absent does not fail loudly: it converts every sandbox's egress into
+      # blanket denial while the suite stays green. That is the `--unshare-net`
+      # state wearing the appearance of an enforced allowlist, which is the
+      # precise thing T060 exists to end.
+      ExSandbox.Egress.Verdict
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

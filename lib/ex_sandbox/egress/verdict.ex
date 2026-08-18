@@ -47,14 +47,23 @@ defmodule ExSandbox.Egress.Verdict do
   @default_path "/var/run/axonn-egress-verdict.sock"
 
   @doc """
-  The default socket path.
+  Where the verdict socket lives.
 
   ⚠️ Deliberately **not** under a sandbox's storage or any path
   `Hardening.Linux` binds into a tenant's mount view. The isolation of this
-  socket is the isolation of the whole policy.
+  socket is the isolation of the whole policy — a path a tenant can see is a
+  control surface, and `FR-011b` requires there to be none.
+
+  Configurable because the default is only writable on a deployment host, and
+  a developer machine that cannot bind it would otherwise be unable to start
+  the application at all.
   """
   @spec default_path() :: String.t()
-  def default_path, do: @default_path
+  def default_path do
+    :ex_sandbox
+    |> Application.get_env(:egress, [])
+    |> Keyword.get(:verdict_socket_path, @default_path)
+  end
 
   @doc false
   def start_link(opts) do
@@ -63,7 +72,7 @@ defmodule ExSandbox.Egress.Verdict do
 
   @impl true
   def init(opts) do
-    path = Keyword.get(opts, :path, @default_path)
+    path = Keyword.get(opts, :path, default_path())
     registry = Keyword.get(opts, :registry, ExSandbox.Egress.Registry)
 
     # A stale socket file from a previous run makes `bind` fail with `:eaddrinuse`,
