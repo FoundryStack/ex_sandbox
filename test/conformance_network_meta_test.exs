@@ -100,8 +100,22 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
     test "every denial check fails" do
       results = network_results(ExSandbox.PorousMechanism)
 
-      wrongly_passed =
-        Enum.flat_map(@unconditional_denial_checks, &matching(results.passed, &1))
+      # ⚠️ `@denial_checks`, not `@unconditional_denial_checks`: the host-gated
+      # denied-destination check is included here for the first time (005
+      # T060a4/T060j).
+      #
+      # It was excluded while the denied address was TEST-NET-1, which no
+      # operator routes -- the control probe said `:no`, so it reported the
+      # third outcome on every host and could not be asserted either way. With a
+      # genuinely reachable denied address the control succeeds and the check
+      # runs. Measured against this fixture: it FAILS, with the evidence "the
+      # sandbox opened a connection to a denied destination (8.8.8.8:53)".
+      #
+      # That is the whole of T060j. The check went from passing vacuously
+      # (`nc`'s bound ignored, exit 124 scored as a drop) to honestly
+      # unavailable to actually discriminating, and only the last of those three
+      # detects a mechanism with no policy.
+      wrongly_passed = Enum.flat_map(@denial_checks, &matching(results.passed, &1))
 
       assert wrongly_passed == [],
              """
@@ -337,15 +351,29 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       assert length(passed) == length(expected),
              "expected all #{length(expected)} non-widening checks to pass, got #{length(passed)}"
 
-      # The host-gated check must not PASS here either -- unavailable is the
-      # only acceptable non-failing outcome for it.
-      assert matching(results.passed, @host_gated_check) == [],
+      # ⚠️ The host-gated check must not FAIL here. It may pass or report the
+      # third outcome, and which one is a fact about this host's egress.
+      #
+      # This assertion used to read "must not PASS", and that was wrong for a
+      # reason worth keeping. It was written when the denied destination was
+      # TEST-NET-1, which nobody routes, so the control probe said `:no`
+      # everywhere and `unavailable` was the only outcome reachable -- the
+      # assertion described the internet, not the fixture. With a genuinely
+      # reachable denied address (005 T060a4) the control succeeds, the check
+      # runs for real, and `EditablePolicyMechanism` **refuses** it because its
+      # allowlist is genuinely enforced. A pass here is now earned rather than
+      # unearned, which is exactly what T060j asked for.
+      #
+      # What must still never happen is a *failure*: this fixture's only defect
+      # is a writable policy, so a denial check failing against it would not be
+      # attributable to the thing the fixture exists to isolate.
+      assert matching(results.failures, @host_gated_check) == [],
              """
-             The host-gated denied-destination check PASSED against a mechanism
-             whose allowlist tenant code can widen.
+             The host-gated denied-destination check FAILED against a mechanism
+             that genuinely refuses denied destinations.
 
-             It is gated on a host control probe precisely so it cannot report a
-             pass it did not earn (T060j).
+             Its only intended defect is a policy tenant code can widen, so a
+             denial failure here is not attributable to it.
              """
     end
   end
@@ -405,4 +433,74 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
              """
     end
   end
+
+  describe "the permitted/denied destination pair (005 T060a4, FR-011c, FR-011d)" do
+    setup do
+      original = Application.get_env(:ex_sandbox, :conformance)
+      on_exit(fn -> restore_conformance_env(original) end)
+      :ok
+    end
+
+    test "the two destinations differ, or FR-011c asks a mechanism to refuse what it permits" do
+      # ⚠️ The failure this guards is silent and inverted. With the pair equal,
+      # the sandbox's own allowlist permits the address the denial check probes,
+      # so a CORRECT mechanism lets the connection through and fails
+      # `FR-011c`, while a mechanism ignoring its allowlist entirely refuses it
+      # and PASSES. The suite would rank a broken mechanism above a working one.
+      Application.put_env(:ex_sandbox, :conformance,
+        permitted_destination: {"1.1.1.1", 443},
+        denied_destination: {"1.1.1.1", 443}
+      )
+
+      assert_raise ArgumentError, ~r/permitted and denied destinations are the same/, fn ->
+        ExSandbox.Conformance.Network.denied_address()
+      end
+    end
+
+    test "a deployment can name its own pair rather than recording a permanent gap" do
+      Application.put_env(:ex_sandbox, :conformance,
+        permitted_destination: {"permitted.internal", 8443},
+        denied_destination: {"denied.internal", 9443}
+      )
+
+      assert ExSandbox.Conformance.Network.permitted_address() == {"permitted.internal", 8443}
+      assert ExSandbox.Conformance.Network.denied_address() == {"denied.internal", 9443}
+    end
+
+    test "the defaults are a reachable pair, not a black hole" do
+      # ⚠️ Pins the property that made the old default useless rather than the
+      # literal addresses. `attempt_reach_denied_host/2` gates on a host control
+      # probe against the denied address, so a documentation-reserved or
+      # otherwise unrouted default makes the check report the third outcome on
+      # every host forever -- which is what `203.0.113.1` did. This asserts the
+      # defaults are not drawn from the reserved ranges that guarantee that.
+      restore_conformance_env(nil)
+
+      {denied_host, _} = ExSandbox.Conformance.Network.denied_address()
+      {permitted_host, _} = ExSandbox.Conformance.Network.permitted_address()
+
+      for host <- [denied_host, permitted_host] do
+        refute host =~ ~r/^(203\.0\.113\.|198\.51\.100\.|192\.0\.2\.)/,
+               """
+               #{host} is in an RFC 5737 documentation range, which no operator
+               routes. A check gated on the host reaching it can never run.
+               """
+      end
+    end
+
+    test "the permitted destination is dialable, so a mechanism can publish it" do
+      # `Mechanism.Beam.put_permitted/1` publishes only entries matching
+      # `{binary, integer}`; an `:any_port` entry is dropped. A default the
+      # mechanism cannot publish leaves `:permitted` absent and the census
+      # reporting `:no_allowlist` -- the exact gap this pair exists to close.
+      restore_conformance_env(nil)
+
+      assert {host, port} = ExSandbox.Conformance.Network.permitted_address()
+      assert is_binary(host)
+      assert is_integer(port)
+    end
+  end
+
+  defp restore_conformance_env(nil), do: Application.delete_env(:ex_sandbox, :conformance)
+  defp restore_conformance_env(value), do: Application.put_env(:ex_sandbox, :conformance, value)
 end

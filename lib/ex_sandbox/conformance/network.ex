@@ -57,11 +57,80 @@ defmodule ExSandbox.Conformance.Network do
   # its own bound reports its own result rather than being killed first.
   @exec_timeout_ms 15_000
 
-  # RFC 5737 TEST-NET-1: documentation-reserved and guaranteed never to host a
-  # real service. See `attempt_reach_denied_host/2` for why being *nominally*
-  # routable turned out not to be enough.
-  @denied_host "203.0.113.1"
-  @denied_port 443
+  # ⚠️ The denied destination used to be RFC 5737 TEST-NET-1 (`203.0.113.1`),
+  # chosen because it is documentation-reserved and nominally routable, so a
+  # refusal would be evidence of policy. **It was removed, not merely
+  # defaulted-over.**
+  #
+  # `attempt_reach_denied_host/2` gates on a host control probe against the same
+  # address, and no operator actually routes TEST-NET-1 -- so the control says
+  # `:no` on every host, and the check reported the third outcome permanently.
+  # An address that can never demonstrate `FR-011c` anywhere is not a
+  # conservative default; it is a check that is guaranteed never to run, which
+  # is how it sat passing against `PorousMechanism` for as long as it did.
+  #
+  # ⚠️ The permit/deny pair, and the two must be **the same kind of address**.
+  #
+  # `FR-011d` is a claim about the allowlist deciding, so the checks are only
+  # meaningful when the sole difference between the permitted and the denied
+  # destination is the policy. A permitted address on the open internet paired
+  # with a denied address nobody routes compares a live host against a black
+  # hole, and the denial is explained by the routing table rather than by the
+  # boundary -- which is exactly how this check came to pass against
+  # `PorousMechanism`.
+  #
+  # Both default to addresses measured reachable from the isolation container
+  # (`1.1.1.1:443` and `8.8.8.8:53`; `93.184.216.34:443` was measured
+  # UNREACHABLE there and would have made the permitted half fail against a
+  # correct mechanism). They are overridable because reachability is a fact
+  # about a deployment, not about conformance -- a host behind an egress proxy
+  # names its own pair rather than reporting a boundary defect.
+  @default_permitted {"1.1.1.1", 443}
+  @default_denied {"8.8.8.8", 53}
+
+  @doc """
+  The destination this run treats as permitted, and the one it treats as denied.
+
+  ⚠️ Both are **configuration, not constants**, because a check gated on
+  reachability cannot hardcode what is reachable. `attempt_reach_denied_host/2`
+  reports the third outcome wherever the host cannot reach the denied address
+  itself, so a deployment whose egress differs from the defaults supplies its
+  own pair rather than recording a permanent gap:
+
+      config :ex_sandbox, :conformance,
+        permitted_destination: {"example.internal", 443},
+        denied_destination: {"blocked.internal", 443}
+
+  They must not overlap, and `denied_address/0` refuses if they do -- an
+  allowlist containing the denied destination would make `FR-011c` fail against
+  a mechanism doing exactly what it was told.
+  """
+  @spec permitted_address() :: {String.t(), pos_integer()}
+  def permitted_address do
+    conformance_config()
+    |> Keyword.get(:permitted_destination, @default_permitted)
+  end
+
+  @spec denied_address() :: {String.t(), pos_integer()}
+  def denied_address do
+    denied = Keyword.get(conformance_config(), :denied_destination, @default_denied)
+
+    if denied == permitted_address() do
+      raise ArgumentError, """
+      the conformance suite's permitted and denied destinations are the same
+      address (#{inspect(denied)}).
+
+      `FR-011c` asks that a destination OUTSIDE the allowlist be refused. With
+      the two equal, the sandbox is asked to refuse a destination its own
+      allowlist permits -- so the check fails against a mechanism enforcing the
+      policy correctly, and passes only against one that ignores it.
+      """
+    end
+
+    denied
+  end
+
+  defp conformance_config, do: Application.get_env(:ex_sandbox, :conformance, [])
 
   # Bounds the host control probe. Deliberately short: it is a discrimination
   # question, not a latency measurement, and it is paid once per run.
@@ -79,7 +148,33 @@ defmodule ExSandbox.Conformance.Network do
         @describetag conformance: :network
 
         ExSandbox.Conformance.Group.guarded_setup do
-          sandbox = build_sandbox()
+          # ⚠️ The suite's sandbox carries a **real allowlist**, and until it did
+          # every check in this group reported the third outcome (005 T060a4).
+          #
+          # `build_sandbox()` set no `context` at all, so no mechanism could
+          # publish `:permitted` -- it is derived from the tenant's allowlist --
+          # and `require_permitted_reachable/2` had nothing to dial. The
+          # derivation was correct and inert: the census read "this mechanism
+          # declares no permitted destinations" for a mechanism whose allowlist
+          # handling was finished.
+          #
+          # ⚠️ Ordering matters and is the reason this did not land earlier. A
+          # populated allowlist makes `require_permitted_reachable/2` DIAL from
+          # inside the sandbox, and a sandbox under `--unshare-net` has no
+          # interfaces, so the dial is refused and scores
+          # `guarantee_failure("005-FR-011a")` -- "confinement that denies the
+          # permitted half is not confinement, it is an outage". Populated
+          # before the netns install, this turns an honest
+          # `capability_unavailable` into a hard `failed` while the mechanism is
+          # unchanged. The suite is right to fail there; the ordering would have
+          # been wrong. It is correct now only because the policed launch path
+          # exists.
+          sandbox =
+            build_sandbox(
+              context: %{
+                network_allowlist: [ExSandbox.Conformance.Network.permitted_address()]
+              }
+            )
 
           case ExSandbox.provision(@mechanism, sandbox) do
             {:ok, provisioned} ->
@@ -269,15 +364,17 @@ defmodule ExSandbox.Conformance.Network do
   here is not a check that passed.
   """
   def attempt_reach_denied_host(mechanism, sandbox) do
+    {denied_host, denied_port} = denied_address()
+
     case host_reaches_denied_address?() do
       :yes ->
-        probe_connect(mechanism, sandbox, @denied_host, @denied_port, "a denied destination")
+        probe_connect(mechanism, sandbox, denied_host, denied_port, "a denied destination")
 
       :no ->
         ExSandbox.Conformance.Helpers.capability_unavailable(
           :network_restriction,
           """
-          this host cannot itself reach #{@denied_host}:#{@denied_port}, so a
+          this host cannot itself reach #{denied_host}:#{denied_port}, so a
           refused connection from inside the sandbox is not evidence of an egress
           policy.
 
@@ -333,9 +430,11 @@ defmodule ExSandbox.Conformance.Network do
   end
 
   defp measure_control do
+    {denied_host, denied_port} = denied_address()
+
     case :gen_tcp.connect(
-           to_charlist(@denied_host),
-           @denied_port,
+           to_charlist(denied_host),
+           denied_port,
            [:binary, active: false],
            @control_timeout_ms
          ) do
@@ -652,7 +751,6 @@ defmodule ExSandbox.Conformance.Network do
         {:refused, reason}
     end
   end
-
 
   # -- What the mechanism has to tell us --------------------------------------
 
