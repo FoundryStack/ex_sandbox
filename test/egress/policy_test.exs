@@ -73,6 +73,7 @@ defmodule ExSandbox.Egress.PolicyTest do
       refute Policy.permits?(nil, {"93.184.216.34", 443})
     end
   end
+
   describe "an allowlist and a decoded destination must be comparable (T060a3)" do
     test "a destination decoded as an IP tuple matches an allowlist written as a string" do
       # ⚠️ This is the seam between two independently-written modules.
@@ -107,5 +108,4 @@ defmodule ExSandbox.Egress.PolicyTest do
       refute Policy.permits?([{"", 443}], {{93, 184, 216, 34}, 443})
     end
   end
-
 end

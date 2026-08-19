@@ -37,7 +37,7 @@ defmodule ExSandbox.Egress.Pool do
   rejection, because the sandbox is not aware it is being proxied and has no
   frame in which to receive one. From inside, a denied destination behaves like
   an unreachable one — which is what `FR-011a` describes.
-  
+
   ## ⚠️ The listener here is no longer in the egress path (2026-08-18)
 
   `decide/3` is still the single implementation of "may this sandbox reach this

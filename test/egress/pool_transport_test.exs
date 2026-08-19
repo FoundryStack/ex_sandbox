@@ -35,7 +35,12 @@ defmodule ExSandbox.Egress.PoolTransportTest do
 
   setup do
     registry = start_supervised!({Registry, name: :"reg_#{System.unique_integer([:positive])}"})
-    pool = start_supervised!({Pool, registry: registry, name: :"pool_#{System.unique_integer([:positive])}"})
+
+    pool =
+      start_supervised!(
+        {Pool, registry: registry, name: :"pool_#{System.unique_integer([:positive])}"}
+      )
+
     %{registry: registry, pool: pool, port: Pool.port(pool)}
   end
 

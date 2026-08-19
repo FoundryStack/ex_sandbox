@@ -82,7 +82,6 @@ defmodule ExSandbox.CapabilityTest do
                "a mechanism must be able to require it"
     end
 
-
     @tag :darwin
     test "is unavailable on macOS, and says why" do
       if match?({:unix, :darwin}, :os.type()) do

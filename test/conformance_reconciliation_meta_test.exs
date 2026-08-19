@@ -56,7 +56,12 @@ defmodule ExSandbox.ConformanceReconciliationMetaTest do
     # below would be about the fixture rather than the suite. Measured here so
     # the claim rests on the mechanism misreporting, not on an assumption.
     m = ExSandbox.BookkeepingMechanism
-    sandbox = %ExSandbox.Sandbox{id: "meta-#{System.unique_integer([:positive])}", owner_ref: "o", template_ref: "t"}
+
+    sandbox = %ExSandbox.Sandbox{
+      id: "meta-#{System.unique_integer([:positive])}",
+      owner_ref: "o",
+      template_ref: "t"
+    }
 
     {:ok, provisioned} = ExSandbox.provision(m, sandbox)
     {:ok, started} = ExSandbox.start(m, provisioned)

@@ -78,7 +78,8 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
       # launch needs Linux. The alternative is verifying this only where the
       # whole launch works, which is the arrangement that let those four
       # survive.
-      source = File.read!(Path.join([__DIR__, "..", "..", "lib", "ex_sandbox", "mechanism", "beam.ex"]))
+      source =
+        File.read!(Path.join([__DIR__, "..", "..", "lib", "ex_sandbox", "mechanism", "beam.ex"]))
 
       assert source =~ "stop_acceptor",
              """
@@ -86,7 +87,8 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
              process and keeps one dead network namespace open.
              """
 
-      assert source =~ ~r/acceptor_os_pid.*stop_acceptor|stop_acceptor\(launched\.acceptor_os_pid\)/s,
+      assert source =~
+               ~r/acceptor_os_pid.*stop_acceptor|stop_acceptor\(launched\.acceptor_os_pid\)/s,
              "the acceptor pid recorded at launch is not the one passed to stop_acceptor"
     end
 
@@ -95,7 +97,16 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
       # to the pid at all -- the same reason `:binding` exists.
       source =
         File.read!(
-          Path.join([__DIR__, "..", "..", "lib", "ex_sandbox", "mechanism", "beam", "node_launcher.ex"])
+          Path.join([
+            __DIR__,
+            "..",
+            "..",
+            "lib",
+            "ex_sandbox",
+            "mechanism",
+            "beam",
+            "node_launcher.ex"
+          ])
         )
 
       assert source =~ "acceptor_os_pid:",

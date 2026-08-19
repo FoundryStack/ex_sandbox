@@ -28,7 +28,9 @@ defmodule ExSandbox.Egress.RelayTest do
   # A throwaway echo server standing in for the destination. Returns the port
   # it listened on; the caller connects to it as the pool would.
   defp echo_server do
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
     {:ok, port} = :inet.port(listener)
 
     # The echo task accepts AND uses its socket, so ownership stays with it and
@@ -69,7 +71,9 @@ defmodule ExSandbox.Egress.RelayTest do
   # because the next person to add a test here will reach for `Task.async` the
   # same way.
   defp client_pair do
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
     {:ok, port} = :inet.port(listener)
     test_process = self()
 

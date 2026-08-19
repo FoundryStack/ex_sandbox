@@ -244,8 +244,7 @@ defmodule ExSandbox.Conformance.Helpers do
       # It appeared once and failed no assertion, which is what makes it worth
       # fixing now: intermittent provisioning failures in a suite whose whole
       # subject is provisioning read as mechanism defects.
-      id:
-        "conformance-#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}",
+      id: "conformance-#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}",
       owner_ref: "conformance-owner",
       template_ref: "conformance-template",
       cpu_limit: 500,

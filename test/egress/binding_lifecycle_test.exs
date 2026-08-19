@@ -38,7 +38,8 @@ defmodule ExSandbox.Egress.BindingLifecycleTest do
   alias ExSandbox.Egress.Registry, as: EgressRegistry
 
   setup do
-    registry = start_supervised!({EgressRegistry, name: :"reg_#{System.unique_integer([:positive])}"})
+    registry =
+      start_supervised!({EgressRegistry, name: :"reg_#{System.unique_integer([:positive])}"})
 
     allocator =
       start_supervised!(
