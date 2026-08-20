@@ -38,12 +38,14 @@ defmodule ExSandbox.Hardening.ConfinementTest do
   keeps here. Deciding *which* path a run may reach is tenancy, and that stays
   in Axonn (`015` T106a).
 
-  ## ⚠️ This test FAILS TODAY. That is the finding.
+  ## It failed before the mechanism existed. That was the finding.
 
-  It is written before the mechanism exists, per `012-FR-012a`, so that T107 is
-  visible in a diff as the thing that turns it green. A profile written first
-  and a test written to match it would be built from prediction — the exact
-  shape `FR-012a` exists to prevent.
+  ⚠️ **UPDATE (T107): it passes now, and the sequence is the point.** It was
+  written before the mechanism existed, per `012-FR-012a`, and MEASURED failing
+  on `confine/2` being undefined (run `2026-08-19T15:28:53Z-85`). T107 is the
+  diff that turned it green. A profile written first and a test written to match
+  it would have been built from prediction — the shape `FR-012a` exists to
+  prevent.
 
   ## ⚠️ It asserts on a DENIAL, never on a flag having been passed
 
@@ -61,15 +63,21 @@ defmodule ExSandbox.Hardening.ConfinementTest do
   """
   use ExUnit.Case, async: false
 
-  # `:isolation` is excluded off Linux by `test_helper.exs`, and this needs a
-  # real mount namespace, so it carries the tag with the rest of the containment
-  # suite. Off Linux it does not pass — it does not run, which is the honest
-  # answer ExUnit has no third outcome for.
+  # ⚠️ NOT tagged `:isolation`, and the reason is a measurement (R30).
   #
-  #     docker compose -f docker/compose.isolation.yml run --rm --build isolation
-  @moduletag :isolation
+  # It was, when written: `:isolation` is excluded off Linux by
+  # `test_helper.exs`, and the assumption was that this needed a mount namespace
+  # like the tenant profile does. R30 then measured `sandbox-exec` enforcing the
+  # same boundary on darwin — surviving three nested execs, not widenable by
+  # re-invoking itself, not defeated by a symlink out of the subtree.
+  #
+  # So this runs on **both** platforms, and that is the point: the boundary this
+  # asserts is the one thing in the containment suite a developer's own machine
+  # can actually check. `confine/2` returns `{:cannot_enforce, …}` on a host that
+  # cannot build the profile, and the tests below fail loudly on it rather than
+  # skipping — a host where the CLI is unconfined must not read as green.
 
-  alias ExSandbox.Hardening.Linux
+  alias ExSandbox.Hardening.Confinement
 
   setup do
     root = Path.join(System.tmp_dir!(), "confinement-#{System.unique_integer([:positive])}")
@@ -92,7 +100,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
   # Runs `cat <path>` under the confinement profile that binds `p`, and reports
   # what actually happened rather than what was configured.
   defp read_under_confinement(p, path) do
-    case Linux.confine_control_plane_process({"cat", [path]}, permit_path: p) do
+    case Confinement.confine({"cat", [path]}, permit_path: p) do
       {:ok, %{cmd: cmd, args: args, env: env, cd: cd}} ->
         opts = [stderr_to_stdout: true, env: env] ++ if(cd, do: [cd: cd], else: [])
         {out, status} = System.cmd(cmd, args, opts)
@@ -151,7 +159,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
       sentinel = "sk-ant-sentinel-#{System.unique_integer([:positive])}"
 
       {:ok, %{cmd: cmd, args: args, env: env, cd: cd}} =
-        Linux.confine_control_plane_process({"sh", ["-c", "printf %s \"$ANTHROPIC_API_KEY\""]},
+        Confinement.confine({"sh", ["-c", "printf %s \"$ANTHROPIC_API_KEY\""]},
           permit_path: p,
           env: [{"ANTHROPIC_API_KEY", sentinel}]
         )
