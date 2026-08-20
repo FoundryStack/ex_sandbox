@@ -160,6 +160,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
       {out, status} = System.cmd(cmd, args, opts)
 
       assert status == 0
+
       assert out =~ sentinel,
              """
              The credential did not survive the profile.
