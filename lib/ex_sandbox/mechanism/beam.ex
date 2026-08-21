@@ -109,13 +109,28 @@ defmodule ExSandbox.Mechanism.Beam do
       |> Keyword.get(:templates, [])
 
     cond do
-      template_ref in known ->
-        {:ok, template_ref}
-
+      # ⚠️ The wildcard is checked FIRST, and the order is the whole fix.
+      #
+      # It used to be second, behind `template_ref in known`. With `known` the
+      # atom `:any`, `in` reaches `Enumerable.impl_for!/1` and RAISES --
+      # `protocol Enumerable not implemented for Atom` -- so the wildcard branch
+      # below it was unreachable and every provision crashed before it.
+      #
+      # `config/config.exs` sets exactly that value for `:dev` and `:prod`
+      # (`templates: :any`, with a comment explaining that the host takes on the
+      # obligation to reject unknown templates). `config/test.exs` sets a real
+      # list, so the whole suite exercised the one shape that worked. MEASURED
+      # in the studio container (D33) at the first real `ExSandbox.provision/2`
+      # on the configured dev host: a capability map with all five available,
+      # and a `Protocol.UndefinedError` from `resolve_template/1`.
+      #
       # A wildcard for hosts that manage template existence themselves and do
       # not want this library second-guessing them. Explicit, so it cannot
       # happen by forgetting to configure anything.
       known == :any ->
+        {:ok, template_ref}
+
+      template_ref in known ->
         {:ok, template_ref}
 
       true ->
