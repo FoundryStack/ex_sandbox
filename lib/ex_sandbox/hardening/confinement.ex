@@ -131,9 +131,43 @@ defmodule ExSandbox.Hardening.Confinement do
     end
   end
 
+  @doc """
+  Resolves `command` the way the kernel will: a bare name through `PATH`, then
+  the symlink chain, component by component.
+
+  Public because the grant and the invocation **must agree**, and they are
+  written in two different places. MEASURED on Linux (D14a): binding the
+  symlink's *target* while invoking the *symlink* fails outright. Resolving
+  first is what deletes that failing case, and a second implementation of the
+  rule is how the two ends drift back apart.
+
+  ⚠️ macOS makes the same demand from the other direction: SBPL **resolves
+  symlinks before matching a path filter**, so a grant written against a
+  symlink silently never matches. Nothing fails; the path is simply denied.
+
+  Returns `command` unchanged when it is not on `PATH` and cannot be resolved,
+  so an unlaunchable command still reaches the exec and earns the operating
+  system's own error rather than a substituted one.
+  """
+  @spec resolve_executable(String.t()) :: String.t()
+  def resolve_executable(command) when is_binary(command) do
+    if Path.type(command) == :absolute do
+      resolve(command)
+    else
+      case System.find_executable(command) do
+        nil -> command
+        found -> resolve(found)
+      end
+    end
+  end
+
   defp build(command, args, permit_path, opts) do
     env = Keyword.get(opts, :env, [])
     cd = Keyword.get(opts, :cd)
+
+    # ⚠️ Resolved HERE so that everything downstream -- the grant, the bind and
+    # the exec -- names the same file. See `resolve_executable/1`.
+    command = resolve_executable(command)
 
     # ⚠️ Resolved, not merely expanded. MEASURED: `System.tmp_dir!()` on macOS is
     # `/var/folders/…`, a symlink to `/private/var/folders/…`, and the kernel
@@ -209,7 +243,7 @@ defmodule ExSandbox.Hardening.Confinement do
       sandbox_exec ->
         # `-p` takes the profile inline, so there is no temporary file to create,
         # secure, or leak. `release/1` has nothing to clean up as a result.
-        {:ok, sandbox_exec, ["-p", sandbox_profile(permit_path), command | args]}
+        {:ok, sandbox_exec, ["-p", sandbox_profile(permit_path, command), command | args]}
     end
   end
 
@@ -225,6 +259,7 @@ defmodule ExSandbox.Hardening.Confinement do
   defp bwrap_args(command, args, permit_path) do
     runtime_read_paths()
     |> Enum.flat_map(&["--ro-bind", &1, &1])
+    |> Kernel.++(command_bind(command, permit_path))
     |> Kernel.++([
       "--bind",
       permit_path,
@@ -250,7 +285,7 @@ defmodule ExSandbox.Hardening.Confinement do
   # before any read happens, so every breach assertion "passes" while the
   # control fails. The order matters: later rules win in a `sandbox-exec`
   # profile, so the permitted subpath must come after the blanket deny.
-  defp sandbox_profile(permit_path) do
+  defp sandbox_profile(permit_path, command) do
     runtime =
       runtime_read_paths()
       |> Enum.map(&"(subpath #{sb_string(&1)})")
@@ -270,7 +305,85 @@ defmodule ExSandbox.Hardening.Confinement do
     (allow file-read* #{ancestors})
     (allow file-read-metadata)
     (allow file-read* file-write* (subpath #{sb_string(permit_path)}))
+    #{writable_devices()}
+    #{executable_grant(command, permit_path)}
     """
+  end
+
+  # ⚠️ Two device nodes by name, NOT `file-write*` on `(subpath "/dev")`.
+  #
+  # MEASURED: under this profile `echo x > /dev/null` fails with `Operation not
+  # permitted`. `/dev` is in `runtime_read_paths/0` and so is granted
+  # `file-read*` only, while `file-write*` exists solely inside `permit_path`.
+  # The comment on `runtime_read_paths/0` says `/dev` is there "because a
+  # process denied `/dev/null` and `/dev/urandom` dies rather than being
+  # confined" -- the read half was implemented and the write half was not.
+  #
+  # The narrow form is chosen because `/dev` is not a directory of harmless
+  # sinks. It also holds `/dev/disk*` and `/dev/rdisk*`, which are raw block
+  # devices for every mounted volume on the host: `file-write*` over the subpath
+  # would hand a confined process the ability to write the operator's disks
+  # directly, straight past every path rule above. That is a strictly larger
+  # hole than the one this module exists to close, opened to fix a redirect.
+  #
+  # MEASURED after this change: `echo x > /dev/null` and
+  # `head -c 4 /dev/urandom > /dev/null` both succeed.
+  defp writable_devices do
+    "(allow file-write* (literal \"/dev/null\") (literal \"/dev/urandom\"))"
+  end
+
+  # ⚠️ `(literal …)`, NEVER `(subpath …)` -- for a sharper reason than the
+  # ancestors above. The resolved CLI lives at `…/versions/<v>`, so a subpath
+  # grant on its parent re-permits **every retained old version** (self-update
+  # never deletes them), and a subpath grant on `~/.local/bin` re-permits every
+  # other tool the operator has installed.
+  #
+  # ## Why a grant at all, when exec already works
+  #
+  # ⚠️ MEASURED, and it refutes the obvious premise: on macOS a confined child
+  # **already execs** a binary under a denied path with no grant of any kind.
+  # `(deny file-read* file-write*)` does not govern `process-exec*`; `(allow
+  # default)` does. So this is not what makes the launch possible.
+  #
+  # What it makes possible is the binary **reading its own file at runtime** --
+  # an embedded payload, an update check. MEASURED on this profile: without the
+  # grant a process reading its own executable gets `Operation not permitted`;
+  # with it, the read succeeds, and a sibling in the same directory stays
+  # denied. That matters because `028/spec.md:248-252` records this CLI's
+  # failure signature for a denied path as **exit 0, zero bytes, no complaint**
+  # -- a green run that produced nothing. One line makes the question moot.
+  #
+  # `process-exec` is granted alongside `file-read*` and `file-map-executable`
+  # (the operation governing `mmap` with `PROT_EXEC`) even though `(allow
+  # default)` already permits it here, so the grant stays correct if that
+  # default is ever tightened. A grant that is only complete by accident is one
+  # someone has to rediscover.
+  defp executable_grant(command, permit_path) do
+    if grantable_command?(command, permit_path) do
+      "(allow process-exec file-read* file-map-executable (literal #{sb_string(command)}))"
+    else
+      ""
+    end
+  end
+
+  # Nothing to grant for a command that is not an absolute path to an existing
+  # file: a name still to be looked up cannot be named in a rule, and a
+  # non-existent path would produce a grant that matches nothing while reading
+  # as though it protected something.
+  #
+  # Already-covered paths are skipped too. On Linux that is load-bearing rather
+  # than tidy: binding a path underneath an existing bind makes `bwrap` mount
+  # over its own mount, which it rejects outright -- the same failure
+  # `nested_in_other?/2` exists to avoid for the runtime set.
+  defp grantable_command?(command, permit_path) do
+    Path.type(command) == :absolute and File.regular?(command) and
+      not nested_in_other?(command, runtime_read_paths() ++ [permit_path])
+  end
+
+  defp command_bind(command, permit_path) do
+    if grantable_command?(command, permit_path),
+      do: ["--ro-bind", command, command],
+      else: []
   end
 
   # ⚠️ `(literal …)`, NEVER `(subpath …)`.
@@ -310,7 +423,9 @@ defmodule ExSandbox.Hardening.Confinement do
   # The runtime's own read set. Generous on purpose (see the moduledoc): this is
   # what the process needs to *execute*, and it is not where the boundary lives.
   # `/dev` is included because a process denied `/dev/null` and `/dev/urandom`
-  # dies rather than being confined.
+  # dies rather than being confined. ⚠️ That grants READS only; the write half
+  # lives in `writable_devices/0`, narrowly, and was missing until D14a measured
+  # `echo x > /dev/null` failing.
   defp runtime_read_paths do
     [to_string(:code.root_dir()), "/usr", "/lib", "/lib64", "/bin", "/sbin", "/System", "/dev"]
     |> Enum.uniq()
