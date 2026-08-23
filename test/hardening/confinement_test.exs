@@ -237,13 +237,29 @@ defmodule ExSandbox.Hardening.ConfinementTest do
           # produced by the probe having actually run. A confinement failure
           # yields the confiner's error status instead -- MEASURED on linux,
           # `bwrap: execvp …: No such file or directory`, exit 1.
+          # ⚠️ READ THE ERRNO BEFORE READING THE CODE. Both failures exit 1 and
+          # the message below used to name only one of them, which cost an
+          # investigation: `execvp: Permission denied` (EACCES) is the HOST
+          # refusing, not the profile. `System.tmp_dir!()` above is `/tmp`, and
+          # Docker mounts a bare `--tmpfs` `noexec` -- so inside a container
+          # this test failed while pointing at `command_bind/2`, where nothing
+          # was wrong. `docker/compose.isolation.yml` mounts `/tmp:exec` for
+          # exactly this reason.
           assert {7, _} = run_under_confinement(p, probe, []),
                  """
                  A confined child could not execute a binary under a denied path.
 
-                 On linux this is `--ro-bind <resolved> <resolved>` missing or
-                 naming the symlink rather than its target; on darwin it means
-                 something now governs `process-exec*` that did not before.
+                 `execvp ...: Permission denied` (EACCES) means the FILESYSTEM
+                 refused, not the profile -- almost always a `noexec` mount
+                 under #{System.tmp_dir!()}. Check it before changing any
+                 confinement code:
+
+                     grep " #{System.tmp_dir!()} " /proc/mounts
+
+                 `execvp ...: No such file or directory` (ENOENT) is the profile:
+                 on linux `--ro-bind <resolved> <resolved>` missing or naming the
+                 symlink rather than its target; on darwin it means something now
+                 governs `process-exec*` that did not before.
                  """
 
           # ⚠️ The runtime self-read, which is the ONLY thing the grant buys on
