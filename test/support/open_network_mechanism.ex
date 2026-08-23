@@ -67,6 +67,15 @@ defmodule ExSandbox.OpenNetworkMechanism do
   @impl true
   def usage(_sandbox), do: {:ok, %{}}
 
+  # This fixture isolates nothing and runs nothing. `:could_not_run` is the
+  # honest answer and the one the suite must not score as a pass: an attempt
+  # that never happened has demonstrated neither a limit holding nor a limit
+  # failing.
+  @impl true
+  def execute(_sandbox, {_cmd, _args}, _opts \\ []) do
+    {:error, {:could_not_run, :not_supported}}
+  end
+
   # Per sandbox, because the file is real even though the boundary is not. A
   # fixed path is one file shared by every test that starts this mechanism, so
   # two of them at once -- in one suite run, or in two concurrent `mix test`

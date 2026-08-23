@@ -26,8 +26,8 @@ defmodule ExSandbox do
     * `ExSandbox.Conformance` — the conformance suite, included via `use`
     * `ExSandbox.Proxy` — forwards a request to a running sandbox's address
     * `ExSandbox.Telemetry` — the events both libraries emit, and their metadata
-    * `ExSandbox.Conformance.{Lifecycle, Isolation, ResourceLimits, Helpers,
-      Group}` — public *by consequence*: `use ExSandbox.Conformance` expands
+    * `ExSandbox.Conformance.{Lifecycle, Isolation, ResourceLimits, Execution,
+      Helpers, Group}` — public *by consequence*: `use ExSandbox.Conformance` expands
       into calls on them inside the consumer's own module, so they are part of
       the compiled surface whether or not anyone intended it
 
@@ -141,6 +141,31 @@ defmodule ExSandbox do
   @spec usage(mechanism(), Sandbox.t()) ::
           {:ok, ExSandbox.Mechanism.usage()} | {:error, term()}
   def usage(mechanism, %Sandbox{} = sandbox), do: mechanism.usage(sandbox)
+
+  @doc """
+  Runs `{cmd, args}` inside a running sandbox (`008-FR-002`, `007-FR-041`).
+
+  Deliberately **not** capability-gated the way `provision/2` and `start/2` are,
+  and the reason is not laxity: this call reaches into a sandbox that is already
+  running, which means the capability decision was taken at its launch and taken
+  correctly, or there is no sandbox here to reach into. Re-asking now would only
+  add a second answer to a question already settled, and on a host whose report
+  changed mid-flight the second answer would refuse to read the output of work
+  that ran perfectly well under confinement that was real when it started.
+
+  The three returns are three different facts — see `c:ExSandbox.Mechanism.execute/3`.
+  In particular `{:error, {:could_not_run, _}}` is **not** an exit status.
+  """
+  @spec execute(mechanism(), Sandbox.t(), {String.t(), [String.t()]}, keyword()) ::
+          {:ok, ExSandbox.Mechanism.completion()}
+          | {:error, {:could_not_run, term()}}
+          | {:error, {:limit_exceeded, :wall_clock | :memory | :cpu}}
+  def execute(mechanism, %Sandbox{} = sandbox, {cmd, args}, opts \\ [])
+      when is_binary(cmd) and is_list(args) do
+    Telemetry.span(:execute, mechanism, sandbox, fn ->
+      mechanism.execute(sandbox, {cmd, args}, opts)
+    end)
+  end
 
   @doc """
   Reports on every capability this host provides.

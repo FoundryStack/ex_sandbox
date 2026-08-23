@@ -28,6 +28,7 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @behaviour ExSandbox.Mechanism
 
+  alias ExSandbox.Mechanism.Beam.Exec
   alias ExSandbox.Mechanism.Beam.NodeLauncher
   alias ExSandbox.Sandbox
 
@@ -1133,6 +1134,107 @@ defmodule ExSandbox.Mechanism.Beam do
         {:error, :unknown_sandbox}
     end
   end
+
+  @impl true
+  def execute(%Sandbox{} = sandbox, {cmd, args}, opts \\ [])
+      when is_binary(cmd) and is_list(args) and is_list(opts) do
+    budget = time_budget(sandbox)
+    timeout = Keyword.get(opts, :timeout) || budget || configured_exec_timeout()
+
+    exprs =
+      Exec.runner_exprs(cmd, args,
+        limit_bytes: Keyword.get(opts, :limit_bytes, Exec.capture_limit_bytes()),
+        env: Keyword.get(opts, :env, Exec.default_env())
+      )
+
+    sandbox
+    |> call(:erl_eval, :exprs, [exprs, []], timeout)
+    |> interpret_execution(sandbox, budget, timeout)
+    |> emit_output(opts[:on_output])
+  end
+
+  # ⚠️ Three outcomes in, three outcomes out, and the mapping is the whole
+  # requirement. `008-FR-016`/`FR-026` say an attempt that could not be
+  # performed is not a failed attempt, so nothing here may invent an exit
+  # status for a command that never ran.
+  defp interpret_execution({:ok, value}, _sandbox, _budget, _timeout) do
+    case Exec.decode(value) do
+      {:ok, completion} -> {:ok, completion}
+      {:could_not_run, reason} -> {:error, {:could_not_run, reason}}
+    end
+  end
+
+  # A sandbox that never existed here, or that has been destroyed. THE case
+  # `008` quickstart Scenario 1 turns on: a destroyed sandbox must answer
+  # `:could_not_run`, not a non-zero status.
+  defp interpret_execution({:error, :unknown_sandbox}, _sandbox, _budget, _timeout) do
+    {:error, {:could_not_run, :unknown_sandbox}}
+  end
+
+  # The call waited out its ceiling. Which ceiling decides what this means, and
+  # the distinction is the same one `exec_in_sandbox/2` already draws:
+  #
+  #   * the sandbox's OWN declared `timeout_ms` is a limit on the tenant's work.
+  #     A declared limit that stops nothing is not a limit, so the sandbox is
+  #     terminated and the caller is told the limit was exceeded.
+  #   * this library's configured ceiling is its guard against waiting forever.
+  #     Tripping it says nothing whatever about the tenant, so it is
+  #     `:could_not_run` -- we have no result and no limit to attribute one to.
+  defp interpret_execution({:error, {:exit, {:timeout, _}}}, sandbox, budget, timeout) do
+    if is_integer(budget) and timeout <= budget do
+      enforce_time_budget(sandbox)
+      {:error, {:limit_exceeded, :wall_clock}}
+    else
+      {:error, {:could_not_run, {:timeout, timeout}}}
+    end
+  end
+
+  defp interpret_execution({:error, reason}, sandbox, _budget, _timeout) do
+    # The sandbox died under us. It may have died BECAUSE of a cap, and the
+    # mechanism is the only thing that can tell: `status/1` probes the node and
+    # records why, `provision_failure_reason/1` reads that verdict, and the
+    # verdict for a dead sandbox that was not stopped by us comes from systemd's
+    # `oom-kill` on the scope (`cap_breached?/1`). Only that positive
+    # attribution becomes `:limit_exceeded`; everything else stays
+    # `:could_not_run`, because a process that died of something unrelated has
+    # demonstrated nothing about a cap.
+    if killed_by_memory_cap?(sandbox) do
+      {:error, {:limit_exceeded, :memory}}
+    else
+      {:error, {:could_not_run, reason}}
+    end
+  end
+
+  defp killed_by_memory_cap?(sandbox) do
+    # `status/1` first, and not as a formality: `provision_failure_reason/1`
+    # reads a *recorded* verdict, and nothing records one until something looks.
+    # Asking for the reason without a preceding status read answers `:ok` ("no
+    # failure recorded") for a sandbox that is already dead.
+    case status(sandbox) do
+      {:ok, state} when state in [:running, :unknown] -> false
+      _ -> provision_failure_reason(sandbox) == {:error, :resource_cap}
+    end
+  end
+
+  # A2's sink, and it is fed AFTER completion for this mechanism -- honestly
+  # rather than pretending.
+  #
+  # ⚠️ `:peer.call/5` is a request/response channel: the sandbox-side runner
+  # cannot push a chunk back mid-command over it without a second channel this
+  # mechanism does not have. So a caller passing `:on_output` gets the same
+  # chunks, in order, at completion. That is A1's timing with A2's *interface*,
+  # which is what makes a later change to genuine streaming a change to this
+  # mechanism rather than to the behaviour every mechanism implements -- the
+  # second breaking change the seam note exists to avoid.
+  defp emit_output(result, nil), do: result
+
+  defp emit_output({:ok, completion} = result, sink) when is_function(sink, 1) do
+    if completion.stdout != <<>>, do: sink.({:stdout, completion.stdout})
+    if completion.stderr != <<>>, do: sink.({:stderr, completion.stderr})
+    result
+  end
+
+  defp emit_output(result, _sink), do: result
 
   @impl true
   def usage(%Sandbox{} = sandbox) do

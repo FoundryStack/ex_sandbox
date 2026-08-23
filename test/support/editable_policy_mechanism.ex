@@ -82,6 +82,15 @@ defmodule ExSandbox.EditablePolicyMechanism do
   @impl true
   def usage(_sandbox), do: {:ok, %{}}
 
+  # This fixture isolates nothing and runs nothing. `:could_not_run` is the
+  # honest answer and the one the suite must not score as a pass: an attempt
+  # that never happened has demonstrated neither a limit holding nor a limit
+  # failing.
+  @impl true
+  def execute(_sandbox, {_cmd, _args}, _opts \\ []) do
+    {:error, {:could_not_run, :not_supported}}
+  end
+
   # ⚠️ Enforcement is genuine and re-reads the policy every time. The permitted
   # destination connects; everything else is refused. This is what makes the
   # fixture dangerous rather than a strawman: the boundary really does hold
