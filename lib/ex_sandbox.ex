@@ -204,7 +204,11 @@ defmodule ExSandbox do
          function_exported?(mechanism, :required_capabilities, 0) do
       mechanism.required_capabilities()
     else
-      Capability.known()
+      # ⚠️ `gating_defaults/0`, NOT `known/0`. `known/0` is the reporting
+      # vocabulary and since `014` T004 it contains `:time_budget`, which is
+      # `unavailable` on every host by design -- gating on it would refuse
+      # every mechanism that omits this callback, on every host, forever.
+      Capability.gating_defaults()
     end
   end
 end

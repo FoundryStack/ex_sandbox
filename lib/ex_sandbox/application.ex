@@ -60,7 +60,25 @@ defmodule ExSandbox.Application do
       # blanket denial while the suite stays green. That is the `--unshare-net`
       # state wearing the appearance of an enforced allowlist, which is the
       # precise thing T060 exists to end.
-      ExSandbox.Egress.Verdict
+      ExSandbox.Egress.Verdict,
+
+      # Answers DNS for sandboxes, and files what each one resolved (029 T015).
+      #
+      # ⚠️ Started **after** the registry, and this one writes to it rather than
+      # only reading: `029-FR-012` matches a hostname allowlist entry against
+      # what this sandbox resolved that name to, and this is what records it.
+      # A resolver that outlived its registry would answer queries and file
+      # nothing, so every hostname entry would silently deny -- the exact
+      # failure `FR-012` exists to end, arriving through a restart instead of
+      # through a type mismatch.
+      #
+      # ⚠️ Its absence is **not** silent in the same way the verdict server's
+      # is, and that is deliberate: with nothing bound to the resolver socket,
+      # the in-namespace listener's relay fails and the datagram is dropped, so
+      # names do not resolve at all rather than resolving into an unenforced
+      # allowlist. A sandbox that cannot resolve is visibly broken; a sandbox
+      # that resolves into nothing recorded is invisibly denied.
+      ExSandbox.Egress.Resolver
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

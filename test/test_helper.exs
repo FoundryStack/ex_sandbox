@@ -103,6 +103,35 @@ missing_capabilities =
 # a host that reports a capability and then fails at the point of provisioning.
 excluded = if linux? and missing_capabilities == [], do: [], else: [:isolation, :reclamation]
 
+# ⚠️ The mirror image of the block above, and it exists for the same reason
+# pointed the other way (014 T003).
+#
+# `014`'s Darwin tests establish their caps by **breaching them and watching
+# macOS stop it** -- a 300 MB allocation under a 100 MB `taskpolicy -m` cap, a
+# spinner under `RLIMIT_CPU`, a `sandbox-exec` profile. None of those
+# mechanisms exists on Linux. Run there, every one of them would report a
+# failure of a guarantee that was never this host's to give; excluded *without
+# being named*, they would be worse -- a Linux CI run would go green having
+# verified nothing about the macOS floor, which is precisely the false
+# confidence `FR-014a` is written against.
+#
+# So they are ABSENT and SAID TO BE ABSENT: ExUnit reports the count as
+# "N excluded", which is a different sentence from "N tests, 0 failures".
+#
+# ⚠️ This exclusion only reaches a test module that TAGS ITSELF. A `014` test
+# file must carry `@moduletag :darwin_hardening` (or per-test `@tag`); an
+# untagged Darwin test runs on Linux and fails there for a reason that reads as
+# a mechanism defect. `ExSandbox.Hardening.DarwinTagTest` asserts this
+# exclusion is configured, and carries a canary that FAILS rather than passes
+# if a `:darwin_hardening` test ever executes off Darwin.
+#
+# ⚠️ Kept separate from `excluded` above rather than folded into it. That list
+# is quoted verbatim in the two warnings below, which are about the *isolation*
+# shortfall; appending an unrelated tag would make a Linux capability warning
+# announce it was skipping macOS tests.
+darwin? = match?({:unix, :darwin}, :os.type())
+darwin_excluded = if darwin?, do: [], else: [:darwin_hardening]
+
 cond do
   not linux? ->
     IO.puts("""
@@ -140,4 +169,12 @@ cond do
     :ok
 end
 
-ExUnit.start(exclude: excluded)
+if darwin_excluded != [] do
+  IO.puts("""
+  \n\e[33m014: skipping #{Enum.join(darwin_excluded, ", ")} tests on #{elem(:os.type(), 1)}.
+  The macOS resource-cap floor (memory, CPU, wall clock, sandbox-exec) is NOT
+  verified by this run.\e[0m
+  """)
+end
+
+ExUnit.start(exclude: excluded ++ darwin_excluded)

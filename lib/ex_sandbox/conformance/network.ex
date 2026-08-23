@@ -861,10 +861,61 @@ defmodule ExSandbox.Conformance.Network do
   """
   def attempt_udp_egress(mechanism, sandbox) do
     with {:ok, probe} <- udp_probe(mechanism, sandbox),
-         :ok <- require_host_answers_udp() do
+         :ok <- require_host_answers_udp(),
+         :ok <- require_resolver_answers(probe, sandbox) do
       run_udp_legs(probe, sandbox)
     end
   end
+
+  # ⚠️ The permitted-path control for this check, and it is not optional
+  # (029 T015, `FR-013`, `FR-016`).
+  #
+  # Every remaining leg scores silence as the boundary holding. A namespace
+  # with no working network at all is silent on all of them, so without a
+  # datagram that IS supposed to come back, this check passes hardest exactly
+  # where the sandbox is most broken.
+  #
+  # The resolver is that datagram: `FR-013` requires one UDP destination a
+  # sandbox can reach, so an answer from it is the positive half and silence
+  # from it means the negative half establishes nothing.
+  #
+  # Mechanisms that declare no `:resolver` get the old behaviour rather than a
+  # failure -- a sandbox with no name resolution is a legitimate configuration,
+  # and its UDP legs are then all denials with no control, which is stated
+  # rather than hidden.
+  defp require_resolver_answers(probe, sandbox) do
+    case declared_resolver(sandbox) do
+      {host, port} ->
+        case probe.(host, port) do
+          :answered ->
+            :ok
+
+          other ->
+            ExSandbox.Conformance.Helpers.capability_unavailable(
+              :network_restriction,
+              """
+              the sandbox's own resolver at #{host}:#{port} did not answer
+              (#{inspect(other)}), so the silence of every other UDP leg
+              establishes nothing: a namespace with no working network is
+              silent on all of them and would pass this check.
+
+              This is the third outcome and not a pass. `029-FR-013` requires
+              exactly one reachable UDP destination, and this check needs it
+              back before it can read any other leg's silence as a refusal.
+              """
+            )
+        end
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp declared_resolver(%{context: %{resolver: {host, port}}})
+       when is_binary(host) and is_integer(port),
+       do: {host, port}
+
+  defp declared_resolver(_sandbox), do: nil
 
   # ⚠️ The control that stops this check reporting a boundary it never saw, and
   # it is the same control `attempt_reach_denied_host/2` applies to TCP: if the
@@ -997,10 +1048,30 @@ defmodule ExSandbox.Conformance.Network do
   # because a leak to either would be worth catching -- but neither is obliged
   # to answer, so on their own they can only ever produce silence. See the
   # check's own note for the run that measured exactly that.
-  defp udp_legs(%{context: %{gateway: gateway}}) when is_binary(gateway),
+  # ⚠️ The sandbox's own resolver is REMOVED from the legs, and leaving it in
+  # is a false failure rather than a false pass (029 T015).
+  #
+  # `@udp_loopback` was written when nothing served `127.0.0.1:53` inside a
+  # namespace, so an answer there could only mean the datagram escaped to the
+  # host's resolver. Since `FR-013` that address is served from inside the
+  # namespace by `nsacceptor.py`, and an answer means the exemption works.
+  # Measured in the isolation image: this leg reported "it left the namespace
+  # unpoliced" against a sandbox whose UDP drop was installed and enforcing.
+  #
+  # It does not vanish from the run -- `require_resolver_answers/2` probes it
+  # first, as the control that makes the remaining legs' silence readable.
+  defp udp_legs(sandbox) do
+    resolver = declared_resolver(sandbox)
+
+    sandbox
+    |> all_udp_legs()
+    |> Enum.reject(&(&1 == resolver))
+  end
+
+  defp all_udp_legs(%{context: %{gateway: gateway}}) when is_binary(gateway),
     do: [@udp_loopback, {gateway, @udp_port}, denied_address()]
 
-  defp udp_legs(_sandbox), do: [@udp_loopback, denied_address()]
+  defp all_udp_legs(_sandbox), do: [@udp_loopback, denied_address()]
 
   @doc """
   Attempts to widen the environment's own allowlist from inside the sandbox

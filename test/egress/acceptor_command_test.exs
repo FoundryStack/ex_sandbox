@@ -7,7 +7,7 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
   # namespace. It cannot be exercised off Linux, so its *shape* is what gets
   # verified here -- the arrangement that keeps a Linux-only command from being
   # checked only where the whole launch works.
-  describe "listener_command/3" do
+  describe "listener_command/7" do
     setup do
       %{
         command:
@@ -16,7 +16,14 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
             18_080,
             "/opt/axonn/nsacceptor",
             "/var/run/axonn-egress-verdict.sock",
-            {10, 0, 4, 0}
+            {10, 0, 4, 0},
+            # ⚠️ The DNS half arrived in 029 T015: the same process carries the
+            # resolver relay, for the same reason it carries TCP -- a socket a
+            # sandbox can reach has to be created from inside its namespace.
+            # See `resolver_wiring_test.exs` for why the bind address is passed
+            # rather than defaulted on either side.
+            "/var/run/axonn-egress-resolver.sock",
+            {{127, 0, 0, 1}, 53}
           )
       }
     end
@@ -54,10 +61,18 @@ defmodule ExSandbox.Egress.AcceptorCommandTest do
       assert helper_index > flag_index,
              "the helper must be the command nsenter runs, not an argument to nsenter"
 
+      # ⚠️ The full argv, in order, rather than a membership check. The helper
+      # reads these positionally, so a value inserted in the wrong place is a
+      # helper that binds its resolver where the sandbox's own address should
+      # be -- and the symptom is a launch that fails at bind time, or worse, one
+      # that binds somewhere the `nft` rule never permitted.
       assert Enum.drop(command, helper_index + 1) == [
                "18080",
                "/var/run/axonn-egress-verdict.sock",
-               "10.0.4.0"
+               "10.0.4.0",
+               "/var/run/axonn-egress-resolver.sock",
+               "127.0.0.1",
+               "53"
              ]
     end
 

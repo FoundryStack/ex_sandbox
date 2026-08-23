@@ -603,7 +603,34 @@ defmodule ExSandbox.Mechanism.Beam do
     |> put_permitted()
     |> put_policy_handle(sandbox)
     |> put_gateway(sandbox)
+    |> put_resolver(sandbox)
   end
+
+  # ⚠️ Published so the UDP check can tell the ONE destination the policy is
+  # meant to permit from every destination it is meant to drop (029 T015,
+  # `FR-013`).
+  #
+  # Without it `attempt_udp_egress/2` probes `127.0.0.1:53` and reads an answer
+  # as "the datagram left the namespace unpoliced". Since T015 that address is
+  # the sandbox's own resolver, served from *inside* its namespace by
+  # `nsacceptor.py`, so the answer means the opposite of what the check says --
+  # measured: the leg failed on a sandbox whose egress policy was working.
+  #
+  # Gated on `binding` for the same reason `put_gateway/2` is: a sandbox with
+  # no egress policy has no resolver exemption either, and publishing one would
+  # hand the check a control that cannot hold.
+  defp put_resolver(context, %Sandbox{} = sandbox) do
+    with {:ok, launched} <- lookup(sandbox.id),
+         binding when not is_nil(binding) <- launched[:binding],
+         {address, port} when is_integer(port) <- ExSandbox.Egress.Resolver.resolver_address() do
+      Map.put(context, :resolver, {resolver_literal(address), port})
+    else
+      _ -> Map.delete(context, :resolver)
+    end
+  end
+
+  defp resolver_literal(address) when is_tuple(address), do: to_string(:inet.ntoa(address))
+  defp resolver_literal(address) when is_binary(address), do: address
 
   # ⚠️ Published **only for a sandbox that actually has a binding**, on exactly
   # the same reasoning as `put_policy_handle/2` above.

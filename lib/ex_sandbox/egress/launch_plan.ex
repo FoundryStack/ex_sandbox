@@ -48,6 +48,7 @@ defmodule ExSandbox.Egress.LaunchPlan do
 
   alias ExSandbox.Egress.Netns
   alias ExSandbox.Egress.Policy
+  alias ExSandbox.Egress.Resolver
 
   @typedoc "Why a plan could not be built."
   @type refusal :: :no_network_confinement | :no_pool_port | :no_privilege_drop
@@ -57,10 +58,11 @@ defmodule ExSandbox.Egress.LaunchPlan do
           pidfile: String.t(),
           pasta_command: [String.t()],
           tenant_command: [String.t()],
-          pool_port: :inet.port_number()
+          pool_port: :inet.port_number(),
+          resolver: Netns.resolver()
         }
 
-  defstruct [:source_key, :pidfile, :pasta_command, :tenant_command, :pool_port]
+  defstruct [:source_key, :pidfile, :pasta_command, :tenant_command, :pool_port, :resolver]
 
   @doc """
   Builds the plan for one sandbox, or refuses.
@@ -68,6 +70,17 @@ defmodule ExSandbox.Egress.LaunchPlan do
   `tenant_command` is the fully composed confinement command — the output of
   `ExSandbox.Hardening.Linux.build_command/2` — which this rewrites to run
   under `pasta` instead of unsharing an empty namespace.
+
+  ## Options
+
+    * `:pidfile` — where `pasta` records its host-side pid.
+    * `:resolver` — `{address, port}` a sandbox may send UDP to, or `nil` for
+      none. Defaults to `ExSandbox.Egress.Resolver.resolver_address/0`.
+      ⚠️ **`nil` drops all UDP**, which includes DNS. That is default-deny and
+      not a degradation, but it is not a resolver either: pass `nil` only when
+      the sandbox is meant to have no name resolution at all.
+      ⚠️ An address that cannot be read **raises** — see the note at the call
+      site.
   """
   @spec build(Policy.source_key(), :inet.port_number(), [String.t()], keyword()) ::
           {:ok, t()} | {:error, refusal()}
@@ -90,13 +103,25 @@ defmodule ExSandbox.Egress.LaunchPlan do
       pidfile = Keyword.get(opts, :pidfile, default_pidfile(source_key))
       runas = Netns.runas_for_uid(uid)
 
+      # ⚠️ **Validated HERE, at build time, and it raises.** The address is read
+      # from configuration, so a typo in it is a deployment mistake rather than
+      # a tenant input -- and the two available wrong answers are both worse
+      # than an exception. Degrading to "no exemption" produces a sandbox with
+      # **no DNS** whose rules all installed cleanly, which is indistinguishable
+      # from one that was never given a resolver and reads as a working launch.
+      # Deferring the check to `redirect_steps/2` would raise *after* the tenant
+      # is already running, converting a configuration error into a terminated
+      # sandbox.
+      resolver = Netns.validate_resolver!(Keyword.get_lazy(opts, :resolver, &default_resolver/0))
+
       {:ok,
        %__MODULE__{
          source_key: source_key,
          pidfile: pidfile,
          pasta_command: outer ++ Netns.pasta_command(pidfile, rest, runas),
          tenant_command: inner,
-         pool_port: pool_port
+         pool_port: pool_port,
+         resolver: resolver
        }}
     else
       false -> {:error, :no_network_confinement}
@@ -199,9 +224,17 @@ defmodule ExSandbox.Egress.LaunchPlan do
   commands without having one.
   """
   @spec redirect_steps(t(), pos_integer()) :: [[String.t()]]
-  def redirect_steps(%__MODULE__{pool_port: pool_port}, holder_pid) do
-    Netns.redirect_commands(holder_pid, pool_port)
+  def redirect_steps(%__MODULE__{pool_port: pool_port, resolver: resolver}, holder_pid) do
+    Netns.redirect_commands(holder_pid, pool_port, resolver)
   end
+
+  # ⚠️ Read through `ExSandbox.Egress.Resolver` rather than from configuration
+  # directly, so the address the rule permits and the address the resolver is
+  # actually served at are **one** value. Two reads of the same config key are
+  # two things that must agree forever, and the symptom of them drifting is a
+  # sandbox whose only permitted UDP destination is not where anything is
+  # listening -- every denial check green, DNS silently dead.
+  defp default_resolver, do: Resolver.resolver_address()
 
   @doc """
   Where `pasta` records its host-side pid for this sandbox.

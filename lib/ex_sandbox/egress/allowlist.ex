@@ -230,6 +230,25 @@ defmodule ExSandbox.Egress.Allowlist do
   # exactly the access the mistake describes.
   def parse(other, _host_aliases), do: {:error, {:invalid_entries, [other]}}
 
+  @doc """
+  The class `host` would be refused for, or `nil` if it names nowhere excluded.
+
+  ⚠️ **Public because `029-FR-015`'s exclusion applies to resolved answers as
+  well as to written entries**, and the two must name the **same class for the
+  same address**. `ExSandbox.Egress.Resolver` runs every answer it is about to
+  record through this function, so a name whose zone points at `127.0.0.1`
+  produces `:loopback` at connect time exactly as writing `127.0.0.1` produces
+  `:loopback` at parse time. A second classifier would drift, and the drift
+  would show up as one surface refusing what the other permits, with no test
+  able to see both.
+
+  `host` may be an address tuple or a string; `host_aliases` has the same
+  meaning as in `parse/2`.
+  """
+  @spec classify(term(), [host_alias()]) :: class() | nil
+  def classify(host, host_aliases \\ []),
+    do: host_class(host, normalise_aliases(host_aliases))
+
   # The port is deliberately unread. A destination either is the host or is not;
   # a class that depended on the port would refuse `127.0.0.1:5432` and permit
   # `127.0.0.1:5433`.
@@ -243,14 +262,11 @@ defmodule ExSandbox.Egress.Allowlist do
   # first means aliases inherit that permissive parsing for free rather than
   # needing a spelling table nobody can keep complete.
   #
-  # ⚠️ **029 T008's built-in classes belong in this function too**, in the two
-  # marked seams below -- `:loopback`, `:rfc1918_private`, `:link_local`,
-  # `:cloud_metadata`, `:unique_local`, `:unspecified` on the address branch and
-  # the `localhost` family on the name branch. They are **absent from this
-  # tree** (T008 is unchecked in `029/tasks.md` here and no such code exists),
-  # so the seams are empty rather than reimplemented -- rebuilding them would
-  # produce a second, divergent copy and a merge that could silently keep the
-  # wrong one.
+  # ⚠️ **029 T008's built-in classes are folded in below** -- `:loopback`,
+  # `:rfc1918_private`, `:link_local`, `:cloud_metadata`, `:unique_local`,
+  # `:unspecified` on the address branch and the `localhost` family on the name
+  # branch. (An earlier revision of this comment said they were absent from the
+  # tree; they were merged in the same fold and the note outlived its subject.)
   @spec host_class(term(), %{addresses: MapSet.t(), names: MapSet.t()}) :: class() | nil
   defp host_class(host, aliases) do
     case normalise_host(host) do

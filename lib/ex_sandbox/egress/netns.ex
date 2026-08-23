@@ -336,6 +336,36 @@ defmodule ExSandbox.Egress.Netns do
       ]
   end
 
+  @doc """
+  Returns `resolver` unchanged, or raises if it is not a usable one.
+
+  ⚠️ **Exists so the refusal lands at plan-build time rather than at
+  rule-install time.** `resolver_exemption/2` also raises, but it runs *after*
+  `pasta` has started the tenant, so a bad address there terminates a running
+  sandbox instead of refusing a launch. Both raise; this one raises early, and
+  the two share `parse_resolver_address/1` so they cannot disagree about what
+  is readable.
+
+  `nil` is valid and means **no UDP destination at all** — see `udp_commands/2`
+  on why that is default-deny rather than a degradation.
+  """
+  @spec validate_resolver!(resolver()) :: resolver()
+  def validate_resolver!(nil), do: nil
+
+  def validate_resolver!({address, port} = resolver)
+      when is_integer(port) and port > 0 and port <= 65_535 do
+    case parse_resolver_address(address) do
+      {:ok, _parsed} ->
+        resolver
+
+      :error ->
+        raise ArgumentError, "resolver address is not an IP address: #{inspect(address)}"
+    end
+  end
+
+  def validate_resolver!(other),
+    do: raise(ArgumentError, "resolver must be `{address, port}` or nil, got: #{inspect(other)}")
+
   defp resolver_exemption(_holder_pid, nil), do: []
 
   defp resolver_exemption(holder_pid, {address, port})
@@ -358,6 +388,37 @@ defmodule ExSandbox.Egress.Netns do
           raise ArgumentError, "resolver address is not an IP address: #{inspect(address)}"
       end
 
+    # ⚠️ **TWO rules, because a DNS exchange is a round trip and this chain
+    # filters BOTH halves of it.** The answer leaves the resolver's socket and
+    # is therefore also `output` traffic -- with the resolver as its *source*
+    # and the tenant's ephemeral port as its destination, so the query rule
+    # cannot match it and the terminal drop does.
+    #
+    # MEASURED inside `unshare -n` with a stub nameserver on `127.0.0.1:53`,
+    # under exactly the rules this function emitted before the second one was
+    # added:
+    #
+    #     query rule only    -> query SENT, stub's reply EPERM, client timed out
+    #     + this second rule -> reply sent, "ANSWER RECEIVED (6 bytes)"
+    #     control, port 5353 -> query EPERM, still refused
+    #
+    # ⚠️ The first line is why "the datagram left" is not evidence that name
+    # resolution works. An earlier probe here asserted only `SENT` and read as
+    # a pass, while every lookup inside a sandbox was in fact timing out --
+    # which surfaces as `FR-012` denying a hostname the operator did permit.
+    #
+    # ⚠️ Narrow on purpose: source address AND source port, not `ct state
+    # established`. Conntrack would also readmit whatever else the namespace
+    # happened to have talked to, and the exemption's whole value is that it
+    # names one endpoint.
+    #
+    # ⚠️ It permits a SOURCE, so it is worth stating what a tenant could do with
+    # it: bind the resolver's address and port itself and send from there. With
+    # the default resolver that address is loopback, so such a datagram cannot
+    # leave the namespace and reaches only the acceptor. A deployment that moves
+    # the resolver to a routable address gives the tenant a way to send UDP from
+    # that source to any destination, and should weigh that against whatever it
+    # gained by moving it.
     [
       nsenter(holder_pid, [
         "nft",
@@ -374,6 +435,24 @@ defmodule ExSandbox.Egress.Netns do
         literal,
         "udp",
         "dport",
+        "#{port}",
+        "accept"
+      ]),
+      nsenter(holder_pid, [
+        "nft",
+        "add",
+        "rule",
+        "inet",
+        "filter",
+        "output",
+        "meta",
+        "l4proto",
+        "udp",
+        daddr_keyword,
+        "saddr",
+        literal,
+        "udp",
+        "sport",
         "#{port}",
         "accept"
       ])
