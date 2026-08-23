@@ -439,4 +439,148 @@ defmodule ExSandbox.Egress.AllowlistTest do
                Allowlist.parse(["internal.corp.example:443"])
     end
   end
+
+  describe "the refusal renders (029-FR-014, Q16 / D104)" do
+    test "🔒 every class has a sentence, and it is not the atom" do
+      # ⚠️ **A `case` over `@type class()`'s members, deliberately exhaustive.**
+      # `describe_class/1` has a clause per class and no catch-all, so a class
+      # added to `parse/2` without a sentence raises `FunctionClauseError` here
+      # rather than reaching an operator as a crash mid-provision. That is the
+      # whole guard: this list and the `@type` must stay equal, and this is
+      # what notices when they do not.
+      for class <- [
+            :loopback,
+            :rfc1918_private,
+            :link_local,
+            :cloud_metadata,
+            :unique_local,
+            :unspecified,
+            :host_alias
+          ] do
+        sentence = Allowlist.describe_class(class)
+
+        assert sentence != "", "#{inspect(class)} has no sentence"
+
+        refute sentence == inspect(class),
+               """
+               #{inspect(class)}'s "sentence" is the atom printed back. The class
+               exists so a refusal is actionable without reading `allowlist.ex`;
+               echoing the atom is that read, one indirection later.
+               """
+      end
+    end
+
+    test "🔒 a rendered refusal names the offending entry AND its class" do
+      # ⚠️ **This is the assertion Q16 says every previous instance of this
+      # defect lacked.** `assert {:error, {:refused_entries, _}}` is true of a
+      # renderer that prints "invalid configuration" and drops both halves.
+      assert {:error, refusal} = Allowlist.parse(["169.254.169.254:80"])
+
+      rendered = Allowlist.describe(refusal)
+
+      assert rendered =~ "169.254.169.254:80",
+             "the refusal does not say WHICH entry was refused: #{rendered}"
+
+      assert rendered =~ "cloud_metadata",
+             """
+             The refusal does not carry the class atom, so an operator cannot
+             match what they were told against this module's own table, and a
+             `:cloud_metadata` refusal is indistinguishable from a
+             `:link_local` one -- which is the exact distinction the class was
+             separated out to make.
+
+             Rendered: #{rendered}
+             """
+
+      assert rendered =~ "instance-metadata",
+             """
+             The class atom is present and nothing says what it means. An
+             operator who typed the instance-credentials endpoint learns that
+             the platform knows what they reached for, or the atom is a token
+             they have to go and look up -- which is `FR-014`'s "without
+             reading code" failing by a different route.
+
+             Rendered: #{rendered}
+             """
+    end
+
+    test "🔒 each class renders distinguishably from every other" do
+      # A renderer that says "refused" seven ways that read alike has carried
+      # the class as far as the string and no further.
+      entries = [
+        {"127.0.0.1:80", :loopback},
+        {"10.0.0.5:443", :rfc1918_private},
+        {"169.254.1.1:80", :link_local},
+        {"169.254.169.254:80", :cloud_metadata},
+        {"fc00::1:443", :unique_local},
+        {"0.0.0.0:8080", :unspecified}
+      ]
+
+      rendered =
+        Map.new(entries, fn {entry, class} ->
+          assert {:error, {:refused_entries, [{^entry, ^class}]}} = Allowlist.parse([entry])
+          {class, Allowlist.describe({:refused_entries, [{entry, class}]})}
+        end)
+
+      assert map_size(Map.new(rendered, fn {class, text} -> {text, class} end)) ==
+               map_size(rendered),
+             "two classes render to the same sentence: #{inspect(rendered)}"
+
+      for {class, text} <- rendered do
+        assert text =~ to_string(class), "#{inspect(class)} is missing from #{text}"
+      end
+    end
+
+    test "every refused entry is rendered, not the first" do
+      assert {:error, refusal} =
+               Allowlist.parse(["127.0.0.1:80", "10.0.0.5:443", "169.254.169.254:80"])
+
+      rendered = Allowlist.describe(refusal)
+
+      for entry <- ["127.0.0.1:80", "10.0.0.5:443", "169.254.169.254:80"] do
+        assert rendered =~ entry, "#{entry} is missing from #{rendered}"
+      end
+
+      for class <- ~w(loopback rfc1918_private cloud_metadata) do
+        assert rendered =~ class, "#{class} is missing from #{rendered}"
+      end
+    end
+
+    test "a host alias renders as the host rather than as a private address" do
+      # The class that only fires when a caller supplies aliases, and the one
+      # whose sentence differs most from the built-in it overlaps.
+      assert {:error, refusal} = Allowlist.parse(["10.0.0.1:443"], ["10.0.0.1"])
+
+      rendered = Allowlist.describe(refusal)
+
+      assert rendered =~ "host_alias"
+      assert rendered =~ "10.0.0.1:443"
+      refute rendered =~ "rfc1918_private"
+    end
+
+    test "an already-parsed tuple entry is rendered in the written form" do
+      # An operator has no `{{127, 0, 0, 1}, 80}` in their configuration to go
+      # and edit; they have a destination. Rendering the tuple would be honest
+      # and useless.
+      assert Allowlist.describe({:refused_entries, [{{{127, 0, 0, 1}, 80}, :loopback}]}) =~
+               "127.0.0.1:80"
+
+      assert Allowlist.describe({:refused_entries, [{{"10.0.0.5", :any_port}, :rfc1918_private}]}) =~
+               "10.0.0.5:*"
+    end
+
+    test "an unreadable entry renders as unreadable, never as refused" do
+      # ⚠️ The two errors stay two sentences at the surface as well as in the
+      # term. An operator told "declined" about a typo re-reads a policy table;
+      # an operator told "could not read" re-reads their spelling.
+      assert {:error, refusal} = Allowlist.parse(["10.0.0.5"])
+
+      rendered = Allowlist.describe(refusal)
+
+      assert rendered =~ "10.0.0.5"
+      assert rendered =~ "could not be read"
+      refute rendered =~ "declined"
+      refute rendered =~ "rfc1918_private"
+    end
+  end
 end
