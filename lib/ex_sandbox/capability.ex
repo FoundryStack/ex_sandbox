@@ -103,9 +103,44 @@ defmodule ExSandbox.Capability do
     :time_budget
   ]
 
+  # ⚠️ **The coarse names, and the ONLY ones a mechanism is gated on by default.**
+  #
+  # `@known` serves two purposes that diverged the moment `014` T004 landed: it
+  # is the reporting vocabulary `FR-013a` requires, and it is the fallback
+  # `ExSandbox.required_capabilities/1` uses for a mechanism that does not
+  # export `required_capabilities/0`. Those are not the same list any more.
+  #
+  # MEASURED consequence of conflating them: `:time_budget` reports
+  # `unavailable` on **every** host by design -- it is not a host fact, see
+  # `time_budget_not_a_host_capability/1` -- so a fallback containing it can
+  # never be satisfied anywhere. That turns an optional callback into a
+  # mandatory one silently, and the symptom is
+  # `{:error, {:capability_unavailable, [:time_budget]}}`, which names a
+  # capability the operator cannot install rather than the callback the
+  # mechanism forgot to write.
+  #
+  # So the gating default stays the pre-`014` set. Widening the *vocabulary*
+  # must not widen what refuses a launch.
+  @gating_defaults [
+    :resource_limits,
+    :filesystem_confinement,
+    :privilege_separation,
+    :network_restriction,
+    :disk_quota
+  ]
+
   @doc "Every capability this library knows how to check."
   @spec known() :: [name()]
   def known, do: @known
+
+  @doc """
+  The capabilities a mechanism is gated on when it declares none.
+
+  Deliberately narrower than `known/0` -- see the note above it. A name that is
+  `unavailable` on every host belongs in the report and never in the gate.
+  """
+  @spec gating_defaults() :: [name()]
+  def gating_defaults, do: @gating_defaults
 
   @doc """
   Checks one capability against the running host.
