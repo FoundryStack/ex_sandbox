@@ -49,6 +49,72 @@ defmodule ExSandbox.Egress.Netns do
   elsewhere. A `prerouting` rule would install cleanly, list correctly, and
   match nothing.
 
+  ## Why the UDP drop is a `filter` chain and not another `nat` rule
+
+  The TCP redirect lives in `nat`/`output` because it *translates* a destination.
+  The UDP rule does not translate anything — it **refuses** — and a `drop` does
+  not belong in a `nat` chain merely because that is where the neighbouring rule
+  was. `nat` chains are consulted by conntrack for the **first packet of a flow
+  only**; a filtering verdict placed there is evaluated on a schedule that has
+  nothing to do with how often the traffic it is refusing occurs. So the drop
+  gets its own base chain of `type filter`, and the two hooks stay honest about
+  what each is for.
+
+  ⚠️ **The chain's policy is `accept`, and that is not a widening.** A `drop`
+  policy on an `output` filter chain refuses *everything*, TCP included, and the
+  TCP path — which is policed by the redirect, not by this chain — would go with
+  it. Default-deny for UDP is expressed by the terminal `meta l4proto udp drop`
+  below, which nothing after it can reach past.
+
+  ⚠️ **Family `inet`, not `ip`.** The redirect's table is `ip` (IPv4 only), which
+  is defensible for a translation whose target is an IPv4 acceptor. A *refusal*
+  scoped to IPv4 would leave the identical IPv6 datagram to walk out, which is
+  the shape `FR-015` calls "a control that reads as the guarantee it is not".
+  `inet` covers both in one chain. It also fails closed if a kernel will not
+  build it: `run_steps/1` halts on a non-zero `nft` exit and
+  `police_or_terminate/3` terminates the tenant, so an unsupported table stops
+  the launch rather than passing it unpoliced.
+
+  ## Measured, on `docker-isolation:latest` (nftables v1.1.3), 2026-08-23
+
+  Every command below installs (`rc=0`), and `nft` folds the redundant
+  `meta l4proto udp` into the `udp dport` match when it lists the exemption
+  back:
+
+      table inet filter {
+        chain output {
+          type filter hook output priority filter; policy accept;
+          ip daddr 10.0.0.53 udp dport 53 accept
+          meta l4proto udp drop
+        }
+      }
+
+  ⚠️ **And the rule was measured by attempting the operation, not by reading
+  the ruleset** (`FR-016`). In a namespace with a real default route — without
+  one every result is `ENETUNREACH` before the hook runs, and *isolated* reads
+  exactly like *policed*:
+
+      BEFORE            udp 8.8.8.8:53      -> SENT        <- the hole
+                        udp 10.0.0.1:53     -> SENT
+      no resolver       udp 8.8.8.8:53      -> EPERM
+                        udp 10.0.0.1:53     -> EPERM
+                        udp 127.0.0.1:53    -> EPERM
+      resolver 10.0.0.53:53
+                        udp 10.0.0.53:53    -> SENT        <- the sole destination
+                        udp 10.0.0.53:5353  -> EPERM
+                        udp 8.8.8.8:53      -> EPERM
+      TCP control       tcp 10.0.0.1:80     -> timeout, NOT EPERM
+
+  ⚠️ The TCP line is the one that makes the rest non-vacuous: a chain whose
+  *policy* were `drop` would refuse TCP too, and every UDP line above would look
+  identical. A timeout there is the correct non-policy outcome for a route with
+  nothing behind it.
+
+  ⚠️ **This was a hand-built namespace, not `pasta`'s, and the commands were run
+  directly rather than through `LaunchPlan`.** It establishes the grammar and
+  the kernel's behaviour; it does **not** establish that the policed launch path
+  installs them. That is `029 T014`'s checkpoint.
+
   ## What this module deliberately does not do
 
   It builds commands; it does not run them. The launch path composes them, and
@@ -105,8 +171,16 @@ defmodule ExSandbox.Egress.Netns do
   # path it looked for. See `pasta_path/0`.
   @pasta_fallback "/usr/bin/pasta"
 
-  @spec redirect_commands(pos_integer(), :inet.port_number()) :: [[String.t()]]
-  def redirect_commands(holder_pid, pool_port)
+  @typedoc """
+  The one UDP destination a sandbox may reach, or `nil` for none.
+
+  ⚠️ An **address**, never a hostname — an `nft` rule cannot resolve a name, and
+  the thing that would resolve it is the resolver this names.
+  """
+  @type resolver :: {String.t() | :inet.ip_address(), :inet.port_number()} | nil
+
+  @spec redirect_commands(pos_integer(), :inet.port_number(), resolver()) :: [[String.t()]]
+  def redirect_commands(holder_pid, pool_port, resolver \\ nil)
       when is_integer(holder_pid) and holder_pid > 0 do
     [
       nsenter(holder_pid, ["nft", "add", "table", "ip", "nat"]),
@@ -187,8 +261,143 @@ defmodule ExSandbox.Egress.Netns do
         "to",
         ":#{pool_port}"
       ])
+    ] ++ udp_commands(holder_pid, resolver)
+  end
+
+  # ⚠️ **This closes a measured hole, not a theoretical one.** Phase 0's
+  # conformance run recorded that "a UDP datagram sent from inside the sandbox to
+  # 8.8.8.8:53 was ANSWERED — it left the namespace unpoliced and the reply came
+  # back". The **same allowlist refuses that destination over TCP**, so until
+  # this rule exists a tenant bypasses the entire enforcement point by choosing a
+  # transport, over the textbook exfiltration port.
+  #
+  # ⚠️ **Resolver-as-sole-destination, ruled, not chosen here.** `FR-013` (as
+  # amended by D34 defect 5) permits either policing UDP the way TCP is policed
+  # or permitting UDP to a platform resolver as its *sole* destination and
+  # dropping the rest. The project owner ruled the second (029 T011). It is
+  # default-deny; the allowlist is **hostname**-based while UDP is
+  # address-based, so "allowlist match for UDP" is not a well-defined question;
+  # and DNS is the only legitimate UDP need of a build sandbox.
+  #
+  # ⚠️ **`nil` drops *all* UDP, and that is the point.** Default-deny includes
+  # the unconfigured case. The resolver itself is Phase 2's first deliverable
+  # (029 T015); until something supplies its address the correct behaviour is
+  # that no UDP leaves, not that UDP is waved through until the resolver
+  # arrives. The address arrives as **data** for the same reason the host-alias
+  # list does — this module must not acquire an opinion about who runs the
+  # resolver.
+  #
+  # ⚠️ **The resolver's address MAY be a host-side one, and that does not
+  # contradict `FR-015`.** It will read as a contradiction, because `FR-015`
+  # forbids reaching the host and the platform's resolver plausibly runs there.
+  # D34 (defect 4) settles it by naming the surfaces: **`FR-015` governs
+  # allowlist entries** — what an operator or tenant may write down, and what a
+  # resolver may answer — while nftables rules the platform itself constructs,
+  # which a tenant cannot author, are governed by `FR-032`. A
+  # platform-constructed rule naming a host-side address is not an allowlist
+  # entry naming one. So no host-alias check belongs here; the exclusion lives
+  # in `ExSandbox.Egress.Allowlist`, where the tenant-authored surface is.
+  defp udp_commands(holder_pid, resolver) do
+    [
+      nsenter(holder_pid, ["nft", "add", "table", "inet", "filter"]),
+      nsenter(holder_pid, [
+        "nft",
+        "add",
+        "chain",
+        "inet",
+        "filter",
+        "output",
+        "{ type filter hook output priority 0 ; policy accept ; }"
+      ])
+    ] ++
+      resolver_exemption(holder_pid, resolver) ++
+      [
+        # ⚠️ LAST, and terminal. `nft` evaluates in order, so this must come
+        # after the resolver exemption or the exemption never runs -- the same
+        # ordering trap the acceptor's `meta mark ... return` documents above.
+        #
+        # ⚠️ `meta l4proto udp`, not a bare `udp`, for the reason measured for
+        # the TCP redirect above: a bare protocol name is not valid `nft`
+        # grammar and the rule is rejected at install time. And no port
+        # predicate -- this refuses UDP as such, so a tenant cannot pick an
+        # unlisted port and walk past it.
+        nsenter(holder_pid, [
+          "nft",
+          "add",
+          "rule",
+          "inet",
+          "filter",
+          "output",
+          "meta",
+          "l4proto",
+          "udp",
+          "drop"
+        ])
+      ]
+  end
+
+  defp resolver_exemption(_holder_pid, nil), do: []
+
+  defp resolver_exemption(holder_pid, {address, port})
+       when is_integer(port) and port > 0 and port <= 65_535 do
+    # ⚠️ Refused loudly rather than degraded to "no exemption". A resolver whose
+    # address cannot be read is a misconfiguration, and silently emitting only
+    # the drop would produce a sandbox with no DNS whose rules all installed
+    # cleanly -- indistinguishable from one that was never given a resolver.
+    # Raising halts the launch, and `police_or_terminate/3` terminates a tenant
+    # that could not be policed.
+    {daddr_keyword, literal} =
+      case parse_resolver_address(address) do
+        {:ok, {_, _, _, _} = parsed} ->
+          {"ip", to_string(:inet.ntoa(parsed))}
+
+        {:ok, parsed} ->
+          {"ip6", to_string(:inet.ntoa(parsed))}
+
+        :error ->
+          raise ArgumentError, "resolver address is not an IP address: #{inspect(address)}"
+      end
+
+    [
+      nsenter(holder_pid, [
+        "nft",
+        "add",
+        "rule",
+        "inet",
+        "filter",
+        "output",
+        "meta",
+        "l4proto",
+        "udp",
+        daddr_keyword,
+        "daddr",
+        literal,
+        "udp",
+        "dport",
+        "#{port}",
+        "accept"
+      ])
     ]
   end
+
+  defp resolver_exemption(_holder_pid, other),
+    do: raise(ArgumentError, "resolver must be `{address, port}` or nil, got: #{inspect(other)}")
+
+  defp parse_resolver_address(address) when is_tuple(address) do
+    case :inet.ntoa(address) do
+      {:error, _} -> :error
+      _ -> {:ok, address}
+    end
+  end
+
+  defp parse_resolver_address(address) when is_binary(address) do
+    case :inet.parse_address(String.to_charlist(address)) do
+      {:ok, parsed} -> {:ok, parsed}
+      {:error, _} -> :error
+    end
+  end
+
+  defp parse_resolver_address(_), do: :error
 
   @doc """
   The `SO_MARK` value the acceptor sets on its own upstream connections.
