@@ -148,4 +148,154 @@ defmodule ExSandbox.Egress.AllowlistTest do
       refute Policy.permits?(allowed, {{93, 184, 216, 34}, 443})
     end
   end
+
+  describe "addresses a sandbox may not be pointed at are refused by class (029-FR-015)" do
+    # ⚠️ Every row asserts the **class**, never merely that the entry was
+    # refused. A test asserting `{:error, _}` would pass against a parser that
+    # simply failed to *read* `169.254.169.254:80` -- which is the outcome
+    # `FR-014` exists to rule out: the operator is told "invalid", re-checks
+    # their spelling, finds it correct, and files a bug against the parser.
+    refusals = [
+      # loopback, in every spelling that reaches it
+      {"127.0.0.1:8080", :loopback},
+      {"127.255.255.254:80", :loopback},
+      {"[::1]:443", :loopback},
+      {"::1:443", :loopback},
+      {"localhost:5432", :loopback},
+      {"LocalHost:5432", :loopback},
+      {"ip6-localhost:80", :loopback},
+      # ⚠️ `:inet.parse_address/1` normalises all three of these to
+      # `{127, 0, 0, 1}`, and so does glibc. A dotted-quad-shaped check would
+      # let every one of them through as a "hostname".
+      {"127.1:80", :loopback},
+      {"2130706433:80", :loopback},
+      {"0x7f000001:80", :loopback},
+      # ⚠️ No `127` anywhere in the tuple: `::ffff:127.0.0.1` parses to
+      # `{0, 0, 0, 0, 0, 65535, 32512, 1}`, so every IPv4 clause misses it.
+      {"::ffff:127.0.0.1:80", :loopback},
+
+      # the operator's own private network
+      {"10.0.0.5:443", :rfc1918_private},
+      {"172.16.0.1:443", :rfc1918_private},
+      {"172.31.255.254:443", :rfc1918_private},
+      {"192.168.1.1:443", :rfc1918_private},
+      {"::ffff:10.0.0.1:443", :rfc1918_private},
+
+      # link-local, and the one link-local address that earns its own name
+      {"169.254.1.1:80", :link_local},
+      {"fe80::1:80", :link_local},
+      {"febf::1:80", :link_local},
+      {"169.254.169.254:80", :cloud_metadata},
+      {"169.254.169.254:*", :cloud_metadata},
+
+      # IPv6 unique-local
+      {"fc00::1:443", :unique_local},
+      {"fd12:3456::1:443", :unique_local},
+      {"[fdff::1]:443", :unique_local},
+
+      # ⚠️ `0.0.0.0` is not "nowhere" -- Linux connect(2) to it lands on
+      # `127.0.0.1`. A loopback spelling that contains no `127`.
+      {"0.0.0.0:8080", :unspecified},
+      {"0.1.2.3:80", :unspecified},
+      {"[::]:8080", :unspecified}
+    ]
+
+    for {entry, class} <- refusals do
+      test "#{entry} is refused as #{class}" do
+        assert {:error, {:refused_entries, [{unquote(entry), unquote(class)}]}} =
+                 Allowlist.parse([unquote(entry)])
+      end
+    end
+
+    test "the refusal names every refused entry, not just the first" do
+      # Same bargain as the unreadable case above: an operator fixing one entry
+      # per deploy is an operator who stops reading the error.
+      assert {:error, {:refused_entries, refused}} =
+               Allowlist.parse([
+                 "api.example.com:443",
+                 "127.0.0.1:80",
+                 "10.0.0.5:443",
+                 "169.254.169.254:80"
+               ])
+
+      assert refused == [
+               {"127.0.0.1:80", :loopback},
+               {"10.0.0.5:443", :rfc1918_private},
+               {"169.254.169.254:80", :cloud_metadata}
+             ]
+    end
+
+    test "a refusal is a different error from an unreadable entry" do
+      # ⚠️ The distinction the whole class exists to draw. Collapsing both into
+      # `:invalid_entries` makes a deliberate policy decision indistinguishable
+      # from a typo.
+      assert {:error, {:invalid_entries, _}} = Allowlist.parse(["127.0.0.1"])
+      assert {:error, {:refused_entries, _}} = Allowlist.parse(["127.0.0.1:80"])
+    end
+
+    test "an already-parsed tuple destination is classified too" do
+      # ⚠️ The tuple form bypasses `parse_entry/1`'s string path entirely, so a
+      # guard wired only into string parsing lets `{{127, 0, 0, 1}, 80}`
+      # straight through -- and this is the form `Policy` actually compares
+      # against.
+      assert {:error, {:refused_entries, [{{{127, 0, 0, 1}, 80}, :loopback}]}} =
+               Allowlist.parse([{{127, 0, 0, 1}, 80}])
+
+      assert {:error, {:refused_entries, [{{"10.0.0.5", :any_port}, :rfc1918_private}]}} =
+               Allowlist.parse([{"10.0.0.5", :any_port}])
+    end
+
+    test "unreadable entries are reported before refused ones" do
+      # ⚠️ Forced, not preferred: an entry that did not parse has no address to
+      # classify. Pinned so the ordering is a decision on the record rather than
+      # an accident of the reduce.
+      assert {:error, {:invalid_entries, ["no-port"]}} =
+               Allowlist.parse(["no-port", "127.0.0.1:80"])
+    end
+  end
+
+  describe "destinations outside the refused classes still parse (029-FR-015)" do
+    # ⚠️ The guard's other failure mode, and the quieter one. A classifier with
+    # an off-by-one range refuses somewhere legitimate, and the operator is told
+    # their correct configuration names a private address.
+    permitted = [
+      "8.8.8.8:53",
+      "93.184.216.34:443",
+      # ⚠️ Just outside `172.16/12` on both sides. A naive `172.*` rule -- or
+      # `b >= 16 and b <= 32` -- refuses one of these.
+      "172.15.255.255:443",
+      "172.32.0.1:443",
+      # Just outside `169.254/16`.
+      "169.253.0.1:80",
+      "169.255.0.1:80",
+      # Just outside `127/8` and `0/8`.
+      "126.255.255.255:80",
+      "128.0.0.1:80",
+      "1.0.0.1:80",
+      # Just outside `fe80::/10` and `fc00::/7`.
+      "[2001:db8::1]:443",
+      "[fec0::1]:443",
+      "[fb00::1]:443",
+      "[fe00::1]:443",
+      # A hostname that merely *contains* a refused name is not that name.
+      "localhost.example.com:443",
+      "notlocalhost:443",
+      "my-10.0.0.5-box.example:443"
+    ]
+
+    for entry <- permitted do
+      test "#{entry} parses" do
+        assert {:ok, [_destination]} = Allowlist.parse([unquote(entry)])
+      end
+    end
+
+    test "a hostname that resolves inward is NOT caught here" do
+      # ⚠️ Deliberate, and stated so it is not mistaken for a gap. This guard is
+      # parse-time and static; it does not resolve. An entry naming a host whose
+      # A record is `10.0.0.5` parses clean. Catching that is `FR-015`'s
+      # "resolved answers" half, which is neither this task nor this module.
+      assert {:ok, [{"internal.corp.example", 443}]} =
+               Allowlist.parse(["internal.corp.example:443"])
+    end
+  end
 end
