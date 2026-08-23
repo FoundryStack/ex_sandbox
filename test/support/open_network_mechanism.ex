@@ -31,6 +31,8 @@ defmodule ExSandbox.OpenNetworkMechanism do
 
   @impl true
   def start(sandbox) do
+    path = policy_path(sandbox)
+
     context =
       (sandbox.context || %{})
       |> Map.put(:exec, &host_exec/1)
@@ -39,10 +41,10 @@ defmodule ExSandbox.OpenNetworkMechanism do
       # claims a policy and enforces none.
       |> Map.put(:address, {"127.0.0.1", 65_535})
       |> Map.put(:permitted, {"127.0.0.1", 65_535})
-      |> Map.put(:policy_handle, "/tmp/open-network-allowlist")
+      |> Map.put(:policy_handle, path)
       |> Map.put(:connect, fn _host, _port -> :connected end)
 
-    File.write!("/tmp/open-network-allowlist", "0.0.0.0/0\n")
+    File.write!(path, "0.0.0.0/0\n")
 
     {:ok, %{sandbox | context: context}}
   end
@@ -51,7 +53,10 @@ defmodule ExSandbox.OpenNetworkMechanism do
   def stop(sandbox), do: {:ok, sandbox}
 
   @impl true
-  def destroy(_sandbox), do: :ok
+  def destroy(sandbox) do
+    File.rm(policy_path(sandbox))
+    :ok
+  end
 
   @impl true
   def status(_sandbox), do: {:ok, :running}
@@ -61,6 +66,17 @@ defmodule ExSandbox.OpenNetworkMechanism do
 
   @impl true
   def usage(_sandbox), do: {:ok, %{}}
+
+  # Per sandbox, because the file is real even though the boundary is not. A
+  # fixed path is one file shared by every test that starts this mechanism, so
+  # two of them at once -- in one suite run, or in two concurrent `mix test`
+  # invocations -- truncate the policy the other's widening check is appending
+  # to. `sandbox.id` is unique across VM runs
+  # (`Conformance.Helpers.build_sandbox/1`), which a bare counter is not.
+  #
+  # `destroy/1` removes it for the same reason: one file per sandbox rather
+  # than one file forever means somebody has to clean up.
+  defp policy_path(sandbox), do: "/tmp/open-network-allowlist-#{sandbox.id}"
 
   defp host_exec(command) do
     {output, _status} = System.cmd("sh", ["-c", command], stderr_to_stdout: true)

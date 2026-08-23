@@ -36,10 +36,6 @@ defmodule ExSandbox.EditablePolicyMechanism do
   """
   @behaviour ExSandbox.Mechanism
 
-  # Inside the "sandbox", by construction: the whole defect is that the policy
-  # is configured *in* the confined space rather than enforced *around* it.
-  @policy_path "/tmp/ex-sandbox-editable-allowlist"
-
   # The one destination the environment permits. Reachable, and reachable for a
   # real reason -- the suite's permitted-direction check must pass honestly here.
   @permitted {"127.0.0.1", 9}
@@ -52,16 +48,18 @@ defmodule ExSandbox.EditablePolicyMechanism do
 
   @impl true
   def start(sandbox) do
+    path = policy_path(sandbox)
+
     # A real allowlist, written at start. Default-deny: only what is listed.
-    File.write!(@policy_path, "127.0.0.1/32\n")
+    File.write!(path, "127.0.0.1/32\n")
 
     context =
       (sandbox.context || %{})
       |> Map.put(:exec, &host_exec/1)
       |> Map.put(:address, {"127.0.0.1", unique_port(sandbox)})
       |> Map.put(:permitted, @permitted)
-      |> Map.put(:policy_handle, @policy_path)
-      |> Map.put(:connect, &check_permitted/2)
+      |> Map.put(:policy_handle, path)
+      |> Map.put(:connect, &check_permitted(path, &1, &2))
 
     {:ok, %{sandbox | context: context}}
   end
@@ -70,8 +68,8 @@ defmodule ExSandbox.EditablePolicyMechanism do
   def stop(sandbox), do: {:ok, sandbox}
 
   @impl true
-  def destroy(_sandbox) do
-    File.rm(@policy_path)
+  def destroy(sandbox) do
+    File.rm(policy_path(sandbox))
     :ok
   end
 
@@ -88,8 +86,8 @@ defmodule ExSandbox.EditablePolicyMechanism do
   # destination connects; everything else is refused. This is what makes the
   # fixture dangerous rather than a strawman: the boundary really does hold
   # against every connection the suite attempts.
-  defp check_permitted(host, port) do
-    allowed = File.read!(@policy_path)
+  defp check_permitted(policy_path, host, port) do
+    allowed = File.read!(policy_path)
 
     cond do
       # `127.0.0.1/32` is the only entry until tenant code appends. Matched by
@@ -99,6 +97,18 @@ defmodule ExSandbox.EditablePolicyMechanism do
       true -> :refused
     end
   end
+
+  # Inside the "sandbox", by construction: the whole defect is that the policy
+  # is configured *in* the confined space rather than enforced *around* it.
+  #
+  # Distinct per sandbox for the same reason as `unique_port/1` below. A fixed
+  # path is one file shared by every test that starts this mechanism, so a
+  # second test's `start` resets the allowlist the first has just widened, and
+  # its `destroy` deletes the file the first is still reading. `sandbox.id` is
+  # unique across VM runs (`Conformance.Helpers.build_sandbox/1`), so two
+  # concurrent `mix test` invocations stay apart too, which a bare counter
+  # would not.
+  defp policy_path(sandbox), do: "/tmp/ex-sandbox-editable-allowlist-#{sandbox.id}"
 
   # Distinct per sandbox so the peer-crossing check has a real address to aim
   # at. Nothing listens there, so the attempt is refused -- correctly, because
