@@ -131,6 +131,104 @@ defmodule ExSandbox.CapabilityTest do
     end
   end
 
+  describe "agreement with the Darwin backend (014 T023)" do
+    # ⚠️ The same guard as the Linux one above, pointed at the other backend —
+    # and it exists for the same recorded reason. `005` T060c caught the Linux
+    # clauses disagreeing with `Hardening.Linux` *on macOS*, and the symptom was
+    # never "one probe is wrong": it was a boundary reported present on a host
+    # that had not built it.
+    #
+    # `Capability.check/1` is what `ExSandbox.provision/2` consults; the
+    # backend's map is what the launch is built from. A split verdict means one
+    # gate admits what the other refuses, and which you hit depends on when you
+    # asked.
+    #
+    # ⚠️ ONE name is expected to diverge, and expecting it is the point.
+    # `:filesystem_confinement` means different things to the two modules and
+    # the difference is load-bearing:
+    #
+    #   * `Hardening.Darwin` reports `true`: its `sandbox-exec` profile does
+    #     confine where the target may write, and T016 verifies that by
+    #     breaching it.
+    #   * `Capability` reports `false`: that name is in `gating_defaults/0` AND
+    #     in `Mechanism.Beam.required_capabilities/0`, where its own comment
+    #     says it means *the mount namespace*. Flipping it on macOS would make
+    #     `ExSandbox.provision/2` admit a BEAM sandbox on a host with no
+    #     `bwrap`, which fails at launch — a fail-open change to the gate, not a
+    #     reporting change.
+    #
+    # That asymmetry is why `014` T020 names three capabilities and not four:
+    # `:memory_cap`, `:cpu_cap` and `:process_separation` are report-only here,
+    # so flipping them on measured evidence changes what is *said* and nothing
+    # about what is *admitted*.
+    #
+    # Asserted as an exact set rather than skipped, so it cannot rot: making the
+    # two agree on this name — in either direction — turns this red and asks for
+    # the decision to be made deliberately.
+    @documented_divergences [:filesystem_confinement]
+
+    @tag :darwin_hardening
+    test "every shared capability agrees, apart from the documented divergence" do
+      probed = ExSandbox.Hardening.Darwin.capabilities()
+
+      shared =
+        for name <- Capability.known(),
+            Map.has_key?(probed, name),
+            do: {name, capability: Capability.check(name).available?, darwin: probed[name]}
+
+      disagreements =
+        for {name, capability: mine, darwin: theirs} <- shared, mine != theirs, do: name
+
+      assert Enum.sort(disagreements) == Enum.sort(@documented_divergences),
+             """
+             `Capability.check/1` and `Hardening.Darwin.capabilities/0` disagree on \
+             #{inspect(Enum.sort(disagreements))}; the documented set is \
+             #{inspect(Enum.sort(@documented_divergences))}.
+
+             #{inspect(shared, pretty: true)}
+
+             Both answer "can this host enforce it". A split verdict that is not in the \
+             documented list means one of the two gates admits what the other refuses.
+
+             If a divergence became correct, add it to `@documented_divergences` with the \
+             reason. If one disappeared, remove it. Do not widen the list to make a run green.
+             """
+    end
+
+    @tag :darwin_hardening
+    test "the agreement is not vacuous: shared names are actually enforced here" do
+      # ⚠️ Two modules that both answered `false` everywhere would satisfy the
+      # test above while establishing nothing. This requires the agreement to be
+      # over at least one `true`, which on this host it is — T020 flipped three
+      # names on T016/T017's evidence.
+      probed = ExSandbox.Hardening.Darwin.capabilities()
+
+      agreed_true =
+        for name <- Capability.known(),
+            Map.fetch(probed, name) == {:ok, true},
+            Capability.check(name).available?,
+            do: name
+
+      assert :memory_cap in agreed_true
+      assert :cpu_cap in agreed_true
+      assert :process_separation in agreed_true
+    end
+
+    @tag :darwin_hardening
+    test "the divergence is exactly the one documented, in the direction documented" do
+      # Named individually so the failure says which half moved.
+      refute Capability.check(:filesystem_confinement).available?,
+             "`Capability` now reports :filesystem_confinement available on macOS. That " <>
+               "name gates `Mechanism.Beam`, which composes `bwrap` — so this admits a " <>
+               "sandbox the launch cannot build. If Phase 5 changed what the mechanism " <>
+               "composes here, change the gate deliberately and update the guard above."
+
+      assert ExSandbox.Hardening.Darwin.capabilities()[:filesystem_confinement],
+             "the Darwin backend no longer reports :filesystem_confinement; the divergence " <>
+               "recorded above has gone away and the documented set should shrink"
+    end
+  end
+
   describe "an unknown name" do
     test "is reported, not raised" do
       report = Capability.check(:no_such_capability)

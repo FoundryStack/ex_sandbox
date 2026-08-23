@@ -151,28 +151,72 @@ defmodule ExSandbox.Hardening.DarwinTagTest do
     end
   end
 
-  describe "the Darwin caps, before any backend exists" do
+  describe "the Darwin caps, now that a backend exists (014 T020)" do
+    # ⚠️ This block was the T020 gate, and it has been passed through rather
+    # than deleted. It used to require **every** decomposed capability to report
+    # `unavailable` on macOS, with a note saying that flipping one was meant to
+    # cost a decision. That decision was made: `014` Phase 3 built
+    # `ExSandbox.Hardening.Darwin`, Phase 4 observed the breaches, and
+    # `ExSandbox.Hardening.DarwinOrderingTest` supplies the evidence `FR-014a`
+    # demands — R9b's misordered composition exiting 0 with 300 MB allocated
+    # beside the backend's own composition killing the same binary at 137.
+    #
+    # What replaces it is the same gate pointed the other way: the three
+    # host-enforced names must now be `available`, and the two that were NOT
+    # flipped must still not be. Moving any of these four still costs a decision.
+
     @tag :darwin_hardening
-    test "every decomposed capability reports unavailable" do
-      # ⚠️ TO WHOEVER IMPLEMENTS `014` T020: this test is the gate, and editing
-      # it is meant to cost you a decision.
-      #
-      # Flipping a name here to `available` is the claim `FR-014a` governs, and
-      # the evidence for it is T017 passing -- the ordering regression test that
-      # shows the misordered composition allocating 300 MB under a 100 MB cap
-      # and the backend's own composition killing it at 137. Until that test
-      # exists and passes, a Darwin `available` is a cap nobody has watched stop
-      # a breach, which is the state this whole slice exists to remove.
-      for name <- @decomposed do
+    test "the three host-enforced names report available, on T016/T017's evidence" do
+      for name <- @derived_from_resource_limits do
         report = Capability.check(name)
 
-        refute report.available?,
-               "#{inspect(name)} reports available on macOS. If T017 now passes, update " <>
-                 "this test deliberately; if it does not, this is the fail-open claim " <>
-                 "FR-014a forbids."
+        assert report.available?,
+               """
+               #{inspect(name)} reports UNAVAILABLE on macOS.
 
-        assert is_binary(report.detail) and report.detail != ""
+               `014` T020 flipped it on measured evidence, and it is derived from \
+               `ExSandbox.Hardening.Darwin.capabilities/0` -- whose probe renders a real \
+               profile and runs the full composition. A `false` here means that probe \
+               failed on this host, so read it as "the backend cannot compose", not as a \
+               reporting bug: #{report.detail}
+               """
       end
+    end
+
+    @tag :darwin_hardening
+    test ":time_budget is NOT flipped with them, and this is deliberate" do
+      # ⚠️ Phase 3 Finding C. `:time_budget` is not a host fact: `FR-014b` puts
+      # its enforcement in the supervising BEAM, so no host provides or
+      # withholds it, and `gating_defaults/0` excludes it on that reasoning.
+      # Flipping it on one OS would make it a host fact on one OS and not the
+      # other -- a state neither the report nor the gate can represent.
+      #
+      # The floor it names is enforced instead by refusal:
+      # `Hardening.Darwin.apply/3` will not build a launch spec without a
+      # positive `:wall_clock_seconds` (T019). That is a different mechanism
+      # from a capability verdict and must not be folded into one.
+      report = Capability.check(:time_budget)
+
+      refute report.available?,
+             "`:time_budget` reports available on macOS. It is not a host capability " <>
+               "anywhere; changing that is a decision about every host at once, not a " <>
+               "Darwin clause."
+
+      assert report.detail =~ "supervising BEAM"
+    end
+
+    @tag :darwin_hardening
+    test ":privilege_separation stays unavailable, and says why (T021)" do
+      report = Capability.check(:privilege_separation)
+
+      refute report.available?,
+             "macOS reports privilege separation available. The backend's profile starts " <>
+               "from `(allow default)` and denies a list — a deny-list is not default-deny " <>
+               "confinement, and `FR-013` exists to report that gap rather than paper over it"
+
+      assert report.detail =~ "deny-list",
+             "the detail must name the gap (a deny-list over a permissive default), not " <>
+               "merely report absence: #{report.detail}"
     end
   end
 end

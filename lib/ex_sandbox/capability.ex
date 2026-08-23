@@ -56,10 +56,29 @@ defmodule ExSandbox.Capability do
       so no probe here can observe it and no cgroup verdict says anything about
       it. See `time_budget_not_a_host_capability/1`.
 
-  Every Darwin clause below reports `unavailable`. That is the fail-safe
-  direction this moduledoc requires, and it is the current truth: no Darwin
-  backend exists yet, so nothing has been watched stopping a breach here.
-  `FR-014a` forbids claiming a cap on any weaker evidence.
+  ## Three Darwin names now report `available`, and what that cost (014 T020)
+
+  Every Darwin clause below used to report `unavailable`, on the correct
+  grounds that no backend existed to watch stopping a breach. `014` Phase 3
+  built one, and Phase 4 observed the breaches: `:memory_cap`, `:cpu_cap` and
+  `:process_separation` are derived from
+  `ExSandbox.Hardening.Darwin.capabilities/0`, whose probe runs the real
+  composition rather than looking for binaries on the `PATH`.
+
+  The claim rests on `ExSandbox.Hardening.DarwinOrderingTest` (`SC-003`), which
+  runs R9b's misordered composition and the backend's own composition in one
+  run and requires them to *differ* — 0 with 300 MB allocated against 137.
+  Without that pair, `FR-014a`'s standard is not met and these names go back.
+
+  Everything else on Darwin still reports `unavailable`, and each detail names
+  what is missing rather than merely asserting absence:
+
+    * `:time_budget` — not a host fact anywhere, see
+      `time_budget_not_a_host_capability/1`.
+    * `:privilege_separation` — a deny-list `sandbox-exec` profile is not
+      default-deny confinement (T021).
+    * `:filesystem_confinement`, `:network_restriction`, `:disk_quota`,
+      `:resource_limits` — each for the reason its clause states.
   """
 
   # Bounded so a probe cannot hang the gateway's startup: `capabilities/0` is
@@ -294,45 +313,122 @@ defmodule ExSandbox.Capability do
   defp do_check(:time_budget, {:unix, :darwin} = os),
     do: time_budget_not_a_host_capability(os)
 
-  # ⚠️ Every Darwin clause below reports `unavailable`, and each detail names
-  # **what has not been demonstrated** rather than merely asserting absence.
-  # The distinction is `FR-014a`'s: a cap is claimed only once a breach has
-  # been watched being stopped, and on macOS no such observation exists yet --
-  # there is no `Hardening.Darwin` to make one with (014 Phase 3).
+  # ── Darwin: three names flipped on measured evidence (014 T020, `FR-014a`)
   #
-  # The spike is the evidence that these are *reachable*, not that they are
-  # *enforced*. Reading it the other way is exactly the R9b trap: a mechanism
-  # that exists, looks applicable, and is not the one in the path being taken.
+  # These three read `unavailable` until `014` Phase 3, on the correct grounds
+  # that nothing had been watched stopping a breach here. That is no longer the
+  # state. `ExSandbox.Hardening.Darwin` exists, and the breaches have been
+  # observed being stopped on this host, per capability:
+  #
+  #   * `:memory_cap` -- `hog 300` under `taskpolicy -m 150` exits **137** having
+  #     printed `mb 100`, so it was stopped BY the cap rather than never running
+  #     (T007).
+  #   * `:cpu_cap` -- a spinner that does **not** call `setrlimit` on itself
+  #     exits **152** under the backend's `ulimit -t`, while the identical
+  #     spinner under a ceiling it cannot reach runs until the harness kills it
+  #     (T008, as amended by T002 Finding 1).
+  #   * `:process_separation` -- the tenant runs as its own OS process: it
+  #     segfaults to **139** without touching this VM, and its pid is not this
+  #     VM's (T010, T016).
+  #
+  # And the evidence `FR-014a` actually demands for the *claim* is the ordering
+  # regression test: `ExSandbox.Hardening.DarwinOrderingTest` runs R9b's
+  # misordered composition and the backend's own composition side by side in one
+  # run, requires the first to exit 0 with 300 MB allocated and the second to
+  # exit 137, and requires them to differ (T017, `SC-003`). Without that pair,
+  # 137 alone would not distinguish a cap that holds from a host that stopped
+  # losing it.
+  #
+  # ⚠️ `:time_budget` is NOT flipped with them, and its absence here is a
+  # decision rather than an oversight (Phase 3 Finding C). It is not a host
+  # fact: `FR-014b` places its enforcement in the supervising BEAM, so no host
+  # provides or withholds it, and `gating_defaults/0` excludes it on exactly
+  # that reasoning. Flipping it on one OS would make it a host fact on one OS
+  # and not the other -- a state neither the report nor the gate can represent.
+  # See `time_budget_not_a_host_capability/1`.
+  #
+  # ⚠️ And `:filesystem_confinement` is not flipped either, though the Darwin
+  # backend does report constructing it. That divergence is deliberate and
+  # documented at the clause below; it is the one name where these two modules
+  # are asking different questions.
+  #
+  # ── Derived from the backend, never re-probed
+  #
+  # Each clause reads `ExSandbox.Hardening.Darwin.capabilities/0` rather than
+  # probing `sandbox-exec` and `taskpolicy` again here. That is the same rule as
+  # `derive_from_resource_limits/3` one screen up, applied across a module
+  # boundary, and it is applied for the reason stated there: two probes of one
+  # fact are two things that must stay equal forever, and this file has twice
+  # recorded them splitting (005 T060a5c, T060c) with the symptom being a
+  # boundary reported present on a host that never built it.
+  #
+  # A cheap presence check here -- "is `taskpolicy` on the PATH" -- is the exact
+  # shape the `:filesystem_confinement` and `:network_restriction` comments
+  # above were written against: it answers a question nobody asked, and it
+  # reports available on a host where `sandbox-exec` rejects the generated
+  # profile. The backend's probe renders a real profile and runs the full
+  # four-layer composition, which is the observed-behaviour standard this
+  # module's own moduledoc sets.
+  #
+  # ⚠️ Cost: that probe launches a process (~13 ms measured). `check_all/0` on
+  # Darwin therefore pays it once per derived name. Bounded, but not free, and
+  # worth knowing before adding a fourth caller on the provisioning path.
   defp do_check(:memory_cap, {:unix, :darwin}) do
-    unavailable(
+    derive_from_darwin_backend(
       :memory_cap,
-      "no macOS backend has been observed stopping an allocation breach: 005 R9b " <>
-        "measured `taskpolicy -m 100 sandbox-exec ... ./hog 300` allocating 300 MB " <>
-        "and exiting 0, and the composition that holds the cap (014 spike Finding 3) " <>
-        "is measured in a shell script, not built here. Note also that `RLIMIT_AS`, " <>
-        "`RLIMIT_DATA` and `RLIMIT_RSS` all fail `setrlimit` with EINVAL on Darwin, " <>
-        "so the Linux mechanism's own memory path would cap nothing if ported"
+      "a memory cap here is `taskpolicy -m` placed as the target's immediate parent " <>
+        "inside a `sandbox-exec` profile; `RLIMIT_AS`, `RLIMIT_DATA` and `RLIMIT_RSS` " <>
+        "all fail `setrlimit` with EINVAL on Darwin, so there is no fallback that caps " <>
+        "anything"
     )
   end
 
   defp do_check(:cpu_cap, {:unix, :darwin}) do
-    unavailable(
+    derive_from_darwin_backend(
       :cpu_cap,
-      "the Darwin kernel honours `RLIMIT_CPU`, but nothing has yet demonstrated " <>
-        "**this platform imposing** it on code that does not ask: the R9b spike's " <>
-        "`spin.c` calls `setrlimit(RLIMIT_CPU, 2)` on itself, so its exit 152 " <>
-        "measures the kernel rather than an imposed cap (014 T002 Finding 1), and " <>
-        "tenant code will not ask"
+      "a CPU cap here is `ulimit -t` in the shell the backend composes -- a ceiling on " <>
+        "CPU-seconds CONSUMED, not on the rate of consumption, since Darwin offers this " <>
+        "composition no rate cap at all"
     )
   end
 
   defp do_check(:process_separation, {:unix, :darwin}) do
-    unavailable(
+    derive_from_darwin_backend(
       :process_separation,
-      "there is no macOS hardening backend, so no tenant process is launched under " <>
-        "a `sandbox-exec` profile at all; `Mechanism.Beam` composes `bwrap`, which " <>
-        "does not exist here. Separation has not been demonstrated because nothing " <>
-        "has yet been separated (014 Phase 3)"
+      "separation here is the tenant running as its own OS process under a " <>
+        "`sandbox-exec` profile, which is what the backend's composition launches"
+    )
+  end
+
+  # ⚠️ macOS keeps reporting `unavailable`, and it keeps reporting it even when
+  # the caller is root -- which the generic `{:unix, _}` clause below would
+  # answer `available` for (014 T021).
+  #
+  # The generic clause asks one question: can this process drop to an
+  # unprivileged uid? On Linux that is the whole of `:privilege_separation`,
+  # because the dropped uid is composed with a mount namespace and a
+  # default-deny filesystem. On Darwin the second half does not exist. The
+  # profile `Hardening.Darwin` generates starts from `(allow default)` and
+  # denies a list -- and it starts there because `(deny default)` was MEASURED
+  # to kill even `/bin/echo`, since `dyld` cannot start (005 R9b).
+  #
+  # A deny-list over a permissive default is not default-deny confinement: every
+  # operation nobody thought to deny is allowed. Reporting `available` on the
+  # strength of a uid drop alone would describe that profile as equivalent to
+  # `bwrap`'s, which is precisely the "weakly-isolated local run presented as
+  # equivalently isolated" that `FR-013` exists to prevent.
+  #
+  # This is the gap the report is *for*. Papering over it costs the honesty that
+  # is this whole capability's purpose.
+  defp do_check(:privilege_separation, {:unix, :darwin}) do
+    unavailable(
+      :privilege_separation,
+      "the macOS backend confines with a `sandbox-exec` profile that starts from " <>
+        "`(allow default)` and denies a list. `(deny default)` is not viable here -- " <>
+        "it kills even /bin/echo, because dyld cannot start (005 R9b) -- so any " <>
+        "operation the profile does not name is permitted. That is a deny-list, not " <>
+        "default-deny confinement, and it is not equivalent to the dropped uid plus " <>
+        "mount namespace this capability means on Linux (014 FR-013, T021)"
     )
   end
 
@@ -579,6 +675,35 @@ defmodule ExSandbox.Capability do
   # ⚠️ The direction of a future edit matters here. Adding a second condition to
   # a derived name is how the drift starts: it belongs in the coarse clause, so
   # every name that decomposes it moves together.
+  # One probe, several names — the Darwin half (014 T020). The verdict is *read
+  # from* `ExSandbox.Hardening.Darwin.capabilities/0` rather than recomputed
+  # here, so the two modules cannot answer differently about the same host.
+  #
+  # ⚠️ `ExSandbox.CapabilityTest`'s Darwin agreement guard asserts exactly that
+  # (T023). It is written to fail if this derivation is ever replaced by a
+  # second probe — which is the direction a future edit drifts, because a
+  # presence check here looks cheaper than a launch over there.
+  #
+  # ⚠️ A name absent from the backend's map is reported unavailable, not
+  # assumed. The backend deliberately omits what it does not claim
+  # (`:network_restriction`, `:disk_quota`), and treating "the backend does not
+  # answer" as "yes" is the fail-open shape this whole module is written
+  # against.
+  defp derive_from_darwin_backend(name, why) do
+    case Map.get(ExSandbox.Hardening.Darwin.capabilities(), name) do
+      true ->
+        available(name)
+
+      _ ->
+        unavailable(
+          name,
+          "#{why}, and `ExSandbox.Hardening.Darwin` could not construct it on this host. " <>
+            "That probe renders a real profile and runs the full composition, so this is " <>
+            "an attempted launch failing rather than a missing binary being inferred from"
+        )
+    end
+  end
+
   defp derive_from_resource_limits(name, os, why) do
     case do_check(:resource_limits, os) do
       %__MODULE__{available?: true} ->

@@ -214,7 +214,20 @@ defmodule ExSandbox.Hardening.DarwinTest do
       # would pass whether or not the backend imposed anything (T002 Finding 1).
       # It runs forever here because this binary asks for nothing, which is what
       # tenant code will do.
-      result = run({bins["spin_nolimit"], []}, %{memory_mb: 150}, budget_ms: 6_000)
+      #
+      # ⚠️ The budget is 600 s rather than absent, and that is T019's floor
+      # rather than a weakening of this control. `FR-014b` now makes a launch
+      # with no `:wall_clock_seconds` a refusal, so "no budget at all" is not a
+      # spec this backend will build. A 600 s CPU ceiling observed for 6 wall-
+      # seconds is the same control: the spinner cannot reach it, so anything
+      # that stops it in that window is the binary limiting itself — which is
+      # exactly what this test exists to rule out. Only the ceiling differs
+      # between this and the capped case above, so the difference in outcome is
+      # attributable to the ceiling and nothing else.
+      result =
+        run({bins["spin_nolimit"], []}, %{memory_mb: 150, wall_clock_seconds: 600},
+          budget_ms: 6_000
+        )
 
       assert match?({:wall_clock_timeout, _}, result.outcome),
              "the uncapped spinner terminated on its own with #{inspect(result.outcome)}. " <>
@@ -468,6 +481,108 @@ defmodule ExSandbox.Hardening.DarwinTest do
     end
   end
 
+  # -- T019: the wall-clock floor -------------------------------------------
+
+  describe "the wall-clock floor (T019, FR-014b, SC-006c)" do
+    # ⚠️ `SC-006c` is verified one way only: **disable the budget and observe
+    # the deployment refuse the run.** Not "observe it fail" — a run that failed
+    # for any other reason (a missing binary, a denied profile, a crash) would
+    # satisfy a looser assertion while leaving the floor exactly as absent as it
+    # was. So every test below asserts on the refusal *specifically*: the error
+    # tuple, the capability it names, and — in the last one — that the target's
+    # side effect never happened while the identical launch *with* a budget
+    # produces it.
+
+    test "a launch with no wall-clock budget is refused, naming :time_budget" do
+      assert {:error, {:cannot_enforce, :time_budget, detail}} =
+               Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 150})
+
+      assert detail =~ "wall-clock budget"
+
+      # ⚠️ The capability name matters as much as the refusal. `:cpu_cap` here
+      # would send a caller to configure a CPU limit, which is not the hole:
+      # an idle process breaches no CPU cap and is exactly what has no
+      # terminating condition without a budget.
+      refute detail =~ "millicore CPU cap was requested"
+    end
+
+    test "a budget of zero is refused for the same reason an absent one is" do
+      # "Disabled" is the state `SC-006c` names, and `0` is how a caller
+      # disables it without deleting the key. It leaves the identical hole.
+      for disabled <- [0, -1, nil, "30", 30.0] do
+        limits = %{memory_mb: 150, wall_clock_seconds: disabled}
+
+        assert {:error, {:cannot_enforce, :time_budget, _}} =
+                 Darwin.apply({"/bin/echo", ["hi"]}, limits),
+               "a :wall_clock_seconds of #{inspect(disabled)} was accepted; " <>
+                 "it enforces nothing, so it must refuse"
+      end
+    end
+
+    test "the refusal reaches build_command/3 too, not only apply/3" do
+      # Both are entry points a caller can reach. A floor enforced in one of
+      # them is a floor with a door next to it.
+      assert {:error, {:cannot_enforce, :time_budget, _}} =
+               Darwin.build_command({"/bin/echo", ["hi"]}, %{memory_mb: 150})
+    end
+
+    test "the refusal happens before anything is written to disk" do
+      before = profile_dir_entries()
+
+      assert {:error, {:cannot_enforce, :time_budget, _}} =
+               Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 150})
+
+      assert profile_dir_entries() == before,
+             "a rejected launch left a profile behind that nothing will ever call " <>
+               "release/1 for — one leak per refused run"
+    end
+
+    test "the run does not happen: no spec, no side effect — and the control shows it could" do
+      workdir =
+        Path.join(System.tmp_dir!(), "darwin_floor_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workdir)
+      on_exit(fn -> File.rm_rf(workdir) end)
+
+      marker = Path.join(workdir, "IT_RAN")
+
+      # `touch` inside the workdir is PERMITTED by the generated profile, so if
+      # anything launches, the marker appears. Aimed anywhere else,
+      # `(deny file-write*)` would absorb the side effect and this test would
+      # report a refusal that never happened.
+      attempt = fn limits ->
+        case Darwin.apply({"/usr/bin/touch", [marker]}, limits, workdir: workdir) do
+          {:ok, spec} ->
+            try do
+              {_out, status} =
+                System.cmd(spec.cmd, spec.args, cd: spec.cd, stderr_to_stdout: true, env: [])
+
+              {:launched, status}
+            after
+              Darwin.release(spec)
+            end
+
+          {:error, reason} ->
+            {:refused, reason}
+        end
+      end
+
+      assert {:refused, {:cannot_enforce, :time_budget, _}} = attempt.(%{memory_mb: 150})
+
+      refute File.exists?(marker),
+             "the target ran despite the budget being disabled — FR-014b's floor is not " <>
+               "a warning, it is a refusal"
+
+      # ⚠️ The control. Without it, a backend that refused *every* launch would
+      # pass everything above while enforcing nothing at all.
+      assert {:launched, 0} = attempt.(%{memory_mb: 150, wall_clock_seconds: 5})
+
+      assert File.exists?(marker),
+             "the identical launch WITH a budget did not run either, so the refusal above " <>
+               "says nothing about the budget"
+    end
+  end
+
   # -- Profile --------------------------------------------------------------
 
   describe "profile generation (T013)" do
@@ -515,7 +630,9 @@ defmodule ExSandbox.Hardening.DarwinTest do
 
   describe "release/1 (T012)" do
     test "removes the generated profile and is idempotent" do
-      assert {:ok, spec} = Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64})
+      assert {:ok, spec} =
+               Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64, wall_clock_seconds: 5})
+
       ["-f", profile | _] = spec.args
 
       assert File.exists?(profile)
@@ -532,7 +649,9 @@ defmodule ExSandbox.Hardening.DarwinTest do
     test "reclaims the workdir it invented, and leaves one the caller supplied" do
       before = profile_dir_entries()
 
-      assert {:ok, spec} = Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64})
+      assert {:ok, spec} =
+               Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64, wall_clock_seconds: 5})
+
       assert File.dir?(spec.cd)
       assert Darwin.release(spec) == :ok
 
@@ -545,13 +664,19 @@ defmodule ExSandbox.Hardening.DarwinTest do
       File.mkdir_p!(mine)
       on_exit(fn -> File.rm_rf(mine) end)
 
-      assert {:ok, spec} = Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64}, workdir: mine)
+      assert {:ok, spec} =
+               Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64, wall_clock_seconds: 5},
+                 workdir: mine
+               )
+
       assert Darwin.release(spec) == :ok
       assert File.dir?(mine)
     end
 
     test "leaves a generated workdir alone once it holds tenant output" do
-      assert {:ok, spec} = Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64})
+      assert {:ok, spec} =
+               Darwin.apply({"/bin/echo", ["hi"]}, %{memory_mb: 64, wall_clock_seconds: 5})
+
       File.write!(Path.join(spec.cd, "tenant-output.txt"), "keep me")
       on_exit(fn -> File.rm_rf(spec.cd) end)
 

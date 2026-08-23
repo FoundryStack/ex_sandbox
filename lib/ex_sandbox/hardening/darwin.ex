@@ -109,13 +109,24 @@ defmodule ExSandbox.Hardening.Darwin do
     * `:memory_mb` when `taskpolicy` is absent from the host.
     * `:cpu_millicores` without a `:wall_clock_seconds` budget — see
       `apply/3` for why the two are one number here.
+    * **any launch at all** without a positive `:wall_clock_seconds` — see
+      below.
 
-  ## What this module does NOT enforce
+  ## What this module does NOT enforce, and refuses to launch without
 
   The wall-clock budget. `launch_spec/0` describes how to *start* a process;
   nothing in it can kill one later. The caller enforcing `:wall_clock_seconds`
   by killing the OS pid is the supervisor's job, and `014` T009 verifies the
   outcome is distinguishable from every exit status — there is none.
+
+  ⚠️ Not enforcing it is **not** a licence to launch without one (`FR-014b`,
+  `SC-006c`, T019). An idle process consumes no CPU, so `ulimit -t` never fires;
+  it allocates nothing, so `taskpolicy -m` never fires; it does not crash. No
+  layer of this composition ends it. So `apply/3` returns
+  `{:error, {:cannot_enforce, :time_budget, …}}` rather than a spec with no
+  budget behind it: this is the last point at which the run can be refused
+  instead of started, and a run with no terminating condition is the one
+  shortfall `FR-014b` says must refuse rather than degrade.
   """
 
   @behaviour ExSandbox.Hardening
@@ -180,6 +191,31 @@ defmodule ExSandbox.Hardening.Darwin do
   not claim them. `(deny network*)` is in the profile and denies egress, but the
   allowlisted-egress construction `:network_restriction` names on Linux has no
   counterpart here, and `:disk_quota` is refused outright by `apply/3`.
+
+  ## Its relationship to `ExSandbox.Capability.check/1` (014 T020, T023)
+
+  `Capability`'s Darwin clauses for `:memory_cap`, `:cpu_cap` and
+  `:process_separation` are **derived from this map**, so the two cannot answer
+  differently about the same host. `ExSandbox.CapabilityTest`'s Darwin agreement
+  guard asserts that, and it is written to fail if the derivation is ever
+  replaced by a second probe.
+
+  ⚠️ One name diverges on purpose. This map reports `:filesystem_confinement`
+  `true` — the profile really does confine where the target may write, and
+  `ExSandbox.Hardening.DarwinCapabilityTest` verifies it by breaching it — while
+  `Capability.check(:filesystem_confinement)` reports `false` on Darwin. They are
+  answering different questions: that name is in `Capability.gating_defaults/0`
+  *and* in `Mechanism.Beam.required_capabilities/0`, where it means **the mount
+  namespace**, and the BEAM mechanism composes `bwrap`, which does not exist
+  here. Flipping it there would admit a sandbox the launch cannot build.
+
+  That asymmetry is why T020 flipped three names and not four: the three are
+  report-only, so evidence changes what is *said* without changing what is
+  *admitted*.
+
+  ⚠️ Not free: this runs the composition (~13 ms measured), so every caller
+  pays a process launch. `Capability.check_all/0` on Darwin pays it once per
+  derived name.
   """
   @spec capabilities() :: capability_map()
   def capabilities do
@@ -270,7 +306,20 @@ defmodule ExSandbox.Hardening.Darwin do
          # nowhere to carry a workdir.
          suffix = unique_suffix(),
          {:ok, workdir} <- resolve_workdir(opts, suffix),
-         home = Path.expand(Keyword.get(opts, :home) || System.user_home!()),
+         # ⚠️ RESOLVED, not merely expanded — the same rule as `resolve_workdir/2`
+         # and for the same measured reason, applied to the other half of the
+         # profile. The kernel evaluates SBPL rules against resolved paths, so a
+         # `(deny file-read* (subpath …))` naming an unresolved spelling denies a
+         # path nothing reads.
+         #
+         # Found by T016's breach attempt, not by review: a `:home` under
+         # `System.tmp_dir!()` is `/var/folders/…`, a symlink to
+         # `/private/var/folders/…`, and `cat <home>/Documents/secret.txt`
+         # succeeded through a profile that named the deny rule correctly. It
+         # does not bite for the default `System.user_home!()`, which is not
+         # behind a symlink — which is exactly why it would have sat here
+         # unnoticed.
+         home = resolve_symlinks(Keyword.get(opts, :home) || System.user_home!()),
          {:ok, profile_path} <- write_profile(workdir, home, suffix) do
       {:ok,
        %{
@@ -449,25 +498,59 @@ defmodule ExSandbox.Hardening.Darwin do
     end
   end
 
+  # ⚠️ Clause order is load-bearing, and the first clause is first on purpose.
+  #
+  # A CPU cap with no budget and *no* cap with no budget are two different
+  # mistakes, and they must not collapse into one message. The first is "you
+  # asked for a rate this composition cannot derive"; the second is `FR-014b`'s
+  # floor. Reporting the floor for the first would send a caller to add a budget
+  # when what they need to know is that the budget is the CPU cap here.
   defp cpu_layer(limits) do
     case {Map.get(limits, :cpu_millicores), Map.get(limits, :wall_clock_seconds)} do
-      {nil, nil} ->
-        {:ok, ""}
-
-      {nil, budget} when is_integer(budget) and budget > 0 ->
-        {:ok, "ulimit -t #{budget}; "}
-
-      {millicores, budget}
-      when is_integer(millicores) and millicores > 0 and is_integer(budget) and budget > 0 ->
-        {:ok, "ulimit -t #{max(ceil(budget * millicores / 1000), 1)}; "}
-
-      {millicores, nil} when is_integer(millicores) ->
+      {millicores, nil} when not is_nil(millicores) ->
         {:error,
          {:cannot_enforce, :cpu_cap,
           "a #{millicores} millicore CPU cap was requested with no :wall_clock_seconds. " <>
             "Darwin offers this composition no CPU *rate* cap; `ulimit -t` is a ceiling on " <>
             "CPU-seconds consumed, and there is no budget to derive one from. Supply " <>
             ":wall_clock_seconds, or omit the CPU cap deliberately"}}
+
+      # ⚠️ **The floor beneath the floor** (`FR-014b`, `SC-006c`, 014 T019).
+      #
+      # Every other capability here may report `unavailable` and still leave a
+      # usable product, because the user is told. A missing wall-clock budget is
+      # different in kind: an idle block consumes no CPU, so `ulimit -t` never
+      # fires; it allocates nothing, so `taskpolicy` never fires; it does not
+      # crash. **Nothing in this composition ends it.** A launch spec built
+      # without a budget is a run with no terminating condition at all, and
+      # `FR-016`'s hang outcome cannot be reported because it never arrives.
+      #
+      # This module cannot *enforce* the budget — a launch spec describes how to
+      # start a process, not how to kill one later, and the supervising BEAM is
+      # where `FR-014b` places enforcement. What it can do, and does here, is
+      # refuse to hand back a spec that has no budget to enforce. That is the
+      # only point in this backend at which the run can still be refused rather
+      # than started, so it is where the refusal has to live.
+      #
+      # `0` is refused for the same reason `nil` is: a disabled budget and an
+      # absent one leave the identical hole, and `SC-006c` verifies this floor
+      # by *disabling* the budget.
+      {_millicores, budget} when not (is_integer(budget) and budget > 0) ->
+        {:error,
+         {:cannot_enforce, :time_budget,
+          "no wall-clock budget was supplied (:wall_clock_seconds was #{inspect(budget)}). " <>
+            "FR-014b forbids running generated code without one: an idle process consumes " <>
+            "no CPU and allocates nothing, so neither `ulimit -t` nor `taskpolicy -m` ever " <>
+            "fires, and a hung run would have no terminating condition. This backend cannot " <>
+            "enforce the budget itself — the supervising BEAM does — but it refuses to build " <>
+            "a launch spec there is no budget to enforce, which is the last point at which " <>
+            "the run can be refused rather than started"}}
+
+      {nil, budget} ->
+        {:ok, "ulimit -t #{budget}; "}
+
+      {millicores, budget} when is_integer(millicores) and millicores > 0 ->
+        {:ok, "ulimit -t #{max(ceil(budget * millicores / 1000), 1)}; "}
 
       {millicores, budget} ->
         {:error,
