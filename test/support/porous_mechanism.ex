@@ -50,6 +50,15 @@ defmodule ExSandbox.PorousMechanism do
   @impl true
   def usage(_sandbox), do: {:ok, %{}}
 
+  # This fixture isolates nothing and runs nothing. `:could_not_run` is the
+  # honest answer and the one the suite must not score as a pass: an attempt
+  # that never happened has demonstrated neither a limit holding nor a limit
+  # failing.
+  @impl true
+  def execute(_sandbox, {_cmd, _args}, _opts \\ []) do
+    {:error, {:could_not_run, :not_supported}}
+  end
+
   defp host_exec(command) do
     {output, _status} = System.cmd("sh", ["-c", command], stderr_to_stdout: true)
     {:ok, output}

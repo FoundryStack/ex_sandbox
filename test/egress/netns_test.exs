@@ -183,6 +183,186 @@ defmodule ExSandbox.Egress.NetnsTest do
     defp rule(commands), do: Enum.find(commands, &("redirect" in &1))
   end
 
+  # ⚠️ **These assert a command shape, which the moduledoc above already calls
+  # weak evidence — and for this rule the gap is wider than usual.** The hole
+  # being closed was measured by *sending a datagram*: Phase 0 recorded that
+  # "a UDP datagram sent from inside the sandbox to 8.8.8.8:53 was ANSWERED".
+  # Nothing below sends anything. These exist so a later edit that drops the
+  # drop, reorders it ahead of the exemption, or scopes it to IPv4 fails here
+  # rather than in a container run whose verdict reads as something else. The
+  # boundary itself is 029 T014's checkpoint: `nc -u` from inside the namespace
+  # to the host loopback and to the gateway address, getting nothing.
+  describe "redirect_commands/3 — the UDP rule (029 T012, FR-013/FR-015)" do
+    setup do
+      %{
+        unconfigured: Netns.redirect_commands(4242, 18_080),
+        resolved: Netns.redirect_commands(4242, 18_080, {"10.0.0.53", 53})
+      }
+    end
+
+    test "with no resolver configured, ALL UDP is dropped", %{unconfigured: commands} do
+      # ⚠️ The unconfigured case is the one that decides whether this is
+      # default-deny. The resolver is Phase 2's first deliverable (029 T015), so
+      # "no resolver yet" is the state of the world today, and permitting UDP
+      # until it arrives would leave the measured hole open for a whole phase
+      # while every rule below installed cleanly.
+      assert drop_rule(commands),
+             "no rule refuses UDP; a sandbox with no resolver configured must reach nothing over UDP"
+
+      refute Enum.any?(commands, &("accept" in &1)),
+             "an exemption was emitted for a resolver that was never supplied"
+    end
+
+    test "the drop is NOT in the nat chain", %{unconfigured: commands} do
+      # ⚠️ `nat` chains translate; they are consulted by conntrack for the first
+      # packet of a flow only. A filtering verdict placed there is evaluated on
+      # a schedule unrelated to the traffic it refuses. The tempting edit is to
+      # append `drop` beside the redirect because that is where the neighbouring
+      # rule lives.
+      for command <- commands, "drop" in command do
+        refute "nat" in command,
+               "a drop belongs in a filter chain, not the nat chain that holds the redirect: " <>
+                 Enum.join(command, " ")
+      end
+    end
+
+    test "the drop's chain is a filter chain hooked on output", %{unconfigured: commands} do
+      chain = Enum.find(commands, &("filter" in &1 and "chain" in &1))
+      assert chain, "no filter chain is created for the drop to live in"
+      assert "output" in chain, "traffic originates inside the namespace, so it traverses output"
+
+      spec = List.last(chain)
+      assert spec =~ "type filter", "the drop's chain must be a filter chain: #{spec}"
+      assert spec =~ "hook output", "the drop's chain must hook output: #{spec}"
+    end
+
+    test "the filter chain's POLICY is accept, so TCP is not dropped with the UDP", %{
+      unconfigured: commands
+    } do
+      # ⚠️ The obvious reading of "default-deny" is a `policy drop` chain, and it
+      # takes the TCP path down with it: TCP is policed by the redirect in the
+      # nat chain, not by this one, so a drop policy here refuses every
+      # permitted destination too. Default-deny for UDP is the terminal
+      # `meta l4proto udp drop` rule, not the chain policy.
+      chain = Enum.find(commands, &("filter" in &1 and "chain" in &1))
+      spec = List.last(chain)
+
+      assert spec =~ "policy accept",
+             "a drop policy on this chain refuses the TCP the redirect exists to permit: #{spec}"
+    end
+
+    test "the drop matches UDP in grammar nft accepts, with no port predicate", %{
+      unconfigured: commands
+    } do
+      # ⚠️ Same measured grammar trap as the TCP redirect above -- a bare `udp`
+      # is rejected at install time with `syntax error`, and a rule that fails
+      # to install leaves UDP walking out exactly as it does today.
+      #
+      # ⚠️ And no `dport`. This refuses UDP *as such*; a port predicate would let
+      # a tenant pick an unlisted port and walk past it, which is the same
+      # argument the redirect's own comment makes for matching all TCP.
+      rule = drop_rule(commands)
+
+      assert rule
+             |> Enum.chunk_every(3, 1, :discard)
+             |> Enum.any?(&(&1 == ["meta", "l4proto", "udp"])),
+             """
+             the drop rule does not carry an `nft` protocol match.
+
+             Built: #{Enum.join(rule, " ")}
+             """
+
+      refute "dport" in rule,
+             "the drop must refuse all UDP; a port predicate leaves the other 65534 open"
+    end
+
+    test "the drop covers IPv6 as well as IPv4", %{unconfigured: commands} do
+      # ⚠️ The redirect's table is `ip` (IPv4 only), which is defensible for a
+      # translation whose target is an IPv4 acceptor. A *refusal* scoped to IPv4
+      # would leave the identical IPv6 datagram to walk out -- a control that
+      # reads as the guarantee it is not, which is the exact shape FR-015 names.
+      rule = drop_rule(commands)
+
+      assert "inet" in rule,
+             "an `ip`-family drop leaves IPv6 UDP unpoliced: " <> Enum.join(rule, " ")
+    end
+
+    test "the resolver exemption comes BEFORE the drop", %{resolved: commands} do
+      # ⚠️ `nft` evaluates in order, so an exemption placed after a terminal drop
+      # never runs -- the same ordering trap the acceptor's `meta mark ... return`
+      # is documented for. The symptom is a resolver that is configured, whose
+      # rules all installed, and which nothing can reach.
+      accept_at = Enum.find_index(commands, &("accept" in &1))
+      drop_at = Enum.find_index(commands, &("drop" in &1))
+
+      assert accept_at, "a configured resolver produced no exemption"
+      assert drop_at, "the exemption is present but nothing refuses the rest of UDP"
+
+      assert accept_at < drop_at,
+             "an exemption after a terminal drop never runs; the resolver would be unreachable"
+    end
+
+    test "the resolver is the SOLE permitted UDP destination", %{resolved: commands} do
+      # The ruling (029 T011) is resolver-as-sole-destination, not an allowlist
+      # over UDP. Exactly one exemption, pinned to one address and one port.
+      exemptions = Enum.filter(commands, &("accept" in &1))
+      assert length(exemptions) == 1, "more than one UDP destination was permitted"
+
+      [rule] = exemptions
+      assert "10.0.0.53" in rule
+      assert "daddr" in rule, "an exemption with no destination match permits UDP to anywhere"
+      assert "53" in rule
+    end
+
+    test "an IPv6 resolver is matched with ip6 daddr, not ip daddr", %{} do
+      # In an `inet` table `ip daddr` matches IPv4 packets only, so an IPv6
+      # resolver named with it would install cleanly and match nothing --
+      # a configured resolver that is unreachable.
+      [rule] =
+        Netns.redirect_commands(4242, 18_080, {{0xFD00, 0, 0, 0, 0, 0, 0, 1}, 53})
+        |> Enum.filter(&("accept" in &1))
+
+      assert "ip6" in rule
+      assert "fd00::1" in rule
+    end
+
+    test "a resolver address that is not an address is refused, not ignored", %{} do
+      # ⚠️ Degrading to "no exemption" would produce a sandbox with no DNS whose
+      # rules all installed cleanly -- indistinguishable from one that was never
+      # given a resolver. Raising halts the launch, and a tenant that could not
+      # be policed is terminated rather than left running.
+      assert_raise ArgumentError, fn ->
+        Netns.redirect_commands(4242, 18_080, {"resolver.internal", 53})
+      end
+    end
+
+    test "the UDP rules enter the holder's namespace like every other", %{resolved: commands} do
+      # Same reason as the redirect: an `nft` command without `nsenter -t <pid> -n`
+      # configures the HOST, succeeds, and warns about nothing.
+      for command <- commands do
+        assert Enum.take(command, 5) == ["nsenter", "-t", "4242", "-n", "-U"],
+               "a policy command that does not enter the namespace configures the host: " <>
+                 Enum.join(command, " ")
+      end
+    end
+
+    test "the TCP redirect is untouched by the UDP rules", %{resolved: commands} do
+      # Regression guard: the UDP work must not disturb the path that already
+      # works. A redirect that stopped matching would surface as a permitted
+      # destination timing out, which reads as an unreachable network.
+      redirect = Enum.find(commands, &("redirect" in &1))
+      assert redirect
+      assert "nat" in redirect
+      assert ":18080" in redirect
+
+      assert redirect
+             |> Enum.chunk_every(3, 1, :discard)
+             |> Enum.any?(&(&1 == ["meta", "l4proto", "tcp"]))
+    end
+
+    defp drop_rule(commands), do: Enum.find(commands, &("drop" in &1))
+  end
+
   describe "default_route?/1" do
     test "recognises the route pasta installs" do
       # Measured output from the isolation container. Without a default route
@@ -234,6 +414,78 @@ defmodule ExSandbox.Egress.NetnsTest do
       [_pasta | rest] = command
       tenant = rest |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
       assert tenant == ["bwrap", "--die-with-parent", "erlexec"]
+    end
+  end
+
+  describe "the flags that close the host off (029-FR-015, 029-FR-018)" do
+    # ⚠️ **What this describe block can and cannot prove.** Every assertion here
+    # reads a list of strings. It shows the flags are *passed*; it does not show
+    # they *close* anything. The claim that the netns can no longer reach the
+    # host needs a live namespace and a probe that watches for bytes, and that
+    # evidence is `T012`/`T014`'s. Do not read a green run here as `FR-015`
+    # demonstrated -- that reading is exactly the "confirm a flag was passed"
+    # failure `012-FR-012a` and `029-FR-016` exist to forbid.
+
+    setup do
+      %{command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])}
+    end
+
+    test "the gateway address is not mapped to the host", %{command: command} do
+      # Without this, pasta maps the namespace's default gateway to the host,
+      # and the host answers on it.
+      assert "--no-map-gw" in command
+    end
+
+    test "inbound and outbound TCP forwarding are both off", %{command: command} do
+      # ⚠️ `-t auto` is `FR-018` directly: MEASURED under the default, a tenant
+      # binding `0.0.0.0:8080` binds `0.0.0.0:8080` **on the host**.
+      assert flag_value(command, "-t") == "none"
+      assert flag_value(command, "-T") == "none"
+    end
+
+    test "inbound and outbound UDP forwarding are both off", %{command: command} do
+      assert flag_value(command, "-u") == "none"
+      assert flag_value(command, "-U") == "none"
+    end
+
+    test "--no-map-gw is not passed alone", %{command: command} do
+      # ⚠️ **The whole reason this test is written as a set rather than as four
+      # independent ones.** The netns reaches host `127.0.0.1` by two
+      # independent paths; `--no-map-gw` closes one. A build passing only that
+      # flag has a narrower hole, not no hole -- and it looks identical from
+      # outside, because a `curl` to the gateway address gets nothing either
+      # way. A regression that drops the port-forwarding flags while keeping
+      # `--no-map-gw` is the shape this asserts against.
+      assert "--no-map-gw" in command
+
+      for flag <- ~w(-t -T -u -U) do
+        assert flag_value(command, flag) == "none",
+               "#{flag} must be none: --no-map-gw closes only one of the two paths to the host"
+      end
+    end
+
+    test "the closing flags precede the argument separator", %{command: command} do
+      # A flag emitted after `--` is not pasta's -- it is handed to the tenant,
+      # which ignores it, and the door stays open while the command string reads
+      # correct.
+      before_separator = Enum.take_while(command, &(&1 != "--"))
+
+      for flag <- ~w(--no-map-gw -t -T -u -U) do
+        assert flag in before_separator, "#{flag} must reach pasta, not the tenant"
+      end
+    end
+
+    test "the flags do not disturb the runas pair or the pidfile" do
+      # Regression guard for the callers that locate `--runas` and `-P` by
+      # scanning for the flag and taking the next element.
+      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "4242:4242")
+
+      assert flag_value(command, "--runas") == "4242:4242"
+      assert flag_value(command, "-P") == "/run/p.pid"
+    end
+
+    defp flag_value(command, flag) do
+      command |> Enum.drop_while(&(&1 != flag)) |> Enum.at(1)
     end
   end
 end

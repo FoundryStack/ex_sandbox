@@ -77,6 +77,7 @@ defmodule ExSandbox.Conformance do
       import ExSandbox.Conformance.Helpers
 
       require ExSandbox.Conformance.Credentials
+      require ExSandbox.Conformance.Execution
       require ExSandbox.Conformance.Isolation
       require ExSandbox.Conformance.Lifecycle
       require ExSandbox.Conformance.Network
@@ -91,6 +92,7 @@ defmodule ExSandbox.Conformance do
       ExSandbox.Conformance.Isolation.tests()
       ExSandbox.Conformance.Network.tests()
       ExSandbox.Conformance.ResourceLimits.tests()
+      ExSandbox.Conformance.Execution.tests()
     end
   end
 end

@@ -99,6 +99,10 @@ defmodule ExSandbox.TelemetryTest do
       @moduledoc false
       @behaviour ExSandbox.Mechanism
       @impl true
+      def execute(_sandbox, {_cmd, _args}, _opts \\ []),
+        do: {:error, {:could_not_run, :not_supported}}
+
+      @impl true
       def required_capabilities, do: []
       @impl true
       def provision(_s), do: {:error, {:image_pull_failed, "no such template"}}
@@ -134,6 +138,9 @@ defmodule ExSandbox.TelemetryTest do
     defmodule NeedsEverything do
       @moduledoc false
       @behaviour ExSandbox.Mechanism
+      @impl true
+      def execute(_sandbox, {_cmd, _args}, _opts \\ []),
+        do: {:error, {:could_not_run, :not_supported}}
 
       # ⚠️ Requires a capability **no host provides**, rather than relying on the
       # host lacking one of the real ones.

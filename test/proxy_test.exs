@@ -12,6 +12,10 @@ defmodule ExSandbox.ProxyTest do
     @moduledoc false
     @behaviour ExSandbox.Mechanism
     @impl true
+    def execute(_sandbox, {_cmd, _args}, _opts \\ []),
+      do: {:error, {:could_not_run, :not_supported}}
+
+    @impl true
     def required_capabilities, do: []
     @impl true
     def provision(s), do: {:ok, s}
@@ -33,6 +37,10 @@ defmodule ExSandbox.ProxyTest do
     @moduledoc false
     @behaviour ExSandbox.Mechanism
     @impl true
+    def execute(_sandbox, {_cmd, _args}, _opts \\ []),
+      do: {:error, {:could_not_run, :not_supported}}
+
+    @impl true
     def required_capabilities, do: []
     @impl true
     def provision(s), do: {:ok, s}
@@ -53,6 +61,10 @@ defmodule ExSandbox.ProxyTest do
   defmodule Blind do
     @moduledoc false
     @behaviour ExSandbox.Mechanism
+    @impl true
+    def execute(_sandbox, {_cmd, _args}, _opts \\ []),
+      do: {:error, {:could_not_run, :not_supported}}
+
     @impl true
     def required_capabilities, do: []
     @impl true
@@ -139,6 +151,10 @@ defmodule ExSandbox.ProxyTest do
       defmodule Counting do
         @moduledoc false
         @behaviour ExSandbox.Mechanism
+        @impl true
+        def execute(_sandbox, {_cmd, _args}, _opts \\ []),
+          do: {:error, {:could_not_run, :not_supported}}
+
         @impl true
         def required_capabilities, do: []
         @impl true

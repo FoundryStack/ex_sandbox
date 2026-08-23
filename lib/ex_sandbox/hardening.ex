@@ -72,4 +72,105 @@ defmodule ExSandbox.Hardening do
 
   @doc "Capabilities this hardening implementation requires of the host."
   @callback required_capabilities() :: [ExSandbox.Capability.name()]
+
+  # The layers a tier statement is built from. Each is measured by reading a
+  # file, never by shelling out: `tier/0` runs on the provisioning path and
+  # `ExSandbox.Hardening.Linux.capabilities/0` is documented as a startup probe
+  # precisely because it runs `unshare` and `bwrap`.
+  @lsm_path "/sys/kernel/security/lsm"
+  @status_path "/proc/self/status"
+  @tun_path "/dev/net/tun"
+
+  @doc """
+  What this host can actually enforce, as one sentence fit to be **recorded**
+  (`029-FR-040`).
+
+  ## Why a string, and why it is stored rather than derived on read
+
+  `FR-040` requires a host that cannot enforce these boundaries either to refuse
+  to launch or to launch in a reduced tier **named in the sandbox's own recorded
+  state**. The reason it must be recorded is the same reason
+  `data_store_placement` is: a tier derived at read time describes *the host
+  asking*, not the host the sandbox was launched on, and those diverge the
+  moment a record outlives a redeploy. A reduced tier that is not recorded is
+  indistinguishable from an enforced one.
+
+  ⚠️ **This is measured, not declared.** `029` D18b states the darwin-in-Docker
+  tier as *"no LSM, no seccomp; network layer enforced"*, and this function is
+  deliberately not that sentence hardcoded -- a constant would go on reporting
+  D18b's measurement on a host D18b never saw. What it reads:
+
+    * `#{@lsm_path}` -- the LSMs the kernel has active. `capability` is
+      discounted: every Linux kernel carries it and it is not an MAC layer, so
+      counting it would report "LSM: capability" on a host with no MAC at all.
+      An unreadable path (securityfs unmounted, or not Linux) reads as none,
+      which is the conservative direction: it under-claims enforcement.
+    * `#{@status_path}`'s `Seccomp:` field -- `0` is disabled, anything else is
+      a filter loaded.
+    * `pasta` on `PATH` and `#{@tun_path}` present -- the two facts
+      `ExSandbox.Hardening.Linux`'s network probe needs a *device* and a binary
+      for, and the two whose absence made `pasta --config-net` fail outright
+      when it was measured (2026-08-17).
+
+  ⚠️ **The network clause says "enforceable", not "enforced", and the gap is
+  deliberate.** These two facts say the apparatus this host would police egress
+  with is present; they do not say the sandbox being recorded was launched
+  through it -- a sandbox with an empty allowlist takes the unpoliced branch.
+  Writing "enforced" here would be the over-claim
+  `ExSandbox.Hardening.Linux.probe_network_policy/0`'s own comment warns about,
+  where "we cannot do this" becomes "we demonstrated this".
+  """
+  @spec tier() :: String.t()
+  def tier do
+    Enum.join([lsm_clause(), seccomp_clause()], ", ") <> "; " <> network_clause()
+  end
+
+  defp lsm_clause do
+    case active_lsms() do
+      [] -> "no LSM"
+      names -> "LSM: " <> Enum.join(names, "+")
+    end
+  end
+
+  defp active_lsms do
+    case File.read(@lsm_path) do
+      {:ok, contents} ->
+        contents
+        |> String.trim()
+        |> String.split(",", trim: true)
+        # `capability` is on every Linux kernel and confines nothing on its own.
+        |> Enum.reject(&(&1 in ["", "capability"]))
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp seccomp_clause do
+    case seccomp_mode() do
+      0 -> "no seccomp"
+      mode when is_integer(mode) -> "seccomp mode #{mode}"
+      :unknown -> "no seccomp"
+    end
+  end
+
+  defp seccomp_mode do
+    with {:ok, contents} <- File.read(@status_path),
+         line when is_binary(line) <-
+           contents |> String.split("\n") |> Enum.find(&String.starts_with?(&1, "Seccomp:")),
+         {mode, _rest} <-
+           line |> String.replace_prefix("Seccomp:", "") |> String.trim() |> Integer.parse() do
+      mode
+    else
+      _ -> :unknown
+    end
+  end
+
+  defp network_clause do
+    if not is_nil(System.find_executable("pasta")) and File.exists?(@tun_path) do
+      "network layer enforceable"
+    else
+      "network layer not enforceable"
+    end
+  end
 end

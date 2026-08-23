@@ -88,6 +88,42 @@ defmodule ExSandbox.Conformance.Network do
   @default_permitted {"1.1.1.1", 443}
   @default_denied {"8.8.8.8", 53}
 
+  # ⚠️ The permitted set carries a **hostname as well as an IP literal**, and
+  # the second entry is what makes `029-FR-012` visible to this suite at all
+  # (029 T004).
+  #
+  # Until it existed every permitted destination the suite named was a dotted
+  # quad, so **name matching was never exercised by construction**: the acceptor
+  # reports `SO_ORIGINAL_DST` as an address, `Egress.Policy.permits?/2` compares
+  # by equality, and a hostname entry can therefore never match a connection --
+  # a defect the whole group ran green over, because no check ever asked a
+  # sandbox to reach a destination it knew by name.
+  #
+  # ⚠️ It must resolve to something **not otherwise in the allowlist**, and this
+  # is the trap the first draft fell into. `one.one.one.one` is the obvious
+  # hostname for `1.1.1.1` and is exactly wrong: the connection it produces is
+  # permitted by the IP entry already present, so the check goes green against a
+  # mechanism that never matched a name. `require_permitted_name_reachable/2`
+  # reports the third outcome rather than a pass if the name and the literal
+  # ever converge -- see the overlap guard there.
+  @default_permitted_name {"cloudflare-dns.com", 443}
+
+  # The UDP legs, and the port is 53 for a reason rather than by habit
+  # (029 T005, `FR-013`, `SC-003`).
+  #
+  # `@default_denied` is a DNS server probed over **TCP**, so the group's
+  # flagship denial check proves DNS-over-TCP is refused to precisely the host
+  # DNS-over-UDP walks out to. The redirect is `meta l4proto tcp` and there is no
+  # UDP handling anywhere, so the transport the resolver actually uses has never
+  # been attempted from inside a sandbox.
+  @udp_loopback {"127.0.0.1", 53}
+  @udp_port 53
+
+  # ⚠️ Cached like `@control_key`, and for the same reason: the answer cannot
+  # change within a run, and an unanswered datagram costs a full timeout every
+  # time it is asked.
+  @udp_control_key {__MODULE__, :denied_address_udp_control}
+
   @doc """
   The destination this run treats as permitted, and the one it treats as denied.
 
@@ -128,6 +164,22 @@ defmodule ExSandbox.Conformance.Network do
     end
 
     denied
+  end
+
+  @doc """
+  The destination this run treats as permitted **and names by hostname**
+  (`029-FR-012`, 029 T004).
+
+  Configurable for the same reason `permitted_address/0` is -- a deployment
+  behind an egress proxy names a host it can actually resolve and reach:
+
+      config :ex_sandbox, :conformance,
+        permitted_name_destination: {"api.internal", 443}
+  """
+  @spec permitted_name_address() :: {String.t(), pos_integer()}
+  def permitted_name_address do
+    conformance_config()
+    |> Keyword.get(:permitted_name_destination, @default_permitted_name)
   end
 
   defp conformance_config, do: Application.get_env(:ex_sandbox, :conformance, [])
@@ -191,7 +243,11 @@ defmodule ExSandbox.Conformance.Network do
   @spec suite_context() :: map()
   def suite_context do
     if Keyword.get(conformance_config(), :allowlist_enabled, true) do
-      %{network_allowlist: [permitted_address()]}
+      # ⚠️ Two entries, and the hostname is not decoration (029 T004). The IP
+      # literal is what `put_permitted`-style derivation picks up for the
+      # existing permit check; the hostname is the only reason `FR-012`'s name
+      # matching is reachable from this suite at all.
+      %{network_allowlist: [permitted_address(), permitted_name_address()]}
     else
       %{}
     end
@@ -305,6 +361,60 @@ defmodule ExSandbox.Conformance.Network do
             @mechanism,
             var!(context).sandbox
           )
+        end
+
+        check "a permitted destination named by HOSTNAME is reachable" do
+          # `029-FR-012`, 029 T004. The half of the allowlist that no check in
+          # this group could see before: every permitted destination the suite
+          # named was a dotted quad, so a mechanism that cannot match a name
+          # collected a full green group.
+          #
+          # ⚠️ A **pass** here is the outcome to be suspicious of, not a
+          # failure. The measured state of the BEAM mechanism is that
+          # `SO_ORIGINAL_DST` arrives as an address and the policy compares by
+          # equality, so a name entry cannot match; this check going green means
+          # either that matching landed or -- the thing to look at first -- that
+          # the connection was permitted by some *other* entry and the name was
+          # never consulted.
+          ExSandbox.Conformance.Network.require_permitted_name_reachable(
+            @mechanism,
+            var!(context).sandbox
+          )
+        end
+
+        check "UDP egress is confined the same as TCP" do
+          # `029-FR-013`, `SC-003`, 029 T005. Every other probe in this group is
+          # `:gen_tcp`, and the policy this group measures is `meta l4proto tcp`
+          # -- so an allowlist a tenant can bypass by choosing a transport has
+          # never been attempted here.
+          #
+          # ⚠️ A datagram coming *back* is the only thing scored as a crossing.
+          # Silence is scored as a refusal, which is the conservative direction
+          # and a known weakness: a UDP probe that is dropped and a UDP probe
+          # nothing was listening for look identical from inside.
+          #
+          # ⚠️ **The name changed once, and the measurement is why.** This check
+          # was `"the host is not reachable over UDP from inside the sandbox"`
+          # and attempted exactly the two legs `SC-003` names -- the host's
+          # loopback and the namespace gateway. Measured in the isolation
+          # harness (run `2026-08-23T05:12:57Z-85`): both legs silent, check
+          # GREEN, and the green established nothing at all. Neither address had
+          # anything obliged to answer, so "the datagram was dropped" and "the
+          # datagram arrived somewhere with no listener" produced the identical
+          # result, and the check reported a boundary it had not observed.
+          #
+          # The denied leg added alongside them is the one with force: it is a
+          # real resolver, the environment's allowlist does NOT permit it, and
+          # it is gated on the host itself getting an answer from it. So the
+          # only outcomes left are a leak (red) and a host that cannot
+          # demonstrate either way (the third outcome) -- a green by silence is
+          # no longer reachable.
+          require_refused("029-FR-013", fn ->
+            ExSandbox.Conformance.Network.attempt_udp_egress(
+              @mechanism,
+              var!(context).sandbox
+            )
+          end)
         end
 
         check "the allowlist cannot be widened from inside the sandbox" do
@@ -562,6 +672,335 @@ defmodule ExSandbox.Conformance.Network do
         )
     end
   end
+
+  @doc """
+  Requires that a permitted destination **named by hostname** is reachable
+  (`029-FR-012`).
+
+  ⚠️ Three gates before the probe runs, and each of them exists because the
+  obvious version of this check reports something it did not measure:
+
+    1. **The mechanism must declare an allowlist at all.** Without one there is
+       no policy for a name to be matched against, and dialling anyway would
+       score a mechanism that denies everything.
+    2. **The host must itself resolve and reach the name.** Same control as
+       `attempt_reach_denied_host/2`: if the host is silent too, silence from
+       inside distinguishes nothing.
+    3. **The name must not resolve to an address the allowlist already carries
+       as a literal.** This is the one that is specific to name matching. If the
+       hostname's address is the IP entry the suite also permits, then a
+       successful connection is explained by the literal and the name was never
+       consulted -- a green tick for a capability that does not exist.
+  """
+  def require_permitted_name_reachable(mechanism, sandbox) do
+    {name, port} = permitted_name_address()
+
+    with :ok <- require_declared_allowlist(mechanism, sandbox),
+         :ok <- require_name_distinct_from_literals(name),
+         :ok <- require_host_reaches_name(name, port) do
+      case probe_connect(mechanism, sandbox, name, port, "a permitted destination named #{name}") do
+        {:succeeded, _evidence} ->
+          :ok
+
+        {:refused, evidence} ->
+          ExSandbox.Conformance.Helpers.guarantee_failure("029-FR-012", """
+          A destination the environment PERMITS **by name** was not reachable
+          from inside the sandbox, while the host reaches it and the same
+          environment reaches a permitted destination named by address.
+
+          Evidence: #{inspect(evidence)}
+
+          `029-FR-012` requires an allowlist entry naming a hostname to match the
+          connections that hostname resolves to. Silently denying a permission an
+          operator believes they granted is the worst available failure for an
+          audit surface -- an entry that cannot work must not be accepted.
+
+          ⚠️ Two distinguishable causes produce this, and both are `FR-012`:
+          the name did not resolve **inside** the sandbox (`FR-013` calls a
+          working DNS story a precondition for `FR-012` rather than a separate
+          nicety), or it resolved and the enforcement point compared the
+          resulting address against a string. The evidence above says which:
+          a refusal reported by the mechanism's own probe means it got as far
+          as connecting.
+          """)
+
+        other ->
+          ExSandbox.Conformance.Helpers.guarantee_failure("029-FR-012", """
+          Reaching a permitted destination by name neither succeeded nor was
+          refused: #{inspect(other)}
+          """)
+      end
+    end
+  end
+
+  defp require_declared_allowlist(mechanism, sandbox) do
+    case permitted_destination(mechanism, sandbox) do
+      {:ok, _} ->
+        :ok
+
+      :no_allowlist ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          this mechanism declares no permitted destinations, so there is no
+          policy for a hostname entry to be matched against and `029-FR-012`
+          cannot be demonstrated.
+
+          This is the third outcome and not a pass.
+          """
+        )
+    end
+  end
+
+  # ⚠️ The guard that keeps a green tick honest. Measured reasoning rather than
+  # caution: `1.1.1.1` and `one.one.one.one` are the same destination, so a
+  # suite permitting both would see the name-based connection permitted by the
+  # literal and report name matching as working on a mechanism that compares
+  # addresses by equality.
+  defp require_name_distinct_from_literals(name) do
+    literals =
+      [permitted_address(), denied_address()]
+      |> Enum.map(fn {host, _port} -> host end)
+      |> Enum.flat_map(&resolve_all/1)
+      |> MapSet.new()
+
+    resolved = resolve_all(name)
+
+    cond do
+      resolved == [] ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          #{name} does not resolve from this host, so a refusal from inside the
+          sandbox says nothing about whether the allowlist matched the name.
+
+          This is the third outcome and not a pass. Name a destination this
+          deployment can resolve:
+
+              config :ex_sandbox, :conformance,
+                permitted_name_destination: {"api.internal", 443}
+          """
+        )
+
+      Enum.any?(resolved, &MapSet.member?(literals, &1)) ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          #{name} resolves to #{inspect(resolved)}, which the suite also names as
+          a literal in `permitted_destination` or `denied_destination`.
+
+          A connection to the name would then be decided by the literal entry and
+          the name would never be consulted, so a pass here would report name
+          matching against a mechanism that only compares addresses. This is the
+          third outcome and not a pass -- choose a `permitted_name_destination`
+          whose addresses are disjoint from the literals.
+          """
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  defp require_host_reaches_name(name, port) do
+    case :gen_tcp.connect(
+           to_charlist(name),
+           port,
+           [:binary, active: false],
+           @control_timeout_ms
+         ) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        :ok
+
+      {:error, reason} ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          this host cannot itself reach #{name}:#{port} (#{inspect(reason)}), so a
+          refusal from inside the sandbox is not evidence that the allowlist
+          failed to match the name -- both sides would be silent and the boundary
+          would explain nothing.
+
+          This is the third outcome and not a pass.
+          """
+        )
+    end
+  end
+
+  defp resolve_all(host) do
+    charlist = to_charlist(host)
+
+    case :inet.parse_address(charlist) do
+      {:ok, address} ->
+        [address]
+
+      {:error, _} ->
+        case :inet.getaddrs(charlist, :inet) do
+          {:ok, addresses} -> addresses
+          {:error, _} -> []
+        end
+    end
+  end
+
+  @doc """
+  Attempts to send UDP datagrams out of the sandbox's namespace
+  (`029-FR-013`, `SC-003`, 029 T005).
+
+  Two legs, both named by `SC-003`: the host's loopback as the sandbox sees it,
+  and the namespace's gateway. The gateway leg is the one with force -- under
+  `pasta` that address is the namespace's own resolver, so an answer from it is
+  a datagram that left and came back, which no TCP probe in this group can
+  observe because the redirect is `meta l4proto tcp`.
+
+  ⚠️ Requires the mechanism to declare `context.udp_probe`. Without it this
+  reports the third outcome rather than guessing, for the same reason
+  `attempt_widen_allowlist/2` does: there is no host-neutral way to send a
+  datagram from inside someone else's namespace, and a shell probe that could
+  not run would score "we did not try" as "the boundary held".
+  """
+  def attempt_udp_egress(mechanism, sandbox) do
+    with {:ok, probe} <- udp_probe(mechanism, sandbox),
+         :ok <- require_host_answers_udp() do
+      run_udp_legs(probe, sandbox)
+    end
+  end
+
+  # ⚠️ The control that stops this check reporting a boundary it never saw, and
+  # it is the same control `attempt_reach_denied_host/2` applies to TCP: if the
+  # HOST cannot get an answer from the denied resolver either, then silence from
+  # inside the sandbox distinguishes nothing and the honest report is the third
+  # outcome.
+  #
+  # Without it the check is green on any host with no route to the internet --
+  # which is a plausible CI runner, and exactly the host where a reader would
+  # most want to be told that nothing was established.
+  defp require_host_answers_udp do
+    if host_answers_udp_denied?() == :yes do
+      :ok
+    else
+      {denied_host, denied_port} = denied_address()
+
+      ExSandbox.Conformance.Helpers.capability_unavailable(
+        :network_restriction,
+        """
+        this host gets no UDP answer from #{denied_host}:#{denied_port} either,
+        so silence from inside the sandbox says nothing about whether the egress
+        policy covers UDP.
+
+        This is the third outcome and not a pass. `029-FR-013` needs a
+        destination that answers datagrams on the host and is outside the
+        environment's allowlist; without one, the only remaining legs are
+        addresses nothing is obliged to answer and their silence is not
+        evidence.
+        """
+      )
+    end
+  end
+
+  defp host_answers_udp_denied? do
+    case :persistent_term.get(@udp_control_key, :unknown) do
+      :unknown ->
+        result = measure_udp_control()
+        :persistent_term.put(@udp_control_key, result)
+        result
+
+      cached ->
+        cached
+    end
+  end
+
+  defp measure_udp_control do
+    {denied_host, denied_port} = denied_address()
+
+    case :gen_udp.open(0, [:binary, active: false]) do
+      {:ok, socket} ->
+        verdict = udp_exchange(socket, denied_host, denied_port)
+        :gen_udp.close(socket)
+        verdict
+
+      {:error, _} ->
+        :no
+    end
+  end
+
+  defp udp_exchange(socket, host, port) do
+    with :ok <- :gen_udp.send(socket, to_charlist(host), port, dns_query()),
+         {:ok, _} <- :gen_udp.recv(socket, 0, @control_timeout_ms) do
+      :yes
+    else
+      _ -> :no
+    end
+  end
+
+  # The same `example.com IN A` query the sandbox-side probe sends, and it has
+  # to be the same one: a resolver discards a malformed datagram in silence, so
+  # a control built from junk bytes would report "this host cannot demonstrate
+  # UDP" against a resolver answering perfectly well.
+  defp dns_query do
+    <<0xAB, 0xCD, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, "example", 3, "com", 0, 0, 1, 0, 1>>
+  end
+
+  defp run_udp_legs(probe, sandbox) do
+    sandbox
+    |> udp_legs()
+    |> Enum.reduce_while({:refused, {:no_datagram_returned, :udp}}, fn {host, port}, acc ->
+      case probe.(host, port) do
+        :answered ->
+          {:halt,
+           {:succeeded,
+            "a UDP datagram sent from inside the sandbox to #{host}:#{port} was " <>
+              "ANSWERED -- it left the namespace unpoliced and the reply came back, " <>
+              "so the egress policy covers TCP only (029-FR-013)"}}
+
+        :unanswered ->
+          {:cont, acc}
+
+        {:sandbox_unreachable, reason} ->
+          {:halt,
+           {:sandbox_unreachable,
+            "the sandbox became unreachable while probing #{host}:#{port} over UDP " <>
+              "(#{inspect(reason)}), so nothing was established about the boundary"}}
+
+        other ->
+          {:halt,
+           {:no_probe,
+            "this mechanism's `context.udp_probe` returned #{inspect(other)}, which is " <>
+              "not one of :answered | :unanswered, so nothing was established"}}
+      end
+    end)
+  end
+
+  defp udp_probe(_mechanism, %{context: %{udp_probe: probe}}) when is_function(probe, 2),
+    do: {:ok, probe}
+
+  defp udp_probe(_mechanism, _sandbox) do
+    ExSandbox.Conformance.Helpers.capability_unavailable(
+      :network_restriction,
+      "this mechanism's sandbox `context` carries no `:udp_probe` -- a " <>
+        "2-arity function sending a datagram from inside the sandbox and " <>
+        "answering `:answered` or `:unanswered` -- so `029-FR-013` cannot be " <>
+        "checked.\n\n" <>
+        "It is not enough for the group's TCP probes to be refused: the " <>
+        "policy this group measures is `meta l4proto tcp`, so an allowlist a " <>
+        "tenant can bypass by choosing a transport would pass every check " <>
+        "here. Populate `context.udp_probe` (`FR-011e`)."
+    )
+  end
+
+  # The loopback leg is host-independent; the gateway leg is only attempted when
+  # the mechanism says what its gateway is. Guessing one would dial an address
+  # that belongs to nothing and score its silence as a boundary.
+  #
+  # ⚠️ The denied destination is LAST and it is the only leg that can produce a
+  # red. The first two are the addresses `SC-003` names and they are kept
+  # because a leak to either would be worth catching -- but neither is obliged
+  # to answer, so on their own they can only ever produce silence. See the
+  # check's own note for the run that measured exactly that.
+  defp udp_legs(%{context: %{gateway: gateway}}) when is_binary(gateway),
+    do: [@udp_loopback, {gateway, @udp_port}, denied_address()]
+
+  defp udp_legs(_sandbox), do: [@udp_loopback, denied_address()]
 
   @doc """
   Attempts to widen the environment's own allowlist from inside the sandbox

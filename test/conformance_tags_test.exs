@@ -26,7 +26,8 @@ defmodule ExSandbox.ConformanceTagsTest do
     :credentials,
     :isolation,
     :network,
-    :resource_limits
+    :resource_limits,
+    :execution
   ]
 
   # Read from source rather than by compiling a suite.

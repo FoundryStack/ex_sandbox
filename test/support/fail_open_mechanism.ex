@@ -51,6 +51,25 @@ defmodule ExSandbox.FailOpenMechanism do
   @impl true
   def usage(_sandbox), do: {:ok, %{memory_mb: 0}}
 
+  # The R9b composition at the execution seam: the hostile command runs to
+  # completion and exits 0 under a cap this mechanism faithfully recorded
+  # applying. `ExSandbox.Conformance.Execution` must fail this, and
+  # `ExSandbox.ConformanceFailOpenTest` is what requires that it does.
+  @impl true
+  def execute(_sandbox, {_cmd, args}, _opts \\ []) do
+    command = Enum.join(args, " ")
+
+    marker =
+      cond do
+        String.contains?(command, "ALLOCATED-PAST-CAP") -> "ALLOCATED-PAST-CAP\n"
+        String.contains?(command, "SPUN-PAST-CAP") -> "SPUN-PAST-CAP\n"
+        String.contains?(command, "SLEPT-PAST-BUDGET") -> "SLEPT-PAST-BUDGET\n"
+        true -> ""
+      end
+
+    {:ok, %{exit_status: 0, stdout: marker, stderr: "", truncated?: false}}
+  end
+
   @doc """
   The caps this mechanism believes it applied.
 
