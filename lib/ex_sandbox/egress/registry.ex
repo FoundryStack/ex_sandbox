@@ -33,6 +33,24 @@ defmodule ExSandbox.Egress.Registry do
   than left to callers, because the correct ordering in a `destroy` callback is
   exactly the kind of thing a later refactor reorders without knowing why it was
   written that way.
+
+  ## Resolved answers live here too, and that is a lifecycle decision
+
+  `029 T016` makes a **hostname** allowlist entry match by consulting what this
+  sandbox resolved that name to. Those answers are per-sandbox state with
+  exactly the same reuse hazard as the policy above: sandbox B assigned A's /30
+  while A's answers survive would inherit A's *name bindings*, which is the same
+  cross-tenant error one layer down and just as invisible from outside.
+
+  ⚠️ **So they are not a second store.** Holding them here means `assign/3`'s
+  refusal and `release/2`'s delete cover both at once, and there is no second
+  ordering for a later refactor to get wrong. A separate `Resolutions` module
+  would have been tidier to read and would have re-opened the one leak this
+  module exists to close.
+
+  A record for an unregistered /30 is **refused**, not created. Creating one
+  would file answers under a sandbox that does not exist, where nothing ever
+  releases them.
   """
 
   use GenServer
@@ -91,6 +109,43 @@ defmodule ExSandbox.Egress.Registry do
     GenServer.call(server, {:registered?, source_key})
   end
 
+  @doc """
+  Files the addresses this sandbox resolved `name` to (`029-FR-012`).
+
+  Refuses with `{:error, :unknown_source}` for a /30 carrying no policy — see
+  the moduledoc on why an entry is never created here.
+
+  ⚠️ Answers **accumulate** rather than replace. A name legitimately resolves to
+  a different member of a rotation on each query, and a connection opened
+  against the first answer while the second is being recorded must not be
+  refused for it. The set is bounded by `release/2`, which is the sandbox's own
+  lifetime.
+  """
+  @spec record_resolution(
+          Policy.source_key(),
+          String.t(),
+          [:inet.ip_address()],
+          GenServer.server()
+        ) :: :ok | {:error, :unknown_source}
+  def record_resolution(source_key, name, addresses, server \\ @name)
+      when is_binary(name) and is_list(addresses) do
+    GenServer.call(server, {:record_resolution, source_key, name, addresses})
+  end
+
+  @doc """
+  What this sandbox resolved, as `%{name => MapSet.t(address)}`.
+
+  ⚠️ `%{}` on a miss, for the same reason `lookup/2` answers `[]`: the miss path
+  and the deny path must be one path. An empty map permits no name, so a
+  sandbox that never resolved anything reaches no hostname entry.
+  """
+  @spec resolutions(Policy.source_key(), GenServer.server()) :: %{
+          optional(String.t()) => MapSet.t(:inet.ip_address())
+        }
+  def resolutions(source_key, server \\ @name) do
+    GenServer.call(server, {:resolutions, source_key})
+  end
+
   # -- Callbacks ------------------------------------------------------------
 
   @impl true
@@ -108,12 +163,12 @@ defmodule ExSandbox.Egress.Registry do
         {:reply, {:error, {:still_registered, key}}, policies}
 
       :error ->
-        {:reply, :ok, Map.put(policies, key, allowed)}
+        {:reply, :ok, Map.put(policies, key, %{allowed: allowed, resolutions: %{}})}
     end
   end
 
   def handle_call({:lookup, key}, _from, policies) do
-    {:reply, Map.get(policies, key, []), policies}
+    {:reply, entry(policies, key).allowed, policies}
   end
 
   def handle_call({:release, key}, _from, policies) do
@@ -123,4 +178,38 @@ defmodule ExSandbox.Egress.Registry do
   def handle_call({:registered?, key}, _from, policies) do
     {:reply, Map.has_key?(policies, key), policies}
   end
+
+  def handle_call({:resolutions, key}, _from, policies) do
+    {:reply, entry(policies, key).resolutions, policies}
+  end
+
+  def handle_call({:record_resolution, key, name, addresses}, _from, policies) do
+    case Map.fetch(policies, key) do
+      :error ->
+        # ⚠️ Refused rather than created. An entry made here would be filed
+        # under a /30 no `release/2` will ever be called for, and it would then
+        # be inherited by the next tenant to be assigned that /30 -- the exact
+        # leak the moduledoc's invariant exists to close, reintroduced through
+        # a side door.
+        {:reply, {:error, :unknown_source}, policies}
+
+      {:ok, %{resolutions: resolutions} = existing} ->
+        merged =
+          Map.update(
+            resolutions,
+            name,
+            MapSet.new(addresses),
+            &Enum.into(addresses, &1)
+          )
+
+        {:reply, :ok, Map.put(policies, key, %{existing | resolutions: merged})}
+    end
+  end
+
+  # ⚠️ The miss returns a *shaped* empty entry rather than `nil`, so every
+  # reader above takes the same path on a miss as on a hit and none of them can
+  # forget to handle one. `[]` denies every destination and `%{}` matches no
+  # name, so the miss is the most restrictive answer rather than an absent one.
+  defp entry(policies, key),
+    do: Map.get(policies, key, %{allowed: [], resolutions: %{}})
 end

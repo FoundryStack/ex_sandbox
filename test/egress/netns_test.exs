@@ -304,26 +304,53 @@ defmodule ExSandbox.Egress.NetnsTest do
 
     test "the resolver is the SOLE permitted UDP destination", %{resolved: commands} do
       # The ruling (029 T011) is resolver-as-sole-destination, not an allowlist
-      # over UDP. Exactly one exemption, pinned to one address and one port.
+      # over UDP. Both exemptions are pinned to one address and one port.
+      #
+      # ⚠️ **TWO rules, and this test asserted ONE until the round trip was
+      # measured.** A DNS exchange has an answer, the answer is also `output`
+      # traffic from this chain's point of view, and it carries the resolver as
+      # its SOURCE -- so the query rule cannot match it. Measured inside
+      # `unshare -n` against a stub nameserver on `127.0.0.1:53` under the
+      # one-rule shape this test used to require: the query was sent, the
+      # stub's reply was refused with EPERM, and the client timed out. The
+      # sandbox had no DNS while every rule installed cleanly.
+      #
+      # "Sole destination" is still exactly what is enforced. The second rule
+      # readmits datagrams whose source is that same one address and port, and
+      # nothing else -- so no new destination becomes reachable.
       exemptions = Enum.filter(commands, &("accept" in &1))
-      assert length(exemptions) == 1, "more than one UDP destination was permitted"
 
-      [rule] = exemptions
-      assert "10.0.0.53" in rule
-      assert "daddr" in rule, "an exemption with no destination match permits UDP to anywhere"
-      assert "53" in rule
+      assert length(exemptions) == 2,
+             "the exemption must cover the query and its answer, and no more"
+
+      for rule <- exemptions do
+        assert "10.0.0.53" in rule
+        assert "53" in rule
+
+        assert "daddr" in rule or "saddr" in rule,
+               "an exemption with no address match permits UDP to anywhere"
+      end
+
+      assert Enum.count(exemptions, &("daddr" in &1)) == 1
+      assert Enum.count(exemptions, &("saddr" in &1)) == 1
     end
 
     test "an IPv6 resolver is matched with ip6 daddr, not ip daddr", %{} do
       # In an `inet` table `ip daddr` matches IPv4 packets only, so an IPv6
       # resolver named with it would install cleanly and match nothing --
       # a configured resolver that is unreachable.
-      [rule] =
+      rules =
         Netns.redirect_commands(4242, 18_080, {{0xFD00, 0, 0, 0, 0, 0, 0, 1}, 53})
         |> Enum.filter(&("accept" in &1))
 
-      assert "ip6" in rule
-      assert "fd00::1" in rule
+      # Both halves of the round trip, or the answer is dropped -- see the
+      # measurement recorded on the test above.
+      assert length(rules) == 2
+
+      for rule <- rules do
+        assert "ip6" in rule
+        assert "fd00::1" in rule
+      end
     end
 
     test "a resolver address that is not an address is refused, not ignored", %{} do

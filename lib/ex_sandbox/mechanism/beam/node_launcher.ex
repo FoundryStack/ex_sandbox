@@ -384,13 +384,23 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     # lose egress entirely while every denial check still passed.
     verdict = Keyword.get_lazy(opts, :verdict_path, &running_verdict_path/0)
 
+    resolver_socket =
+      Keyword.get_lazy(opts, :resolver_path, &ExSandbox.Egress.Resolver.default_path/0)
+
     command =
       ExSandbox.Egress.Acceptor.listener_command(
         holder_pid,
         plan.pool_port,
         helper,
         verdict,
-        plan.source_key
+        plan.source_key,
+        resolver_socket,
+        # ⚠️ From the PLAN, not from configuration. The plan already validated
+        # this address and it is the same value the `nft` exemption was built
+        # from, so the listener cannot end up bound somewhere the rule does not
+        # permit. Reading the config key a second time here is exactly the drift
+        # `Acceptor.listener_command/7` warns about.
+        plan.resolver
       )
 
     [prog | args] = command
