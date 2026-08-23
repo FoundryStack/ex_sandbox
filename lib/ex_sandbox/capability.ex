@@ -24,6 +24,61 @@ defmodule ExSandbox.Capability do
   So a check here answers "could this host enforce the cap at all", and it
   errs toward `false`. Whether a **particular mechanism** actually enforces it
   is `ExSandbox.Conformance`'s question, answered by breaching it.
+
+  ## The coarse name and its decomposition (`014-FR-013a`, T004)
+
+  `:resource_limits` remains the **coarse, Linux-facing name**, and it stays.
+  `ExSandbox.Mechanism.Beam.required_capabilities/0` names it, and its comment
+  records why one name suffices there: the memory and CPU caps "both come from
+  the same cgroup scope, and a host with one has the other". On Linux that is
+  true, and a single gate over a single mechanism is the honest shape.
+
+  It stops being true off Linux, which is what `014-FR-013a` is about. `005`
+  R9b measured a macOS host where the caps come apart: `RLIMIT_CPU` is honoured
+  by the kernel while `RLIMIT_AS`/`DATA`/`RSS` fail `setrlimit` with `EINVAL`,
+  and the memory cap survives or is lost depending on where `taskpolicy` sits
+  in the process tree. One summary level cannot report that host without lying
+  in one direction or the other.
+
+  So `:process_separation`, `:memory_cap`, `:cpu_cap` and `:time_budget` are
+  `:resource_limits`' **per-capability decomposition** — an additional, finer
+  vocabulary, not a replacement. Two rules keep the two from drifting apart,
+  and both exist because a split verdict on one underlying fact is a defect
+  this file has already carried more than once (005 T060a5c, T060c):
+
+    * On Linux the three host-enforced names are **derived** from the existing
+      cgroup v2 probe rather than re-probing it. Two probes of one fact are two
+      things that must stay equal forever, and the symptom of their drifting is
+      a cap reported enforced on a host that does not enforce it.
+
+    * `:time_budget` is derived from nothing, because it is **not a host fact
+      at all**. `014-FR-014b` places its enforcement in the supervising BEAM,
+      so no probe here can observe it and no cgroup verdict says anything about
+      it. See `time_budget_not_a_host_capability/1`.
+
+  ## Three Darwin names now report `available`, and what that cost (014 T020)
+
+  Every Darwin clause below used to report `unavailable`, on the correct
+  grounds that no backend existed to watch stopping a breach. `014` Phase 3
+  built one, and Phase 4 observed the breaches: `:memory_cap`, `:cpu_cap` and
+  `:process_separation` are derived from
+  `ExSandbox.Hardening.Darwin.capabilities/0`, whose probe runs the real
+  composition rather than looking for binaries on the `PATH`.
+
+  The claim rests on `ExSandbox.Hardening.DarwinOrderingTest` (`SC-003`), which
+  runs R9b's misordered composition and the backend's own composition in one
+  run and requires them to *differ* — 0 with 300 MB allocated against 137.
+  Without that pair, `FR-014a`'s standard is not met and these names go back.
+
+  Everything else on Darwin still reports `unavailable`, and each detail names
+  what is missing rather than merely asserting absence:
+
+    * `:time_budget` — not a host fact anywhere, see
+      `time_budget_not_a_host_capability/1`.
+    * `:privilege_separation` — a deny-list `sandbox-exec` profile is not
+      default-deny confinement (T021).
+    * `:filesystem_confinement`, `:network_restriction`, `:disk_quota`,
+      `:resource_limits` — each for the reason its clause states.
   """
 
   # Bounded so a probe cannot hang the gateway's startup: `capabilities/0` is
@@ -39,6 +94,12 @@ defmodule ExSandbox.Capability do
           | :privilege_separation
           | :network_restriction
           | :disk_quota
+          # `:resource_limits`' per-capability decomposition (014-FR-013a).
+          # See the moduledoc: additional names, not replacements.
+          | :process_separation
+          | :memory_cap
+          | :cpu_cap
+          | :time_budget
 
   @type t :: %__MODULE__{
           name: name(),
@@ -54,12 +115,51 @@ defmodule ExSandbox.Capability do
     :filesystem_confinement,
     :privilege_separation,
     :network_restriction,
+    :disk_quota,
+    :process_separation,
+    :memory_cap,
+    :cpu_cap,
+    :time_budget
+  ]
+
+  # ⚠️ **The coarse names, and the ONLY ones a mechanism is gated on by default.**
+  #
+  # `@known` serves two purposes that diverged the moment `014` T004 landed: it
+  # is the reporting vocabulary `FR-013a` requires, and it is the fallback
+  # `ExSandbox.required_capabilities/1` uses for a mechanism that does not
+  # export `required_capabilities/0`. Those are not the same list any more.
+  #
+  # MEASURED consequence of conflating them: `:time_budget` reports
+  # `unavailable` on **every** host by design -- it is not a host fact, see
+  # `time_budget_not_a_host_capability/1` -- so a fallback containing it can
+  # never be satisfied anywhere. That turns an optional callback into a
+  # mandatory one silently, and the symptom is
+  # `{:error, {:capability_unavailable, [:time_budget]}}`, which names a
+  # capability the operator cannot install rather than the callback the
+  # mechanism forgot to write.
+  #
+  # So the gating default stays the pre-`014` set. Widening the *vocabulary*
+  # must not widen what refuses a launch.
+  @gating_defaults [
+    :resource_limits,
+    :filesystem_confinement,
+    :privilege_separation,
+    :network_restriction,
     :disk_quota
   ]
 
   @doc "Every capability this library knows how to check."
   @spec known() :: [name()]
   def known, do: @known
+
+  @doc """
+  The capabilities a mechanism is gated on when it declares none.
+
+  Deliberately narrower than `known/0` -- see the note above it. A name that is
+  `unavailable` on every host belongs in the report and never in the gate.
+  """
+  @spec gating_defaults() :: [name()]
+  def gating_defaults, do: @gating_defaults
 
   @doc """
   Checks one capability against the running host.
@@ -144,6 +244,191 @@ defmodule ExSandbox.Capability do
       "macOS `taskpolicy -m` applies to its immediate child only and is silently " <>
         "lost across an intervening exec (005 R9b), so a configured cap is not an " <>
         "enforced cap"
+    )
+  end
+
+  # ── `:resource_limits`' per-capability decomposition (014-FR-013a, T004-T006)
+  #
+  # ⚠️ On Linux these are DERIVED from the clause above, never re-probed, and
+  # the rule is not a tidiness preference. `:resource_limits` and each name
+  # below answer the *same underlying question* -- is there a cgroup v2 scope
+  # this launch can be placed in -- so two probes of it are two things that
+  # must stay equal forever. This file has already paid for that twice: 005
+  # T060a5c and T060c both record two probes of one capability splitting, and
+  # in both cases the visible symptom was not "one probe is wrong" but a
+  # boundary reported present on a host that did not build it.
+  #
+  # Derivation makes the split unrepresentable rather than merely tested for.
+  defp do_check(:memory_cap, {:unix, :linux} = os) do
+    derive_from_resource_limits(
+      :memory_cap,
+      os,
+      "a memory cap is `memory.max` in the cgroup v2 scope the launch creates"
+    )
+  end
+
+  defp do_check(:cpu_cap, {:unix, :linux} = os) do
+    derive_from_resource_limits(
+      :cpu_cap,
+      os,
+      "a CPU cap is `cpu.max` in the cgroup v2 scope the launch creates, the same " <>
+        "scope the memory cap comes from"
+    )
+  end
+
+  # ⚠️ This one is derived on a DIFFERENT argument from the two above, and the
+  # difference is worth stating rather than hiding behind a shared helper call.
+  #
+  # A separate OS process is not a cgroup fact: every Linux host can fork and
+  # exec one, cgroup v2 or not. Derived from the cgroup probe, this name
+  # therefore *under*-claims on a cgroup-less Linux host -- it reports
+  # unavailable where the bare mechanism would in fact have worked.
+  #
+  # That under-claim is both the fail-safe direction and, for this library,
+  # operationally exact. `Mechanism.Beam.required_capabilities/0` names
+  # `:resource_limits`, so on a host without cgroup v2 `ExSandbox.provision/2`
+  # refuses and **no sandbox process is launched at all**. There is no state in
+  # which this library delivers process separation there, so reporting it
+  # available would describe a launch that cannot happen.
+  #
+  # The alternative -- probing "can this host run a process", which is always
+  # true -- is a check that cannot fail, the shape 005 R9's `{:error, :undef}`
+  # finding warns about.
+  defp do_check(:process_separation, {:unix, :linux} = os) do
+    derive_from_resource_limits(
+      :process_separation,
+      os,
+      "the tenant's separate OS process is the thing placed in the cgroup v2 " <>
+        "scope, and `Mechanism.Beam` requires `:resource_limits`, so without that " <>
+        "scope no sandbox process is launched at all"
+    )
+  end
+
+  # ⚠️ NOT derived, and not probed either. See
+  # `time_budget_not_a_host_capability/1` -- deriving this from cgroup v2 would
+  # be wrong in both directions.
+  defp do_check(:time_budget, {:unix, :linux} = os),
+    do: time_budget_not_a_host_capability(os)
+
+  defp do_check(:time_budget, {:unix, :darwin} = os),
+    do: time_budget_not_a_host_capability(os)
+
+  # ── Darwin: three names flipped on measured evidence (014 T020, `FR-014a`)
+  #
+  # These three read `unavailable` until `014` Phase 3, on the correct grounds
+  # that nothing had been watched stopping a breach here. That is no longer the
+  # state. `ExSandbox.Hardening.Darwin` exists, and the breaches have been
+  # observed being stopped on this host, per capability:
+  #
+  #   * `:memory_cap` -- `hog 300` under `taskpolicy -m 150` exits **137** having
+  #     printed `mb 100`, so it was stopped BY the cap rather than never running
+  #     (T007).
+  #   * `:cpu_cap` -- a spinner that does **not** call `setrlimit` on itself
+  #     exits **152** under the backend's `ulimit -t`, while the identical
+  #     spinner under a ceiling it cannot reach runs until the harness kills it
+  #     (T008, as amended by T002 Finding 1).
+  #   * `:process_separation` -- the tenant runs as its own OS process: it
+  #     segfaults to **139** without touching this VM, and its pid is not this
+  #     VM's (T010, T016).
+  #
+  # And the evidence `FR-014a` actually demands for the *claim* is the ordering
+  # regression test: `ExSandbox.Hardening.DarwinOrderingTest` runs R9b's
+  # misordered composition and the backend's own composition side by side in one
+  # run, requires the first to exit 0 with 300 MB allocated and the second to
+  # exit 137, and requires them to differ (T017, `SC-003`). Without that pair,
+  # 137 alone would not distinguish a cap that holds from a host that stopped
+  # losing it.
+  #
+  # ⚠️ `:time_budget` is NOT flipped with them, and its absence here is a
+  # decision rather than an oversight (Phase 3 Finding C). It is not a host
+  # fact: `FR-014b` places its enforcement in the supervising BEAM, so no host
+  # provides or withholds it, and `gating_defaults/0` excludes it on exactly
+  # that reasoning. Flipping it on one OS would make it a host fact on one OS
+  # and not the other -- a state neither the report nor the gate can represent.
+  # See `time_budget_not_a_host_capability/1`.
+  #
+  # ⚠️ And `:filesystem_confinement` is not flipped either, though the Darwin
+  # backend does report constructing it. That divergence is deliberate and
+  # documented at the clause below; it is the one name where these two modules
+  # are asking different questions.
+  #
+  # ── Derived from the backend, never re-probed
+  #
+  # Each clause reads `ExSandbox.Hardening.Darwin.capabilities/0` rather than
+  # probing `sandbox-exec` and `taskpolicy` again here. That is the same rule as
+  # `derive_from_resource_limits/3` one screen up, applied across a module
+  # boundary, and it is applied for the reason stated there: two probes of one
+  # fact are two things that must stay equal forever, and this file has twice
+  # recorded them splitting (005 T060a5c, T060c) with the symptom being a
+  # boundary reported present on a host that never built it.
+  #
+  # A cheap presence check here -- "is `taskpolicy` on the PATH" -- is the exact
+  # shape the `:filesystem_confinement` and `:network_restriction` comments
+  # above were written against: it answers a question nobody asked, and it
+  # reports available on a host where `sandbox-exec` rejects the generated
+  # profile. The backend's probe renders a real profile and runs the full
+  # four-layer composition, which is the observed-behaviour standard this
+  # module's own moduledoc sets.
+  #
+  # ⚠️ Cost: that probe launches a process (~13 ms measured). `check_all/0` on
+  # Darwin therefore pays it once per derived name. Bounded, but not free, and
+  # worth knowing before adding a fourth caller on the provisioning path.
+  defp do_check(:memory_cap, {:unix, :darwin}) do
+    derive_from_darwin_backend(
+      :memory_cap,
+      "a memory cap here is `taskpolicy -m` placed as the target's immediate parent " <>
+        "inside a `sandbox-exec` profile; `RLIMIT_AS`, `RLIMIT_DATA` and `RLIMIT_RSS` " <>
+        "all fail `setrlimit` with EINVAL on Darwin, so there is no fallback that caps " <>
+        "anything"
+    )
+  end
+
+  defp do_check(:cpu_cap, {:unix, :darwin}) do
+    derive_from_darwin_backend(
+      :cpu_cap,
+      "a CPU cap here is `ulimit -t` in the shell the backend composes -- a ceiling on " <>
+        "CPU-seconds CONSUMED, not on the rate of consumption, since Darwin offers this " <>
+        "composition no rate cap at all"
+    )
+  end
+
+  defp do_check(:process_separation, {:unix, :darwin}) do
+    derive_from_darwin_backend(
+      :process_separation,
+      "separation here is the tenant running as its own OS process under a " <>
+        "`sandbox-exec` profile, which is what the backend's composition launches"
+    )
+  end
+
+  # ⚠️ macOS keeps reporting `unavailable`, and it keeps reporting it even when
+  # the caller is root -- which the generic `{:unix, _}` clause below would
+  # answer `available` for (014 T021).
+  #
+  # The generic clause asks one question: can this process drop to an
+  # unprivileged uid? On Linux that is the whole of `:privilege_separation`,
+  # because the dropped uid is composed with a mount namespace and a
+  # default-deny filesystem. On Darwin the second half does not exist. The
+  # profile `Hardening.Darwin` generates starts from `(allow default)` and
+  # denies a list -- and it starts there because `(deny default)` was MEASURED
+  # to kill even `/bin/echo`, since `dyld` cannot start (005 R9b).
+  #
+  # A deny-list over a permissive default is not default-deny confinement: every
+  # operation nobody thought to deny is allowed. Reporting `available` on the
+  # strength of a uid drop alone would describe that profile as equivalent to
+  # `bwrap`'s, which is precisely the "weakly-isolated local run presented as
+  # equivalently isolated" that `FR-013` exists to prevent.
+  #
+  # This is the gap the report is *for*. Papering over it costs the honesty that
+  # is this whole capability's purpose.
+  defp do_check(:privilege_separation, {:unix, :darwin}) do
+    unavailable(
+      :privilege_separation,
+      "the macOS backend confines with a `sandbox-exec` profile that starts from " <>
+        "`(allow default)` and denies a list. `(deny default)` is not viable here -- " <>
+        "it kills even /bin/echo, because dyld cannot start (005 R9b) -- so any " <>
+        "operation the profile does not name is permitted. That is a deny-list, not " <>
+        "default-deny confinement, and it is not equivalent to the dropped uid plus " <>
+        "mount namespace this capability means on Linux (014 FR-013, T021)"
     )
   end
 
@@ -379,6 +664,95 @@ defmodule ExSandbox.Capability do
   # claiming on an unknown host is FR-012b's rule.
   defp do_check(name, os) do
     unavailable(name, "unsupported host: #{inspect(os)}")
+  end
+
+  # One probe, several names (014-FR-013a). The verdict is *read from* the
+  # coarse `:resource_limits` clause rather than recomputed, so the two cannot
+  # answer differently about the same host -- and the coarse clause's detail is
+  # carried through, because "unavailable" without the cause is the kind of
+  # message that gets ignored (see `missing/1`).
+  #
+  # ⚠️ The direction of a future edit matters here. Adding a second condition to
+  # a derived name is how the drift starts: it belongs in the coarse clause, so
+  # every name that decomposes it moves together.
+  # One probe, several names — the Darwin half (014 T020). The verdict is *read
+  # from* `ExSandbox.Hardening.Darwin.capabilities/0` rather than recomputed
+  # here, so the two modules cannot answer differently about the same host.
+  #
+  # ⚠️ `ExSandbox.CapabilityTest`'s Darwin agreement guard asserts exactly that
+  # (T023). It is written to fail if this derivation is ever replaced by a
+  # second probe — which is the direction a future edit drifts, because a
+  # presence check here looks cheaper than a launch over there.
+  #
+  # ⚠️ A name absent from the backend's map is reported unavailable, not
+  # assumed. The backend deliberately omits what it does not claim
+  # (`:network_restriction`, `:disk_quota`), and treating "the backend does not
+  # answer" as "yes" is the fail-open shape this whole module is written
+  # against.
+  defp derive_from_darwin_backend(name, why) do
+    case Map.get(ExSandbox.Hardening.Darwin.capabilities(), name) do
+      true ->
+        available(name)
+
+      _ ->
+        unavailable(
+          name,
+          "#{why}, and `ExSandbox.Hardening.Darwin` could not construct it on this host. " <>
+            "That probe renders a real profile and runs the full composition, so this is " <>
+            "an attempted launch failing rather than a missing binary being inferred from"
+        )
+    end
+  end
+
+  defp derive_from_resource_limits(name, os, why) do
+    case do_check(:resource_limits, os) do
+      %__MODULE__{available?: true} ->
+        available(name)
+
+      %__MODULE__{detail: detail} ->
+        unavailable(name, "#{why}, and that scope is unavailable here: #{detail}")
+    end
+  end
+
+  # ⚠️ `:time_budget` is the one name in the decomposition that is NOT a
+  # property of the host, and deriving it from the cgroup probe like its three
+  # siblings would be wrong in **both** directions:
+  #
+  #   * On a Linux host without cgroup v2 it would report the budget
+  #     unavailable, when the supervising BEAM's timer works there exactly as
+  #     it does anywhere else. That is an under-claim with teeth: `014-FR-014b`
+  #     makes a missing time budget the one shortfall that must **refuse the
+  #     run** rather than degrade it, so a false `unavailable` here does not
+  #     cost a warning, it costs the deployment.
+  #
+  #   * On a host with cgroup v2 it would report the budget available on the
+  #     strength of `memory.max` and `cpu.max` existing -- evidence about two
+  #     other caps, and none at all about a wall-clock timer. `FR-015` exists
+  #     precisely because the CPU cap does **not** fire on an idle block, so
+  #     inferring one from the other reports the hang outcome as covered by the
+  #     mechanism that R9b measured missing it.
+  #
+  # So it is neither derived nor probed. It reports `unavailable` on every
+  # host, and the detail says why an answer is not available rather than
+  # pretending the answer is "no": nothing in this library has yet been
+  # observed killing an idle run against a budget, and `FR-014a`'s standard is
+  # observation. `014` T009 and T019 are where that observation gets made; T020
+  # is where a name may be flipped on the strength of it.
+  #
+  # ⚠️ Until then, do not read this `false` as "this host cannot do it". It
+  # means "this module cannot tell you", which the fail-safe rule renders as
+  # `available?: false` -- the same shape as an unknown capability name above.
+  defp time_budget_not_a_host_capability(os) do
+    unavailable(
+      :time_budget,
+      "the wall-clock budget is enforced by the supervising BEAM rather than by any " <>
+        "host mechanism (014-FR-014b), so #{inspect(os)} neither provides nor withholds " <>
+        "it and this probe cannot observe it. It is reported unavailable because no " <>
+        "supervisor has yet been watched terminating an idle run against a budget, and " <>
+        "FR-014a admits a cap only on observed behaviour -- not because the host lacks " <>
+        "something. Deriving it from the cgroup v2 probe would answer about `memory.max` " <>
+        "and `cpu.max`, which say nothing about an idle block (FR-015)"
+    )
   end
 
   # Evidence, not configuration (FR-012a): the confinement is actually built and

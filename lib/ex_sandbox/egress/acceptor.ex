@@ -111,9 +111,44 @@ defmodule ExSandbox.Egress.Acceptor do
           :inet.port_number(),
           String.t(),
           String.t(),
-          Policy.source_key()
+          Policy.source_key(),
+          String.t(),
+          {:inet.ip_address(), :inet.port_number()} | nil
         ) :: [String.t()]
-  def listener_command(holder_pid, port, helper_path, verdict_path, source_key) do
+  def listener_command(
+        holder_pid,
+        port,
+        helper_path,
+        verdict_path,
+        source_key,
+        resolver_path,
+        nil
+      ) do
+    # ⚠️ Port `0` is the helper's "serve no DNS" signal, and it is reached only
+    # when the plan carries no resolver -- which is `LaunchPlan`'s explicit
+    # "this sandbox has no name resolution at all". It is not a fallback: a
+    # resolver that was configured and could not be read raises at plan-build
+    # time and never gets here.
+    listener_command(
+      holder_pid,
+      port,
+      helper_path,
+      verdict_path,
+      source_key,
+      resolver_path,
+      {{0, 0, 0, 0}, 0}
+    )
+  end
+
+  def listener_command(
+        holder_pid,
+        port,
+        helper_path,
+        verdict_path,
+        source_key,
+        resolver_path,
+        {resolver_address, resolver_port}
+      ) do
     # ⚠️ `-U`, not a bare `-n`. The BEAM stands outside the platform user
     # namespace that owns this netns, and from there `-n` alone is refused --
     # see `ExSandbox.Egress.Netns` for the measurement of both forms from both
@@ -144,7 +179,21 @@ defmodule ExSandbox.Egress.Acceptor do
       # its own existence. Deriving identity from the peer would consult a value
       # the tenant partly controls to answer a question already answered by
       # connecting at all.
-      source_key_text(source_key)
+      source_key_text(source_key),
+      # ⚠️ The DNS half (029 T015). The same process carries it for the same
+      # reason it carries TCP -- a socket the sandbox can reach must be created
+      # from inside the namespace -- and it holds no more policy for DNS than it
+      # does for TCP: it relays query bytes to `ExSandbox.Egress.Resolver` and
+      # writes back what the platform answers.
+      #
+      # ⚠️ The bind address is passed rather than defaulted in the helper. It
+      # must be **the same address** the `nft` exemption permits, and a default
+      # on either side is a second place for that value to live. If the two
+      # drifted, the listener would be bound where nothing is permitted to send:
+      # DNS silently dead, and every denial check still green.
+      resolver_path,
+      to_string(:inet.ntoa(resolver_address)),
+      "#{resolver_port}"
     ]
   end
 

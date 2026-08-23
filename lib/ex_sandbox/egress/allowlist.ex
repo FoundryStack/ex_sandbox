@@ -230,6 +230,111 @@ defmodule ExSandbox.Egress.Allowlist do
   # exactly the access the mistake describes.
   def parse(other, _host_aliases), do: {:error, {:invalid_entries, [other]}}
 
+  @doc """
+  The class `host` would be refused for, or `nil` if it names nowhere excluded.
+
+  ⚠️ **Public because `029-FR-015`'s exclusion applies to resolved answers as
+  well as to written entries**, and the two must name the **same class for the
+  same address**. `ExSandbox.Egress.Resolver` runs every answer it is about to
+  record through this function, so a name whose zone points at `127.0.0.1`
+  produces `:loopback` at connect time exactly as writing `127.0.0.1` produces
+  `:loopback` at parse time. A second classifier would drift, and the drift
+  would show up as one surface refusing what the other permits, with no test
+  able to see both.
+
+  `host` may be an address tuple or a string; `host_aliases` has the same
+  meaning as in `parse/2`.
+  """
+  @spec classify(term(), [host_alias()]) :: class() | nil
+  def classify(host, host_aliases \\ []),
+    do: host_class(host, normalise_aliases(host_aliases))
+
+  @doc """
+  Why an entry of `class` was refused, as a clause a person can act on.
+
+  ⚠️ **This is the half of `029-FR-015` that had no reader, and the class
+  existed for it.** `parse/2` has named a class since `029` T008 and every
+  caller propagated the tuple opaquely, so what reached an operator was
+  "provisioning failed" — the exact sentence the class was added to replace.
+  A class nobody renders is the same defect as a check that cannot fail.
+
+  The sentence lives **here**, beside the classifier, rather than at whichever
+  surface happens to show it. Two surfaces writing their own would be two
+  vocabularies for one set of atoms, and the one nobody reads is the one that
+  stops matching `address_class/1`.
+
+  ⚠️ The atom is **not** in the sentence — `describe/1` puts it there. This is
+  the prose half only, so a caller rendering somewhere the atom would be noise
+  can leave it out.
+  """
+  @spec describe_class(class()) :: String.t()
+  def describe_class(:loopback), do: "names loopback — the sandbox itself"
+
+  def describe_class(:rfc1918_private),
+    do: "names a private network, which is the operator's, not the tenant's"
+
+  def describe_class(:link_local), do: "names a link-local address"
+
+  def describe_class(:cloud_metadata),
+    do: "names the cloud instance-metadata endpoint, which holds this host's credentials"
+
+  def describe_class(:unique_local), do: "names an IPv6 unique-local address"
+
+  def describe_class(:unspecified),
+    do: "names the unspecified address, which connects to loopback"
+
+  def describe_class(:host_alias), do: "is another name for the host this sandbox runs on"
+
+  @doc """
+  Renders a `parse/2` error as sentences naming **every** entry and its class.
+
+  This is what `029-FR-014` asks for and what nothing produced: the answer to
+  *"why was this refused?"* in a form that can be put in front of a person
+  who is not going to read `address_class/1`.
+
+  ⚠️ **The class atom is printed literally, alongside its prose.** Not
+  decoration: `:cloud_metadata` is the string an operator greps for, pastes
+  into a bug report, and matches against this module's own table. A sentence
+  alone would be readable and unsearchable.
+
+  ⚠️ **Every refused entry is listed, not the first.** The refusal is already
+  the second round trip for an operator who also had unreadable entries (see
+  the moduledoc); making them fix refusals one per provision would be a third,
+  fourth and fifth.
+  """
+  @spec describe(error()) :: String.t()
+  def describe({:refused_entries, entries}) do
+    "The network allowlist was understood and declined: " <>
+      Enum.map_join(entries, "; ", fn {entry, class} ->
+        "#{format_entry(entry)} #{describe_class(class)} (#{inspect(class)})"
+      end) <> "."
+  end
+
+  def describe({:invalid_entries, entries}) do
+    "The network allowlist could not be read: " <>
+      Enum.map_join(entries, "; ", &format_entry/1) <>
+      ". An entry is written host:port, or host:* for every port."
+  end
+
+  # An entry is echoed **as the operator wrote it** wherever it is a string,
+  # because the thing they have to go and edit is that string. Already-parsed
+  # tuple forms have no written spelling to echo, so one is composed.
+  defp format_entry(entry) when is_binary(entry), do: entry
+  defp format_entry({host, :any_port}), do: "#{format_host(host)}:*"
+  defp format_entry({host, port}) when is_integer(port), do: "#{format_host(host)}:#{port}"
+  defp format_entry(other), do: inspect(other)
+
+  defp format_host(host) when is_binary(host), do: host
+
+  defp format_host(host) when is_tuple(host) do
+    case :inet.ntoa(host) do
+      {:error, _} -> inspect(host)
+      charlist -> List.to_string(charlist)
+    end
+  end
+
+  defp format_host(other), do: inspect(other)
+
   # The port is deliberately unread. A destination either is the host or is not;
   # a class that depended on the port would refuse `127.0.0.1:5432` and permit
   # `127.0.0.1:5433`.
@@ -243,14 +348,11 @@ defmodule ExSandbox.Egress.Allowlist do
   # first means aliases inherit that permissive parsing for free rather than
   # needing a spelling table nobody can keep complete.
   #
-  # ⚠️ **029 T008's built-in classes belong in this function too**, in the two
-  # marked seams below -- `:loopback`, `:rfc1918_private`, `:link_local`,
-  # `:cloud_metadata`, `:unique_local`, `:unspecified` on the address branch and
-  # the `localhost` family on the name branch. They are **absent from this
-  # tree** (T008 is unchecked in `029/tasks.md` here and no such code exists),
-  # so the seams are empty rather than reimplemented -- rebuilding them would
-  # produce a second, divergent copy and a merge that could silently keep the
-  # wrong one.
+  # ⚠️ **029 T008's built-in classes are folded in below** -- `:loopback`,
+  # `:rfc1918_private`, `:link_local`, `:cloud_metadata`, `:unique_local`,
+  # `:unspecified` on the address branch and the `localhost` family on the name
+  # branch. (An earlier revision of this comment said they were absent from the
+  # tree; they were merged in the same fold and the note outlived its subject.)
   @spec host_class(term(), %{addresses: MapSet.t(), names: MapSet.t()}) :: class() | nil
   defp host_class(host, aliases) do
     case normalise_host(host) do

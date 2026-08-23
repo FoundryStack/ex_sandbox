@@ -68,18 +68,69 @@ missing_capabilities =
     []
   end
 
-# ⚠️ Only the OS decides `excluded`. A capability shortfall must NOT be
-# expressed here, and the reason is measured: `run-isolation-tests.sh` passes
-# `--include isolation --include reclamation` precisely so that an accidental
-# edit to this file cannot silently shrink the run. `--include` re-admits an
-# excluded tag, so an exclusion added here is overridden inside the very
-# container where it would matter -- it changes the local run and nothing else.
+# ⚠️ The CAPABILITY decides `excluded`, and the operating system is only the
+# cheapest way to be sure the capability is absent. This line used to read
+# `if linux?, do: [], else: [...]`, on the argument that a capability shortfall
+# must never be expressed here -- `run-isolation-tests.sh` passes
+# `--include isolation --include reclamation`, `--include` re-admits an excluded
+# tag, so an exclusion here is inert inside the container and "changes the local
+# run and nothing else".
 #
-# The capability shortfall is handled where `--include` cannot reach it:
-# `ExSandbox.Test.IsolationLaunch.provision_or_skip/2` refuses at the point of
-# provisioning, naming the missing capability. The warning below still fires so
-# the shortfall is impossible to miss.
-excluded = if linux?, do: [], else: [:isolation, :reclamation]
+# ⚠️ That argument was right about the mechanism and wrong about the population.
+# There is a third kind of host besides "macOS" and "the isolation container": a
+# **Linux machine with none of the capabilities**, and it is the one CI runs on.
+# MEASURED, run 32590944743 on `main`: `library-boundary (ex_sandbox)` -- the job
+# `ci.yml` calls required and "not a lint job" -- failed **32 tests**, every one
+# of them `NOT DEMONSTRATED (host capability unavailable)`. `ubuntu-latest`
+# carries no `bwrap` and no `pasta`, so `probe_mount_namespace/0` and
+# `probe_network_policy/0` are both false and the mechanism refuses to provision,
+# correctly. A required gate that cannot pass is not a gate, and the tests it
+# was supposed to enforce were therefore running NOWHERE in automation.
+#
+# Predicating on the capability makes that host behave like macOS: excluded,
+# with the red banner below saying out loud that nothing was verified. Two
+# separate guards stop this from becoming a silent pass on a host that OUGHT to
+# be capable:
+#
+#   * `--include` still wins inside the container, so an accidental edit here
+#     cannot shrink the run that matters. That was the original point and it
+#     still holds.
+#   * `run-isolation-tests.sh` refuses outright, non-zero, when NO capability is
+#     present -- so a container that fails to construct its hardening fails the
+#     job rather than skipping quietly.
+#
+# `ExSandbox.Test.IsolationLaunch.provision_or_skip/2` remains the backstop for
+# a host that reports a capability and then fails at the point of provisioning.
+excluded = if linux? and missing_capabilities == [], do: [], else: [:isolation, :reclamation]
+
+# ⚠️ The mirror image of the block above, and it exists for the same reason
+# pointed the other way (014 T003).
+#
+# `014`'s Darwin tests establish their caps by **breaching them and watching
+# macOS stop it** -- a 300 MB allocation under a 100 MB `taskpolicy -m` cap, a
+# spinner under `RLIMIT_CPU`, a `sandbox-exec` profile. None of those
+# mechanisms exists on Linux. Run there, every one of them would report a
+# failure of a guarantee that was never this host's to give; excluded *without
+# being named*, they would be worse -- a Linux CI run would go green having
+# verified nothing about the macOS floor, which is precisely the false
+# confidence `FR-014a` is written against.
+#
+# So they are ABSENT and SAID TO BE ABSENT: ExUnit reports the count as
+# "N excluded", which is a different sentence from "N tests, 0 failures".
+#
+# ⚠️ This exclusion only reaches a test module that TAGS ITSELF. A `014` test
+# file must carry `@moduletag :darwin_hardening` (or per-test `@tag`); an
+# untagged Darwin test runs on Linux and fails there for a reason that reads as
+# a mechanism defect. `ExSandbox.Hardening.DarwinTagTest` asserts this
+# exclusion is configured, and carries a canary that FAILS rather than passes
+# if a `:darwin_hardening` test ever executes off Darwin.
+#
+# ⚠️ Kept separate from `excluded` above rather than folded into it. That list
+# is quoted verbatim in the two warnings below, which are about the *isolation*
+# shortfall; appending an unrelated tag would make a Linux capability warning
+# announce it was skipping macOS tests.
+darwin? = match?({:unix, :darwin}, :os.type())
+darwin_excluded = if darwin?, do: [], else: [:darwin_hardening]
 
 cond do
   not linux? ->
@@ -93,6 +144,15 @@ cond do
     # green run for evidence. On Linux they might -- the suite looks like it ran
     # somewhere it could have verified everything, and the excluded tests are
     # exactly the ones that would have caught a containment defect.
+    #
+    # ⚠️ This branch USED TO LIE, and reading CI's output is what showed it.
+    # While `excluded` was decided by the OS alone, reaching here meant
+    # `excluded == []` -- so it printed "skipping  tests" with an empty list and
+    # then "they are NOT RUNNING" about 32 tests that were running and failing
+    # in the lines directly below. The banner and the run disagreed, and the
+    # banner is what a reader believes; `sandbox_gateway`'s own test_helper
+    # records the same failure shape from the other direction. Predicating
+    # `excluded` on the capability is what makes both sentences true.
     IO.puts("""
     \n\e[31m005: skipping #{Enum.join(excluded, ", ")} tests on a Linux host that
     CANNOT LAUNCH A SANDBOX. Missing: #{Enum.join(missing_capabilities, ", ")}.
@@ -109,4 +169,12 @@ cond do
     :ok
 end
 
-ExUnit.start(exclude: excluded)
+if darwin_excluded != [] do
+  IO.puts("""
+  \n\e[33m014: skipping #{Enum.join(darwin_excluded, ", ")} tests on #{elem(:os.type(), 1)}.
+  The macOS resource-cap floor (memory, CPU, wall clock, sandbox-exec) is NOT
+  verified by this run.\e[0m
+  """)
+end
+
+ExUnit.start(exclude: excluded ++ darwin_excluded)

@@ -20,6 +20,21 @@ something unexpected happened is a boundary that stops enforcing exactly when
 it is malfunctioning. There is no path here where a failure yields more
 reachability than a success -- no retry, no fallback destination, no "allow on
 timeout".
+
+⚠️ IT ALSO CARRIES DNS, AND FOR THE SAME REASON IT CARRIES TCP (029 T015).
+A socket's network namespace is fixed by the namespace of the calling process,
+so a UDP listener the sandbox can reach has to be created from in here. It
+holds no resolver either: it relays the query bytes to the platform over a
+second AF_UNIX socket and writes back whatever the platform answers. The
+platform is what resolves, what applies FR-015 to the answers, and what records
+the name->address binding the verdict later consults -- see
+`ExSandbox.Egress.Resolver`.
+
+⚠️ A DNS RELAY FAILURE IS SILENCE, NEVER A SYNTHESISED ANSWER. Answering from
+here would mean inventing a name-to-address mapping the platform never made and
+never recorded, and a tenant acting on it would connect to an address no
+allowlist entry can match. A dropped datagram is what an unavailable resolver
+looks like on the wire, and the client retries.
 """
 import errno
 import os
@@ -43,6 +58,13 @@ CONNECT_TIMEOUT = 5.0
 VERDICT_TIMEOUT = 5.0
 IDLE_TIMEOUT = 120.0
 BUF = 65536
+
+# A DNS message over UDP without EDNS0 is at most 512 bytes; the platform's
+# responses are re-encoded by `:inet_dns` and stay within it. Read more than
+# that so an oversized query is seen and dropped rather than silently truncated
+# into something that decodes as a *different* question.
+DNS_BUF = 4096
+RESOLVER_TIMEOUT = 6.0
 
 
 def original_destination(conn):
@@ -140,13 +162,84 @@ def handle(conn, verdict_path, source_key):
     threading.Thread(target=splice, args=(upstream, conn), daemon=True).start()
 
 
+def ask_resolver(resolver_path, source_key, query):
+    """Hand one DNS query to the platform and return its answer bytes.
+
+    Returns None on any failure. ⚠️ None means "send nothing back", never
+    "answer something" -- see the module docstring.
+
+    The frame is `"<source-key>\n" <> <query bytes>`, length-prefixed, and the
+    source key is the one this process was STARTED with. It is never read off
+    the datagram: this listener serves one namespace, so the sandbox's identity
+    is its own existence, exactly as for the TCP side.
+    """
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(RESOLVER_TIMEOUT)
+        s.connect(resolver_path)
+        frame = source_key.encode() + b"\n" + query
+        s.sendall(struct.pack("!I", len(frame)) + frame)
+        head = recv_exactly(s, 4)
+        if head is None:
+            s.close()
+            return None
+        body = recv_exactly(s, struct.unpack("!I", head)[0])
+        s.close()
+        return body
+    except OSError:
+        return None
+
+
+def recv_exactly(sock, count):
+    """Read exactly `count` bytes, or None if the peer stops first."""
+    chunks = []
+    remaining = count
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def serve_dns(udp, resolver_path, source_key):
+    """Answer DNS for this namespace, one datagram at a time.
+
+    ⚠️ Serialised rather than threaded per datagram. A resolver is a
+    request/response service with a client that retries on silence, and a
+    thread per datagram is an unbounded fan-out driven by tenant code -- the
+    tenant would choose how many host-side connections the platform opens.
+    """
+    while True:
+        try:
+            query, peer = udp.recvfrom(DNS_BUF)
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            return
+        answer = ask_resolver(resolver_path, source_key, query)
+        if answer is None:
+            continue
+        try:
+            udp.sendto(answer, peer)
+        except OSError:
+            continue
+
+
 def main():
-    if len(sys.argv) != 4:
-        sys.stderr.write("usage: nsacceptor.py <port> <verdict-socket> <source-key>\n")
+    if len(sys.argv) != 7:
+        sys.stderr.write(
+            "usage: nsacceptor.py <port> <verdict-socket> <source-key> "
+            "<resolver-socket> <resolver-address> <resolver-port>\n"
+        )
         return 2
     port = int(sys.argv[1])
     verdict_path = sys.argv[2]
     source_key = sys.argv[3]
+    resolver_path = sys.argv[4]
+    resolver_address = sys.argv[5]
+    resolver_port = int(sys.argv[6])
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -160,6 +253,41 @@ def main():
     # 127.0.0.1 on the host.
     srv.bind(("0.0.0.0", port))
     srv.listen(128)
+
+    # ⚠️ Bound BEFORE the readiness line, so a host that cannot serve DNS to
+    # this sandbox refuses the launch instead of producing one whose every
+    # hostname allowlist entry silently denies. `await_acceptor/2` treats an
+    # exit before that line as a refusal, and `police_or_terminate/3` then
+    # terminates the tenant.
+    #
+    # ⚠️ Bound to the resolver address EXACTLY, not `0.0.0.0`. The nft exemption
+    # names one destination address, and a wildcard bind here would accept
+    # datagrams the rule never permitted -- making the listener wider than the
+    # rule and hiding a mistake in the rule.
+    #
+    # ⚠️ Port 0 means the plan carries NO resolver, i.e. this sandbox is meant
+    # to have no name resolution at all. It is an explicit configuration, not a
+    # fallback -- a resolver that was configured and could not be read raises at
+    # plan-build time and never reaches this process.
+    if resolver_port:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            udp.bind((resolver_address, resolver_port))
+        except OSError as exc:
+            sys.stderr.write(
+                "RESOLVER bind failed on %s:%d (%s)\n"
+                % (resolver_address, resolver_port, exc)
+            )
+            sys.stderr.flush()
+            return 1
+
+        threading.Thread(
+            target=serve_dns, args=(udp, resolver_path, source_key), daemon=True
+        ).start()
+        sys.stdout.write("RESOLVER listening %s:%d\n" % (resolver_address, resolver_port))
+    else:
+        sys.stdout.write("RESOLVER disabled\n")
     sys.stdout.write("ACCEPTOR listening %d\n" % port)
     sys.stdout.flush()
 

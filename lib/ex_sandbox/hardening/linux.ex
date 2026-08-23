@@ -323,6 +323,7 @@ defmodule ExSandbox.Hardening.Linux do
       # and the platform's own files -- is simply not in its mount view.
     ] ++
       runtime_ro_binds() ++
+      resolv_conf_bind() ++
       [
         "--bind",
         storage,
@@ -352,6 +353,69 @@ defmodule ExSandbox.Hardening.Linux do
         # last, its failure read as a broken launch rather than a broken quota.
       ]
   end
+
+  # ⚠️ **`029-FR-013`: without this the resolver is unreachable and every
+  # hostname entry in an allowlist is dead, which is `FR-012` failing for a
+  # reason that has nothing to do with matching.**
+  #
+  # The design this replaces assumed glibc falls back to `127.0.0.1:53` when
+  # there is no `resolv.conf`, so that a sandbox with no `/etc` would reach the
+  # in-namespace listener with nothing configured. MEASURED on the isolation
+  # image (Debian, `elixir:1.20.2-otp-29`), inside `unshare -n`, with a stub
+  # nameserver bound on `127.0.0.1:53`:
+  #
+  #     no /etc/resolv.conf            -> stub received NOTHING, :nxdomain
+  #     resolv.conf naming 127.0.0.1   -> stub received a 30-byte query, resolved
+  #
+  # The control in the second line is what makes the first line mean "glibc did
+  # not fall back" rather than "the stub was broken". So the file has to exist,
+  # and the platform writes it.
+  #
+  # ⚠️ Bound **read-only from a platform-owned path**, not written into the
+  # sandbox's own storage. The storage bind is read-write, so a file inside it
+  # is a file the tenant edits -- and while pointing itself at another address
+  # only earns it an nftables drop, a resolver configuration a tenant controls
+  # is not one an operator can reason about.
+  #
+  # ⚠️ Nothing is bound when the resolver is not on port 53. `resolv.conf` has
+  # no syntax for a port, so writing the file would tell the tenant to query an
+  # address that will not answer -- a configuration that looks present and is
+  # not, which is worse than an absent one.
+  defp resolv_conf_bind do
+    case resolver_for_tenant() do
+      nil -> []
+      path -> ["--ro-bind", path, "/etc/resolv.conf"]
+    end
+  end
+
+  defp resolver_for_tenant do
+    case ExSandbox.Egress.Resolver.resolver_address() do
+      {address, 53} -> write_resolv_conf(address)
+      _other -> nil
+    end
+  end
+
+  defp write_resolv_conf(address) do
+    literal = address |> normalise_address() |> to_string()
+    path = Path.join(sandbox_storage_root(), "resolv.conf")
+
+    # ⚠️ One file for every sandbox, and that is safe precisely because it
+    # carries no per-sandbox information: the resolver address is the same
+    # inside every namespace, and the listener on the far side of it serves
+    # exactly one sandbox because it lives in that sandbox's netns. Per-sandbox
+    # copies would only add a file to leak on destroy.
+    case File.write(path, "nameserver #{literal}\n") do
+      :ok -> path
+      # A host where this cannot be written gets NO bind rather than a launch
+      # failure: the sandbox then has no DNS, which is the same state the
+      # `nil`-resolver ruleset produces, and it is visible as a name that does
+      # not resolve rather than as a sandbox that would not start.
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp normalise_address(address) when is_tuple(address), do: :inet.ntoa(address)
+  defp normalise_address(address) when is_binary(address), do: address
 
   # The read-only binds that give the sandbox a runtime, derived from **this
   # host** rather than assumed.

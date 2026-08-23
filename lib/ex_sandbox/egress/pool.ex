@@ -94,7 +94,14 @@ defmodule ExSandbox.Egress.Pool do
         {:refused, :unknown_source}
 
       allowed ->
-        if Policy.permits?(allowed, destination) do
+        # ⚠️ The resolutions are fetched **for this source key**, not for the
+        # connection and not globally. `029-FR-012` matches a hostname entry
+        # against what *this* sandbox resolved that name to; a table shared
+        # across sandboxes would let one tenant's answer decide another
+        # tenant's verdict, which is the cross-tenant shape
+        # `ExSandbox.Egress.Registry`'s moduledoc already guards in the
+        # allowlist itself.
+        if Policy.permits?(allowed, destination, Registry.resolutions(key, registry)) do
           :permitted
         else
           {:refused, :not_permitted}
