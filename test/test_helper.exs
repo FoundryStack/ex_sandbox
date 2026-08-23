@@ -68,18 +68,40 @@ missing_capabilities =
     []
   end
 
-# ⚠️ Only the OS decides `excluded`. A capability shortfall must NOT be
-# expressed here, and the reason is measured: `run-isolation-tests.sh` passes
-# `--include isolation --include reclamation` precisely so that an accidental
-# edit to this file cannot silently shrink the run. `--include` re-admits an
-# excluded tag, so an exclusion added here is overridden inside the very
-# container where it would matter -- it changes the local run and nothing else.
+# ⚠️ The CAPABILITY decides `excluded`, and the operating system is only the
+# cheapest way to be sure the capability is absent. This line used to read
+# `if linux?, do: [], else: [...]`, on the argument that a capability shortfall
+# must never be expressed here -- `run-isolation-tests.sh` passes
+# `--include isolation --include reclamation`, `--include` re-admits an excluded
+# tag, so an exclusion here is inert inside the container and "changes the local
+# run and nothing else".
 #
-# The capability shortfall is handled where `--include` cannot reach it:
-# `ExSandbox.Test.IsolationLaunch.provision_or_skip/2` refuses at the point of
-# provisioning, naming the missing capability. The warning below still fires so
-# the shortfall is impossible to miss.
-excluded = if linux?, do: [], else: [:isolation, :reclamation]
+# ⚠️ That argument was right about the mechanism and wrong about the population.
+# There is a third kind of host besides "macOS" and "the isolation container": a
+# **Linux machine with none of the capabilities**, and it is the one CI runs on.
+# MEASURED, run 32590944743 on `main`: `library-boundary (ex_sandbox)` -- the job
+# `ci.yml` calls required and "not a lint job" -- failed **32 tests**, every one
+# of them `NOT DEMONSTRATED (host capability unavailable)`. `ubuntu-latest`
+# carries no `bwrap` and no `pasta`, so `probe_mount_namespace/0` and
+# `probe_network_policy/0` are both false and the mechanism refuses to provision,
+# correctly. A required gate that cannot pass is not a gate, and the tests it
+# was supposed to enforce were therefore running NOWHERE in automation.
+#
+# Predicating on the capability makes that host behave like macOS: excluded,
+# with the red banner below saying out loud that nothing was verified. Two
+# separate guards stop this from becoming a silent pass on a host that OUGHT to
+# be capable:
+#
+#   * `--include` still wins inside the container, so an accidental edit here
+#     cannot shrink the run that matters. That was the original point and it
+#     still holds.
+#   * `run-isolation-tests.sh` refuses outright, non-zero, when NO capability is
+#     present -- so a container that fails to construct its hardening fails the
+#     job rather than skipping quietly.
+#
+# `ExSandbox.Test.IsolationLaunch.provision_or_skip/2` remains the backstop for
+# a host that reports a capability and then fails at the point of provisioning.
+excluded = if linux? and missing_capabilities == [], do: [], else: [:isolation, :reclamation]
 
 cond do
   not linux? ->
@@ -93,6 +115,15 @@ cond do
     # green run for evidence. On Linux they might -- the suite looks like it ran
     # somewhere it could have verified everything, and the excluded tests are
     # exactly the ones that would have caught a containment defect.
+    #
+    # ⚠️ This branch USED TO LIE, and reading CI's output is what showed it.
+    # While `excluded` was decided by the OS alone, reaching here meant
+    # `excluded == []` -- so it printed "skipping  tests" with an empty list and
+    # then "they are NOT RUNNING" about 32 tests that were running and failing
+    # in the lines directly below. The banner and the run disagreed, and the
+    # banner is what a reader believes; `sandbox_gateway`'s own test_helper
+    # records the same failure shape from the other direction. Predicating
+    # `excluded` on the capability is what makes both sentences true.
     IO.puts("""
     \n\e[31m005: skipping #{Enum.join(excluded, ", ")} tests on a Linux host that
     CANNOT LAUNCH A SANDBOX. Missing: #{Enum.join(missing_capabilities, ", ")}.
