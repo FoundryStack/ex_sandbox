@@ -1207,12 +1207,50 @@ defmodule ExSandbox.Mechanism.Beam do
   #   * this library's configured ceiling is its guard against waiting forever.
   #     Tripping it says nothing whatever about the tenant, so it is
   #     `:could_not_run` -- we have no result and no limit to attribute one to.
+  #
+  # ⚠️ **"Nothing to attribute it to" has to be CHECKED, not assumed** (Q17).
+  #
+  # A memory cap that works arrives here, not at the clause below. The OOM kill
+  # takes the whole systemd scope -- the sandbox's BEAM with it -- so the peer
+  # call has nobody left to answer it and waits out the ceiling. The result is a
+  # `:timeout`, which matched here and returned `:could_not_run` while the
+  # positive attribution sitting in the next clause was never consulted.
+  #
+  # Measured in the isolation container (`docker/compose.memtiming.yml`), one
+  # 64 MB sandbox against `memory_hog_command(192)`:
+  #
+  #     launch chain (provision + start)          207 ms
+  #     control `echo` round trip                  53 ms
+  #     scope Result=oom-kill first observed        55 ms after the exec started
+  #     execute/3 returned                      15001 ms  {:could_not_run, {:timeout, 15000}}
+  #     status/1 then provision_failure_reason/1  8 ms   {:error, :resource_cap}
+  #
+  # So the cap fired in 55 ms, the caller then waited 14.9 s on a dead node, and
+  # the answer it gave was that the command could not be run -- of a cap that
+  # had already killed it. `ExSandbox.Conformance.Execution.classify/4` scores
+  # `:could_not_run` `:inconclusive`, quite correctly, so a working memory cap
+  # reported as UNDEMONSTRATED. The same breach down `exec_in_sandbox/2`
+  # resolved to `{:limit_exceeded, :reported_by_mechanism}` in the same run,
+  # which is why one conformance group passed while the other did not.
+  #
+  # ⚠️ Still a **positive** attribution, and ordered after the tenant's own
+  # budget. `killed_by_memory_cap?/1` demands that the node be gone AND that
+  # systemd's verdict on this sandbox's own scope be `oom-kill`; a call that
+  # timed out for any other reason falls through to `:could_not_run` exactly as
+  # before. A sandbox that overran a budget it declared is still reported
+  # against that budget -- it asked for the limit, and the limit is the honest
+  # attribution even where memory also gave out.
   defp interpret_execution({:error, {:exit, {:timeout, _}}}, sandbox, budget, timeout) do
-    if is_integer(budget) and timeout <= budget do
-      enforce_time_budget(sandbox)
-      {:error, {:limit_exceeded, :wall_clock}}
-    else
-      {:error, {:could_not_run, {:timeout, timeout}}}
+    cond do
+      is_integer(budget) and timeout <= budget ->
+        enforce_time_budget(sandbox)
+        {:error, {:limit_exceeded, :wall_clock}}
+
+      killed_by_memory_cap?(sandbox) ->
+        {:error, {:limit_exceeded, :memory}}
+
+      true ->
+        {:error, {:could_not_run, {:timeout, timeout}}}
     end
   end
 

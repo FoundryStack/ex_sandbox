@@ -79,6 +79,56 @@ defmodule ExSandbox.Mechanism.Beam.ResourceCapTest do
     assert {:error, :resource_cap} = Beam.provision_failure_reason(victim)
   end
 
+  # ⚠️ The **reporting** half of the cap, and it was broken while the two tests
+  # above passed (Q17).
+  #
+  # `provision_failure_reason/1` said `:resource_cap` all along; what `execute/3`
+  # *told its caller* was `{:could_not_run, {:timeout, 15000}}`, because the OOM
+  # kill takes the sandbox's BEAM with it, the peer call then waits out the
+  # library's ceiling, and `interpret_execution/4`'s `:timeout` clause matched
+  # above the attribution that would have named memory.
+  #
+  # Measured in the container before the fix: the scope reported
+  # `Result=oom-kill` **55 ms** after the exec began, `execute/3` returned
+  # 15001 ms later, and `status/1` + `provision_failure_reason/1` answered
+  # `{:error, :resource_cap}` in 8 ms when finally asked. A cap that fired in
+  # 55 ms was reported as a command that could not be run.
+  #
+  # That is why this asserts on `execute/3` rather than on `status/1`: the
+  # conformance suite's memory check consumes exactly this value, and
+  # `Conformance.Execution.classify/4` scores `:could_not_run` as
+  # `:inconclusive` -- so the guarantee reported the third outcome on a host
+  # where it holds.
+  test "a command killed by the memory cap is reported as :limit_exceeded, not :could_not_run" do
+    victim = launch("execute-attribution", %{memory_limit_mb: 64})
+
+    result =
+      ExSandbox.execute(
+        Beam,
+        victim,
+        {"/bin/sh", ["-c", ExSandbox.Conformance.ResourceLimits.memory_hog_command(192)]}
+      )
+
+    assert {:error, {:limit_exceeded, :memory}} = result
+  end
+
+  # The other direction, and it is what keeps the clause above from becoming a
+  # fail-open. A call that waits out the ceiling for any reason **other** than a
+  # cap must still say `:could_not_run`: attributing every timeout to memory
+  # would report a cap as demonstrated by a sandbox that is alive and well.
+  #
+  # `sleep 60` under no declared `timeout_ms` is exactly that -- the ceiling
+  # trips, the scope is untouched, and there is nothing to attribute.
+  test "a timeout with no cap behind it is still could_not_run" do
+    idle = launch("execute-no-cap", %{memory_limit_mb: 512})
+
+    assert {:error, {:could_not_run, {:timeout, _}}} =
+             ExSandbox.execute(Beam, idle, {"/bin/sh", ["-c", "sleep 60"]})
+
+    assert {:ok, :running} = Beam.status(idle),
+           "the sandbox died during a plain timeout, so this asserts nothing about attribution"
+  end
+
   test "spinning all cores does not starve other sandboxes" do
     spinner = launch("spinner", %{cpu_limit: 100})
     bystander = launch("bystander", %{cpu_limit: 500})
