@@ -63,6 +63,24 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
   @widening_check "the allowlist cannot be widened from inside the sandbox"
   @peer_check "reaching another sandbox over the network is refused"
 
+  # ⚠️ Named in the existence guard below and in NO outcome assertion, and the
+  # omission is deliberate rather than an oversight (029 T004, T005).
+  #
+  # Both checks were added to make requirements the group could not see
+  # measurable at all: `029-FR-012`'s name matching (every permitted destination
+  # the suite named was an IP literal) and `029-FR-013`'s UDP (every probe was
+  # `:gen_tcp` against a policy that is `meta l4proto tcp`). Their outcome
+  # against these fixtures is not yet a fact this file can pin -- neither
+  # `PorousMechanism` nor `EditablePolicyMechanism` declares a `:udp_probe`, so
+  # the UDP check reports the third outcome against every one of them, which
+  # says nothing about the fixture.
+  #
+  # Guarding their *existence* is what this file can honestly do today: it stops
+  # a rename from making them vanish, which is the failure the guard below
+  # exists to catch.
+  @permitted_name_check "a permitted destination named by HOSTNAME is reachable"
+  @udp_check "UDP egress is confined the same as TCP"
+
   defp names(results) do
     Enum.map(results.passed, &Atom.to_string/1) ++
       Enum.map(results.failures ++ results.unavailable, fn {n, _} -> Atom.to_string(n) end)
@@ -83,7 +101,13 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
     # mode this whole file exists to catch, arriving through its own guard.
     present = names(network_results(ExSandbox.PorousMechanism))
 
-    for check <- [@permitted_check, @widening_check, @peer_check | @denial_checks] do
+    for check <- [
+          @permitted_check,
+          @permitted_name_check,
+          @udp_check,
+          @widening_check,
+          @peer_check | @denial_checks
+        ] do
       assert Enum.any?(present, &String.contains?(&1, check)),
              "no network check named #{inspect(check)} -- this file's lists are stale"
     end
@@ -537,8 +561,16 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
         permitted_destination: {"permitted.internal", 8443}
       )
 
+      # ⚠️ TWO entries since 029 T004, and the second is load-bearing. The IP
+      # literal is what the existing permit check derives from; the hostname is
+      # the only reason `029-FR-012`'s name matching is reachable from this
+      # suite at all -- with an all-literal allowlist no check ever asks a
+      # sandbox to reach a destination it knows by name.
       assert ExSandbox.Conformance.Network.suite_context() == %{
-               network_allowlist: [{"permitted.internal", 8443}]
+               network_allowlist: [
+                 {"permitted.internal", 8443},
+                 ExSandbox.Conformance.Network.permitted_name_address()
+               ]
              }
     end
 
