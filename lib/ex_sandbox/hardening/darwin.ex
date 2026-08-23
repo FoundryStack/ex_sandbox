@@ -303,18 +303,23 @@ defmodule ExSandbox.Hardening.Darwin do
   end
 
   @doc """
-  Removes the `.sb` profile this backend generated for a sandbox.
+  Removes the `.sb` profile this backend generated for a sandbox, and the
+  workdir it invented alongside it if that workdir is still empty.
 
-  Accepts the launch spec `apply/3` returned, or the profile path directly.
+  Accepts the launch spec `apply/3` returned, or the profile path directly —
+  the two carry the same information, because the profile and its workdir are
+  named from one shared suffix.
 
   Idempotent, for the reason `destroy/1` is: a release that raises on an already
   released handle turns every crash-and-retry into a stuck sandbox, and the
   caller has no way to ask whether it already ran.
 
-  ⚠️ It unlinks **only** a `.sb` file inside this module's own profile directory.
-  The path arrives inside a launch spec that a caller may have built, edited, or
-  read from configuration, and `File.rm/1` on whatever it names would make this
-  function an arbitrary-delete primitive reachable from the launch path.
+  ⚠️ It unlinks **only** a `.sb` file inside this module's own profile directory,
+  and removes a workdir only when that directory is inside the same place *and*
+  empty. The path arrives inside a launch spec that a caller may have built,
+  edited, or read from configuration, and `File.rm_rf/1` on whatever it names
+  would make this function an arbitrary-delete primitive reachable from the
+  launch path — one that would take the tenant's output with it.
   """
   @impl ExSandbox.Hardening
   @spec release(term()) :: :ok | {:error, term()}
