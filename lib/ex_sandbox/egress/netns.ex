@@ -238,10 +238,60 @@ defmodule ExSandbox.Egress.Netns do
   `pasta --config-net --interface sb0 …` fails with `Invalid interface name
   sb0: No such device`. Neither is needed — `pasta` picks the host's default
   route interface, which is the one with a route out.
+
+  ## The four flags that close the host off (`029-FR-015`, `029-FR-018`)
+
+  `pasta`'s defaults are built for convenience — it *wants* the namespace to
+  reach the host and the host to reach the namespace. Every one of the flags
+  below turns a default off, and none of them is a hardening extra.
+
+  | flag | what the default does |
+  |---|---|
+  | `--no-map-gw` | maps the namespace's default gateway to the **host**, so the host is reachable at the gateway address |
+  | `-t none` | `-t auto` forwards **inbound TCP**: a tenant binding `0.0.0.0:8080` binds `0.0.0.0:8080` *on the host* (`FR-018`) |
+  | `-T none` | the same for TCP in the outbound-to-host direction |
+  | `-u none` | `-u auto` forwards inbound **UDP** |
+  | `-U none` | the same for UDP in the outbound-to-host direction |
+
+  ⚠️ **`--no-map-gw` alone closes half the doors and reads as complete.** The
+  namespace reaches host `127.0.0.1` by **two independent paths**, and that flag
+  closes one of them: the gateway-address mapping. The other is the port
+  forwarding that `-t/-T/-u/-U` default to `auto`. A build that passes
+  `--no-map-gw` and stops has a *narrower* hole rather than no hole, and it
+  presents identically to one that has none — `curl` to the gateway address
+  gets nothing, which is exactly what a correct configuration looks like.
+
+  ⚠️ **`-t none` deliberately disables the inbound forwarding Phase 3 wants.**
+  That is not an oversight to be repaired when Phase 3 lands. Phase 3 replaces
+  it with an explicit `-t <hostport>:<nsport>`, which is a **narrowing** of
+  `auto` — one named port instead of every port the tenant chooses to bind —
+  and not a re-widening back to the default.
+
+  ⚠️ This function builds a command. That the flags are **passed** is all a
+  command-string assertion can show; that they **close the doors** is a
+  different claim needing a live namespace, and it belongs to `T012`/`T014`'s
+  probe set, not here.
   """
   @spec pasta_command(String.t(), [String.t()], String.t()) :: [String.t()]
   def pasta_command(pidfile, [_ | _] = tenant_command, runas \\ "0") do
-    [pasta_path(), "--config-net", "--runas", runas, "-P", pidfile, "--"] ++ tenant_command
+    [
+      pasta_path(),
+      "--config-net",
+      "--runas",
+      runas,
+      "--no-map-gw",
+      "-t",
+      "none",
+      "-T",
+      "none",
+      "-u",
+      "none",
+      "-U",
+      "none",
+      "-P",
+      pidfile,
+      "--"
+    ] ++ tenant_command
   end
 
   @doc """

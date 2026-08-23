@@ -236,4 +236,76 @@ defmodule ExSandbox.Egress.NetnsTest do
       assert tenant == ["bwrap", "--die-with-parent", "erlexec"]
     end
   end
+
+  describe "the flags that close the host off (029-FR-015, 029-FR-018)" do
+    # ⚠️ **What this describe block can and cannot prove.** Every assertion here
+    # reads a list of strings. It shows the flags are *passed*; it does not show
+    # they *close* anything. The claim that the netns can no longer reach the
+    # host needs a live namespace and a probe that watches for bytes, and that
+    # evidence is `T012`/`T014`'s. Do not read a green run here as `FR-015`
+    # demonstrated -- that reading is exactly the "confirm a flag was passed"
+    # failure `012-FR-012a` and `029-FR-016` exist to forbid.
+
+    setup do
+      %{command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])}
+    end
+
+    test "the gateway address is not mapped to the host", %{command: command} do
+      # Without this, pasta maps the namespace's default gateway to the host,
+      # and the host answers on it.
+      assert "--no-map-gw" in command
+    end
+
+    test "inbound and outbound TCP forwarding are both off", %{command: command} do
+      # ⚠️ `-t auto` is `FR-018` directly: MEASURED under the default, a tenant
+      # binding `0.0.0.0:8080` binds `0.0.0.0:8080` **on the host**.
+      assert flag_value(command, "-t") == "none"
+      assert flag_value(command, "-T") == "none"
+    end
+
+    test "inbound and outbound UDP forwarding are both off", %{command: command} do
+      assert flag_value(command, "-u") == "none"
+      assert flag_value(command, "-U") == "none"
+    end
+
+    test "--no-map-gw is not passed alone", %{command: command} do
+      # ⚠️ **The whole reason this test is written as a set rather than as four
+      # independent ones.** The netns reaches host `127.0.0.1` by two
+      # independent paths; `--no-map-gw` closes one. A build passing only that
+      # flag has a narrower hole, not no hole -- and it looks identical from
+      # outside, because a `curl` to the gateway address gets nothing either
+      # way. A regression that drops the port-forwarding flags while keeping
+      # `--no-map-gw` is the shape this asserts against.
+      assert "--no-map-gw" in command
+
+      for flag <- ~w(-t -T -u -U) do
+        assert flag_value(command, flag) == "none",
+               "#{flag} must be none: --no-map-gw closes only one of the two paths to the host"
+      end
+    end
+
+    test "the closing flags precede the argument separator", %{command: command} do
+      # A flag emitted after `--` is not pasta's -- it is handed to the tenant,
+      # which ignores it, and the door stays open while the command string reads
+      # correct.
+      before_separator = Enum.take_while(command, &(&1 != "--"))
+
+      for flag <- ~w(--no-map-gw -t -T -u -U) do
+        assert flag in before_separator, "#{flag} must reach pasta, not the tenant"
+      end
+    end
+
+    test "the flags do not disturb the runas pair or the pidfile" do
+      # Regression guard for the callers that locate `--runas` and `-P` by
+      # scanning for the flag and taking the next element.
+      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "4242:4242")
+
+      assert flag_value(command, "--runas") == "4242:4242"
+      assert flag_value(command, "-P") == "/run/p.pid"
+    end
+
+    defp flag_value(command, flag) do
+      command |> Enum.drop_while(&(&1 != flag)) |> Enum.at(1)
+    end
+  end
 end
