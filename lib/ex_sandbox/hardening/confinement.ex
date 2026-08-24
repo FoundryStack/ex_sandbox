@@ -109,6 +109,26 @@ defmodule ExSandbox.Hardening.Confinement do
     * `:env` — environment passed through **unmodified**, credential included.
       Defaults to `[]`.
     * `:cd` — working directory. A starting point, not a boundary; see above.
+    * `:permit_extra_subpaths` — additional directories the process may read and
+      write, **on top of** `:permit_path`. Defaults to `[]`, which is the only
+      value this library ever chooses for itself.
+
+  ## ⚠️ `:permit_extra_subpaths` is opaque here, and that is the whole design
+
+  This library does not know, and must not learn, which program is being
+  confined or why one of them needs a path outside its own storage. `012` is an
+  extraction boundary: naming a particular CLI's scratch directory here would
+  put an application's workaround inside a generic hardening module, where the
+  next reader cannot tell a measured necessity from an accident.
+
+  So the list arrives already decided. The caller is what reads its own
+  configuration, derives whatever the path depends on, and answers for the cost
+  of each entry. Every entry widens the boundary this module exists to draw —
+  `[]` is the default precisely so that widening is something a caller has to
+  write down.
+
+  Each entry is resolved the way `:permit_path` is, and is emitted **after** the
+  blanket deny, because later rules win in a `sandbox-exec` profile.
 
   Returns `{:error, {:cannot_enforce, capability, detail}}` when this host
   cannot build the profile, matching `ExSandbox.Hardening`'s contract. It never
@@ -176,10 +196,32 @@ defmodule ExSandbox.Hardening.Confinement do
     # on exactly this, reporting `Operation not permitted` for P itself.
     permit_path = resolve(permit_path)
 
+    # ⚠️ Resolved for the same reason, and it is not academic: the only caller
+    # that passes anything names a path under `/tmp`, and `/tmp` is a symlink to
+    # `/private/tmp` on darwin. A grant written against the unresolved spelling
+    # builds cleanly, reads correctly, and matches nothing.
+    extras = extra_subpaths(opts, permit_path)
+
     with :ok <- ensure_permit_path(permit_path),
-         {:ok, cmd, wrapped} <- wrap(:os.type(), command, args, permit_path) do
+         {:ok, cmd, wrapped} <- wrap(:os.type(), command, args, permit_path, extras) do
       {:ok, %{cmd: cmd, args: wrapped, env: env, cd: cd}}
     end
+  end
+
+  # `[]` unless the caller said otherwise, and no branch here can produce a
+  # non-empty list on its own.
+  #
+  # Entries already covered by `permit_path` are dropped: on darwin a duplicate
+  # grant is merely noise, but on Linux binding underneath an existing bind
+  # makes `bwrap` mount over its own mount, which it rejects outright -- the
+  # same failure `nested_in_other?/2` exists to avoid for the runtime set.
+  defp extra_subpaths(opts, permit_path) do
+    opts
+    |> Keyword.get(:permit_extra_subpaths, [])
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&resolve/1)
+    |> Enum.uniq()
+    |> Enum.reject(&(&1 == permit_path or nested_in_other?(&1, [permit_path])))
   end
 
   # `bwrap` refuses a bind whose source does not exist, and `sandbox-exec`
@@ -223,9 +265,9 @@ defmodule ExSandbox.Hardening.Confinement do
     end
   end
 
-  defp wrap({:unix, :linux}, command, args, permit_path) do
+  defp wrap({:unix, :linux}, command, args, permit_path, extras) do
     if System.find_executable("bwrap") do
-      {:ok, "bwrap", bwrap_args(command, args, permit_path)}
+      {:ok, "bwrap", bwrap_args(command, args, permit_path, extras)}
     else
       {:error,
        {:cannot_enforce, :path_confinement,
@@ -233,7 +275,7 @@ defmodule ExSandbox.Hardening.Confinement do
     end
   end
 
-  defp wrap({:unix, :darwin}, command, args, permit_path) do
+  defp wrap({:unix, :darwin}, command, args, permit_path, extras) do
     case System.find_executable("sandbox-exec") do
       nil ->
         {:error,
@@ -243,11 +285,11 @@ defmodule ExSandbox.Hardening.Confinement do
       sandbox_exec ->
         # `-p` takes the profile inline, so there is no temporary file to create,
         # secure, or leak. `release/1` has nothing to clean up as a result.
-        {:ok, sandbox_exec, ["-p", sandbox_profile(permit_path, command), command | args]}
+        {:ok, sandbox_exec, ["-p", sandbox_profile(permit_path, command, extras), command | args]}
     end
   end
 
-  defp wrap(other, _command, _args, _permit_path) do
+  defp wrap(other, _command, _args, _permit_path, _extras) do
     {:error,
      {:cannot_enforce, :path_confinement,
       "no path-confinement facility is known for #{inspect(other)}"}}
@@ -256,10 +298,11 @@ defmodule ExSandbox.Hardening.Confinement do
   # ⚠️ `--ro-bind` the runtime, `--bind` exactly one data path. Note what is
   # ABSENT and deliberately so, against the tenant profile at `linux.ex:316-345`:
   # no `--unshare-net`, because this process must reach the model endpoint.
-  defp bwrap_args(command, args, permit_path) do
+  defp bwrap_args(command, args, permit_path, extras) do
     runtime_read_paths()
     |> Enum.flat_map(&["--ro-bind", &1, &1])
     |> Kernel.++(command_bind(command, permit_path))
+    |> Kernel.++(extra_binds(extras))
     |> Kernel.++([
       "--bind",
       permit_path,
@@ -285,7 +328,7 @@ defmodule ExSandbox.Hardening.Confinement do
   # before any read happens, so every breach assertion "passes" while the
   # control fails. The order matters: later rules win in a `sandbox-exec`
   # profile, so the permitted subpath must come after the blanket deny.
-  defp sandbox_profile(permit_path, command) do
+  defp sandbox_profile(permit_path, command, extras) do
     runtime =
       runtime_read_paths()
       |> Enum.map(&"(subpath #{sb_string(&1)})")
@@ -307,7 +350,41 @@ defmodule ExSandbox.Hardening.Confinement do
     (allow file-read* file-write* (subpath #{sb_string(permit_path)}))
     #{writable_devices()}
     #{executable_grant(command, permit_path)}
+    #{extra_grants(extras)}
     """
+  end
+
+  # ⚠️ LAST in the profile, and that placement is load-bearing rather than
+  # aesthetic: `sandbox-exec` lets later rules win, so a grant written above the
+  # blanket `(deny file-read* file-write*)` is silently undone by it.
+  #
+  # MEASURED 2026-08-24 against the profile above with one such line appended
+  # for `/private/tmp/claude-501`: `ls` of that directory went from `Operation
+  # not permitted` to exit 0, `touch` inside it exit 0, and the control -- `ls
+  # ~/.ssh` -- stayed `Operation not permitted`. The grant reaches what it names
+  # and does not leak sideways.
+  defp extra_grants([]), do: ""
+
+  defp extra_grants(extras) do
+    Enum.map_join(extras, "\n", fn path ->
+      "(allow file-read* file-write* (subpath #{sb_string(path)}))"
+    end)
+  end
+
+  # ⚠️ Only what exists, which is the one asymmetry between the platforms here:
+  # `bwrap` refuses a bind whose source is missing and fails the whole launch,
+  # while `sandbox-exec` happily permits a subpath that is not there. Filtering
+  # keeps a caller's grant from turning into a refusal to launch on a host where
+  # the directory has not been created yet.
+  #
+  # Paths under the runtime read set are dropped for the mount-over-its-own-mount
+  # reason on `grantable_command?/2`; `extra_subpaths/2` has already dropped the
+  # ones under `permit_path`.
+  defp extra_binds(extras) do
+    extras
+    |> Enum.filter(&File.exists?/1)
+    |> Enum.reject(&nested_in_other?(&1, runtime_read_paths()))
+    |> Enum.flat_map(&["--bind", &1, &1])
   end
 
   # ⚠️ Two device nodes by name, NOT `file-write*` on `(subpath "/dev")`.
