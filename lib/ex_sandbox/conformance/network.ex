@@ -323,6 +323,38 @@ defmodule ExSandbox.Conformance.Network do
           end)
         end
 
+        check "every published handle of another sandbox is refused from inside" do
+          # `029-FR-017`, 029 T034a. The rule that replaces the structural
+          # guarantee, and it is deliberately NOT the check above.
+          #
+          # The check above asks one question: is `context.address` refused? That
+          # is a question about the single handle this suite happens to know. The
+          # requirement is about **every** handle the platform publishes for a
+          # sandbox -- and 029 Phase 3 is where a sandbox acquires a second one
+          # (a host-side tuple, T033) and a third (a public name, T040a) while
+          # `context.address` keeps naming the first. A check that probes one
+          # handle goes green with the others wide open, which is the shape this
+          # phase has already found twice (T012a's unpoliced IPv6, T040a's
+          # gateway path).
+          #
+          # ⚠️ And it is gated on the handle being **live**. The check above
+          # currently PASSES against `ExSandbox.EditablePolicyMechanism` because
+          # nothing listens at the address it publishes -- `:refused` scored as
+          # the boundary holding, which is the hazard T034 names, sitting in the
+          # suite today rather than arriving with Phase 3. A refusal means
+          # something only where the platform itself reaches the handle.
+          other = build_sandbox()
+          other = provision_or_report(@mechanism, other)
+          {:ok, other} = ExSandbox.start(@mechanism, other)
+          on_exit(fn -> ExSandbox.destroy(@mechanism, other) end)
+
+          ExSandbox.Conformance.Network.require_every_peer_handle_refused(
+            @mechanism,
+            var!(context).sandbox,
+            other
+          )
+        end
+
         check "reaching the platform's own listening port is refused" do
           # The platform is the highest-value target on the host: it holds the
           # credentials every sandbox is denied, and it is reachable by address
@@ -479,6 +511,219 @@ defmodule ExSandbox.Conformance.Network do
             "This is not a pass: an unaddressable sandbox is indistinguishable " <>
             "from one with no boundary. Populate `context.address` (`FR-011e`)."
         )
+    end
+  end
+
+  @doc """
+  Every handle by which the platform makes `sandbox` reachable from outside it
+  (`029-FR-017`, 029 T034a).
+
+  ⚠️ **A declaration the mechanism owes the suite, not something the suite can
+  discover.** `FR-011e` already established that shape for `context.address`,
+  and the reason is stronger here: the suite cannot enumerate a mechanism's
+  publishing surfaces. It cannot know that a container runtime also answers on a
+  bridge address and a service name, or that this platform will shortly publish
+  a host-side tuple *and* a public hostname for the same sandbox. So the set is
+  declared, and a handle the platform publishes but the mechanism does not
+  declare is ungoverned by construction.
+
+  Read from `context.peer_handles` — a list of `{host, port}` — falling back to
+  `[context.address]` when that is already a dialable tuple, so a mechanism that
+  publishes exactly one handle declares nothing extra.
+
+  ⚠️ **Mechanism-neutral on purpose** (D27). Nothing here names a namespace, a
+  port forward, a table, or a bridge. A container mechanism declares its
+  published port and its runtime-resolvable name; this one declares its netns
+  tuple and, after 029 T033, its host-side tuple. The rule survives the transfer
+  that D27 says T031 and T032 do not.
+  """
+  @spec peer_handles(ExSandbox.Sandbox.t() | map()) :: [term()]
+  def peer_handles(%{context: context}) when is_map(context) do
+    case Map.get(context, :peer_handles) do
+      declared when is_list(declared) ->
+        declared
+
+      _ ->
+        # ⚠️ Only a tuple falls back. The BEAM mechanism publishes
+        # `"peer:" <> id` (`beam.ex:582`), deliberately, and turning a string
+        # into a handle here would hand `:gen_tcp.connect/4` something it cannot
+        # resolve and score the failure as the boundary holding -- the false
+        # pass `BeamContextTest` pins out.
+        case Map.get(context, :address) do
+          {host, port} when is_binary(host) and is_integer(port) -> [{host, port}]
+          _ -> []
+        end
+    end
+  end
+
+  def peer_handles(_sandbox), do: []
+
+  @doc """
+  Requires that **every** declared handle of `other` is refused from inside
+  `sandbox`, and that at least one of them was actually exercised
+  (`029-FR-017`).
+
+  ## The three outcomes, and why the middle one is not a pass
+
+  Per handle:
+
+    * the platform cannot reach it → **not exercised**. A refusal from inside is
+      not evidence when the destination answers nobody: `EditablePolicyMechanism`
+      publishes an address with no listener behind it, and the existing
+      peer check passes against it for that reason alone.
+    * the platform reaches it and the sandbox does not → **refused**, which is
+      the only thing that counts as evidence.
+    * the sandbox reaches it → **crossed**, which fails outright.
+
+  Aggregated: any crossing fails; otherwise any refusal passes; otherwise the
+  third outcome, naming every handle and why each was not exercised.
+
+  ⚠️ The order is chosen. "Any crossing fails" beats "any refusal passes" so a
+  mechanism cannot buy a green tick for one handle while leaking through
+  another — which is the entire difference between this check and the one that
+  probes `context.address` alone.
+
+  ⚠️ **A mechanism declaring no handle reports the third outcome, never a
+  pass.** That is the state today: `FR-017` holds because a sandbox's address is
+  unnameable, so there is nothing to attempt, and "the boundary was not
+  exercised" is the true statement about it. Scoring it green would be
+  `FR-015`'s *control that reads as the guarantee it is not*.
+  """
+  @spec require_every_peer_handle_refused(module(), ExSandbox.Sandbox.t(), ExSandbox.Sandbox.t()) ::
+          :ok
+  def require_every_peer_handle_refused(mechanism, sandbox, other) do
+    case peer_handles(other) do
+      [] ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          no_peer_handles_detail(other)
+        )
+
+      handles ->
+        handles
+        |> Enum.map(&peer_handle_verdict(mechanism, sandbox, other, &1))
+        |> decide_peer_handles(other)
+    end
+  end
+
+  defp no_peer_handles_detail(other) do
+    published =
+      case other.context do
+        context when is_map(context) -> inspect(Map.get(context, :address))
+        _ -> "nothing (the sandbox carries no `context` map)"
+      end
+
+    """
+    this mechanism declares no dialable handle for a sandbox, so no attempt to
+    reach one from another sandbox was made and `029-FR-017` was not exercised.
+
+    `context.peer_handles` is absent and `context.address` is #{published},
+    which is not a `{host, port}` this suite can dial.
+
+    This is the third outcome and it is the honest one. `FR-017` is satisfied
+    **structurally** while a sandbox's address is unnameable -- nothing enforces
+    it, so nothing can fail to -- and a green tick here would report an
+    enforcement point that has never refused anything. That is exactly
+    `029-FR-015`'s "a control that reads as the guarantee it is not".
+
+    To turn this into a pass, declare `context.peer_handles` as the complete
+    list of `{host, port}` the platform publishes for a sandbox, each one
+    reachable from the platform itself.
+    """
+  end
+
+  defp peer_handle_verdict(mechanism, sandbox, other, {host, port} = handle)
+       when is_binary(host) and is_integer(port) and port > 0 do
+    if platform_reaches?(host, port) do
+      case probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}") do
+        {:succeeded, evidence} ->
+          {:crossed, handle, evidence}
+
+        {:refused, evidence} ->
+          {:refused, handle, evidence}
+
+        other_result ->
+          {:not_exercised, handle,
+           "the attempt neither crossed nor was refused: #{inspect(other_result)}"}
+      end
+    else
+      {:not_exercised, handle,
+       "the platform itself could not open a connection to #{host}:#{port} within " <>
+         "#{@control_timeout_ms}ms, so a refusal from inside a sandbox distinguishes " <>
+         "nothing -- a dead handle is refused for everyone"}
+    end
+  end
+
+  defp peer_handle_verdict(_mechanism, _sandbox, _other, handle) do
+    {:not_exercised, handle,
+     "declared as #{inspect(handle)}, which is not a `{host, port}` with a binary " <>
+       "host and a positive integer port, so it cannot be dialled"}
+  end
+
+  defp decide_peer_handles(verdicts, other) do
+    crossed = for {:crossed, handle, evidence} <- verdicts, do: {handle, evidence}
+    refused = for {:refused, handle, _evidence} <- verdicts, do: handle
+
+    cond do
+      crossed != [] ->
+        tally = "#{length(crossed)} of #{length(verdicts)} published handle(s)"
+
+        ExSandbox.Conformance.Helpers.guarantee_failure("029-FR-017", """
+        A sandbox REACHED another sandbox at #{tally}.
+
+        #{Enum.map_join(crossed, "\n", fn {handle, evidence} -> "  #{inspect(handle)}: #{inspect(evidence)}" end)}
+
+        `FR-017` is a rule about every handle the platform publishes, not about
+        the one a suite happens to probe. A mechanism that refuses the others
+        still fails here, and that is the point: the second handle is how this
+        guarantee is lost.
+        """)
+
+      refused != [] ->
+        :ok
+
+      true ->
+        ExSandbox.Conformance.Helpers.capability_unavailable(
+          :network_restriction,
+          """
+          #{length(verdicts)} handle(s) were declared for sandbox #{other.id} and
+          not one of them was exercised, so `029-FR-017` was not demonstrated:
+
+          #{Enum.map_join(verdicts, "\n", fn {:not_exercised, handle, why} -> "  #{inspect(handle)}: #{why}" end)}
+
+          This is the third outcome and not a pass. A handle nothing answers on
+          is refused for every caller, inside a sandbox or out, so a refusal
+          attributes to nothing. `FR-033` requires the same thing from the other
+          side: an address is not published until forwarding is proven to work.
+          """
+        )
+    end
+  end
+
+  # ⚠️ The control probes the handle from the **platform**, which is the vantage
+  # `FR-017` entitles: the gateway has to reach a sandbox, a sibling must not.
+  # Same argument as `host_reaches_denied_address?/0` one address over.
+  #
+  # ⚠️ Deliberately **not cached**, unlike the denied-address control. That one
+  # asks about a single fixed address whose answer cannot change within a run;
+  # this one asks about a handle belonging to a sandbox that was created for
+  # this check and destroyed after it, and ports are recycled. A cache keyed on
+  # `{host, port}` would answer about a previous sandbox's listener -- which is
+  # `FR-034`'s stale-route defect, reproduced inside the check meant to catch
+  # its neighbour.
+  defp platform_reaches?(host, port) do
+    case :gen_tcp.connect(
+           to_charlist(host),
+           port,
+           [:binary, active: false],
+           @control_timeout_ms
+         ) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        true
+
+      {:error, _reason} ->
+        false
     end
   end
 
