@@ -1,6 +1,6 @@
 defmodule ExSandbox.Mechanism.Beam.ServesHttpTest do
   @moduledoc """
-  A sandbox actually serves an HTTP request (`specs/README.md` "Done when" 2).
+  A sandbox actually serves an HTTP request (`docs/legacy/specify/README.md` "Done when" 2).
 
   ## Why this file exists
 

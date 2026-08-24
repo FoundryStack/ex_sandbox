@@ -2,7 +2,7 @@ defmodule ExSandbox.Hardening.Darwin do
   @moduledoc """
   OS-level confinement for the BEAM mechanism on macOS (014 T011 – T015, from
   `005` R9b and `014`'s re-measurement at
-  `specs/014-desktop-deployment/spikes/darwin-hardening/baseline.md`).
+  `docs/legacy/specify/014-desktop-deployment/spikes/darwin-hardening/baseline.md`).
 
   ## The composition, and why it has this exact shape
 
@@ -55,7 +55,7 @@ defmodule ExSandbox.Hardening.Darwin do
 
   `(deny default)` is **not viable** and this is measured, not assumed: it kills
   even `/bin/echo`, because `dyld` cannot start. R9b recorded it; the template
-  this module renders (`specs/005-sandbox-beam/spikes/macos-isolation/work.sb`)
+  this module renders (`docs/legacy/specify/005-sandbox-beam/spikes/macos-isolation/work.sb`)
   carries the finding in its own first comment.
 
   So the profile is a **deny-list over a permissive default**, which is weaker
@@ -403,8 +403,8 @@ defmodule ExSandbox.Hardening.Darwin do
   @spec render_profile(String.t(), String.t()) :: String.t()
   def render_profile(workdir, home) when is_binary(workdir) and is_binary(home) do
     # Verbatim from the R9b-verified template at
-    # `specs/005-sandbox-beam/spikes/macos-isolation/work.sb`, with `@WORKDIR@`
-    # and `@HOME@` substituted. Embedded rather than read from `specs/` at
+    # `docs/legacy/specify/005-sandbox-beam/spikes/macos-isolation/work.sb`, with `@WORKDIR@`
+    # and `@HOME@` substituted. Embedded rather than read from `docs/legacy/specify/` at
     # runtime because this library ships without that tree — a profile read from
     # a path that does not exist in a release is a launch failure at the worst
     # possible moment, and a silently empty profile would be worse.
