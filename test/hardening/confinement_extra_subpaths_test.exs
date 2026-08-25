@@ -62,7 +62,9 @@ defmodule ExSandbox.Hardening.ConfinementExtraSubpathsTest do
         System.cmd(
           cmd,
           wrapped,
-          [stderr_to_stdout: true, env: env] ++ if(cd, do: [cd: cd], else: [])
+          stderr_to_stdout: true,
+          env: env,
+          cd: cd
         )
 
       {:error, reason} ->

@@ -95,7 +95,7 @@ defmodule ExSandbox.Hardening.Confinement do
           cmd: String.t(),
           args: [String.t()],
           env: [{String.t(), String.t()}],
-          cd: String.t() | nil
+          cd: String.t()
         }
 
   @doc """
@@ -109,9 +109,39 @@ defmodule ExSandbox.Hardening.Confinement do
     * `:env` — environment passed through **unmodified**, credential included.
       Defaults to `[]`.
     * `:cd` — working directory. A starting point, not a boundary; see above.
+      Defaults to the resolved `:permit_path`, and the caller has to launch
+      with it — see "⚠️ The working directory is part of the boundary".
     * `:permit_extra_subpaths` — additional directories the process may read and
       write, **on top of** `:permit_path`. Defaults to `[]`, which is the only
       value this library ever chooses for itself.
+
+  ## ⚠️ The working directory is part of the boundary
+
+  `:cd` used to default to `nil`, leaving the child in whatever directory the
+  caller happened to be in. That is not neutral. The directory is denied by the
+  profile by construction — it is not `:permit_path` — so a confined process
+  started there resolves every relative path outside its own boundary, and on
+  darwin cannot read its own working directory at all.
+
+  MEASURED 2026-08-25, and the shape of the measurement is the interesting
+  part. A VM started in X that `chdir`s to Y before spawning gives the child a
+  cwd of Y that the child cannot `getcwd`:
+
+      cwd=…/apps/ex_sandbox status=0 out=""                      # started there
+      cwd=…/apps/ex_sandbox status=0 out="shell-init: error …"   # chdir'd there
+
+  Same directory, same profile, different result — so `sh` under confinement
+  wrote a diagnostic to stderr in an umbrella `mix test` (Mix `chdir`s into
+  each app) and wrote nothing at all when the same suite ran from the app's own
+  directory. `ConfinementExtraSubpathsTest` failed on exactly that, and reading
+  it as a flake was wrong: it was reproducible from one directory and
+  unreproducible from the other.
+
+  Defaulting to `:permit_path` puts the child inside the one directory the
+  profile fully grants. `Axonn.ModelAccess.Backend.DelegatedCli` already passed
+  `cd: storage_path` by hand, which is the same value — so this makes the
+  contract say what the only production caller had already worked out, rather
+  than leaving each caller to rediscover it.
 
   ## ⚠️ `:permit_extra_subpaths` is opaque here, and that is the whole design
 
@@ -204,7 +234,10 @@ defmodule ExSandbox.Hardening.Confinement do
 
     with :ok <- ensure_permit_path(permit_path),
          {:ok, cmd, wrapped} <- wrap(:os.type(), command, args, permit_path, extras) do
-      {:ok, %{cmd: cmd, args: wrapped, env: env, cd: cd}}
+      # ⚠️ The RESOLVED path, for the same reason the grant uses it: on darwin
+      # `System.tmp_dir!()` is a symlink, and a `cd` into the unresolved
+      # spelling lands the child somewhere the profile does not name.
+      {:ok, %{cmd: cmd, args: wrapped, env: env, cd: cd || permit_path}}
     end
   end
 

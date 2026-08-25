@@ -102,7 +102,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
   defp read_under_confinement(p, path) do
     case Confinement.confine({"cat", [path]}, permit_path: p) do
       {:ok, %{cmd: cmd, args: args, env: env, cd: cd}} ->
-        opts = [stderr_to_stdout: true, env: env] ++ if(cd, do: [cd: cd], else: [])
+        opts = [stderr_to_stdout: true, env: env, cd: cd]
         {out, status} = System.cmd(cmd, args, opts)
         {status, out}
 
@@ -121,7 +121,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
   defp run_under_confinement(p, command, args) do
     case Confinement.confine({command, args}, permit_path: p) do
       {:ok, %{cmd: cmd, args: wrapped, env: env, cd: cd}} ->
-        opts = [stderr_to_stdout: true, env: env] ++ if(cd, do: [cd: cd], else: [])
+        opts = [stderr_to_stdout: true, env: env, cd: cd]
         {out, status} = System.cmd(cmd, wrapped, opts)
         {status, out}
 
@@ -162,6 +162,48 @@ defmodule ExSandbox.Hardening.ConfinementTest do
           {out, status} -> {:error, "#{compiler} exited #{status}: #{out}"}
         end
     end
+  end
+
+  describe "the working directory the spec hands back" do
+    # ⚠️ These pin a CONTRACT, and the contract exists because leaving it
+    # implicit produced a failure that read as a flake. A child started outside
+    # its own boundary resolves relative paths outside it, and on darwin cannot
+    # read its own working directory -- but only when the VM reached that
+    # directory by `chdir` rather than by starting there, which is the
+    # difference between an umbrella `mix test` and the same suite run from the
+    # app's own directory. See the moduledoc note on `confine/2`.
+
+    test "defaults to the permitted path, resolved", %{p: p} do
+      {:ok, spec} = Confinement.confine({"pwd", []}, permit_path: p)
+
+      assert spec.cd == physical(p),
+             """
+             The spec left the caller to choose a working directory, and the
+             only directory the profile fully grants is P.
+             """
+    end
+
+    test "is left alone when the caller names one", %{p: p, q: q} do
+      {:ok, spec} = Confinement.confine({"pwd", []}, permit_path: p, cd: q)
+
+      assert spec.cd == q
+    end
+
+    test "starts the child inside the boundary, able to read where it is", %{p: p} do
+      {status, out} = run_under_confinement(p, "pwd", ["-P"])
+
+      # Equality rather than a `=~`, so a `getcwd` diagnostic on stderr fails
+      # this: `run_under_confinement/3` merges stderr into `out`.
+      assert {0, physical(p)} == {status, String.trim(out)}
+    end
+  end
+
+  # The path after symlinks, which on darwin is what `System.tmp_dir!()` is not:
+  # `/var` is a symlink to `/private/var`, and the kernel evaluates both the
+  # profile and `getcwd` against the resolved spelling.
+  defp physical(dir) do
+    {out, 0} = System.cmd("/bin/pwd", ["-P"], cd: dir)
+    String.trim(out)
   end
 
   describe "a confined process and the path it was given" do
@@ -320,7 +362,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
           env: [{"ANTHROPIC_API_KEY", sentinel}]
         )
 
-      opts = [stderr_to_stdout: true, env: env] ++ if(cd, do: [cd: cd], else: [])
+      opts = [stderr_to_stdout: true, env: env, cd: cd]
       {out, status} = System.cmd(cmd, args, opts)
 
       assert status == 0
