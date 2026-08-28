@@ -379,4 +379,54 @@ defmodule ExSandbox.Hardening.ConfinementTest do
              """
     end
   end
+
+  describe "the runtime read set and the local time zone database" do
+    # ⚠️ Darwin only, and not because the *risk* is darwin's. `/etc/localtime`
+    # is a symlink into `/var/db/timezone` here and SBPL resolves symlinks
+    # before matching, so the grant has to name the resolved directory. Under
+    # `bwrap` an unbound path is simply absent, which the C library treats as
+    # "no local zone" rather than as a refusal -- a different outcome from a
+    # different mechanism, and asserting darwin's here would fail Linux for a
+    # reason that is not a defect.
+    @describetag :darwin_hardening
+
+    # ⚠️ The measurement this exists for, stated so the next reader does not
+    # re-derive it. `runtime_read_paths/0` omitted `/private/var/db/timezone`,
+    # and MEASURED 2026-08-28 on darwin 25.5.0 the confined `claude` 2.1.238
+    # was killed with **137 and zero bytes** on every real invocation -- while
+    # `claude --version` under the same profile exited 0 and printed its
+    # version. A denied time zone database does not confine the process; it
+    # ends it before its first byte.
+    #
+    # ⚠️ This asserts the BREACH, never that a string is present in a list.
+    # A test reading `runtime_read_paths/0` would pass against a profile that
+    # never emitted the grant, which is the fail-open shape `012-FR-012a`
+    # exists to refuse.
+    test "a confined process reads the zone data `/etc/localtime` resolves to", %{p: p} do
+      unless match?({:unix, :darwin}, :os.type()) do
+        flunk("""
+        This ran off darwin, so `:darwin_hardening` was not excluded.
+
+        The assertion below is about how `sandbox-exec` resolves a symlink
+        before matching a path filter. Off darwin it asserts nothing, and a
+        green result here would be a boundary reported from a mechanism that
+        never ran.
+        """)
+      end
+
+      {status, out} = read_under_confinement(p, "/etc/localtime")
+
+      assert status == 0,
+             """
+             The confined process could not read the local time zone database.
+
+             `/etc/localtime` resolves into `/private/var/db/timezone`, which
+             `ExSandbox.Hardening.Confinement`'s `runtime_read_paths/0` must
+             grant. Without it a confined agent CLI is KILLED (exit 137, zero
+             bytes) rather than confined -- see that function's comment.
+
+             cat said: #{inspect(out)}
+             """
+    end
+  end
 end
