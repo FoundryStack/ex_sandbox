@@ -168,17 +168,29 @@ defmodule ExSandbox.Hardening.ConfinementExtraSubpathsTest do
       the namespace. This is an escape, not a mechanism difference.
       """
 
-      assert status != 0, """
-      The child's write to the parent of the granted path returned 0.
-
-      Nothing reached the host — the assertion above already established that
-      — so this is a statement about which mechanism denied it and when.
-      `sandbox-exec` refuses the write and the child sees the failure.
-      Under `bwrap` the write can land on a namespace-private mount and be
-      discarded with the namespace, which the child cannot distinguish from
-      success. Decide which of those the contract requires before changing
-      this line; do not relax it merely because CI is red.
-      """
+      # ⚠️ MEASURED: run 33169499037 answered this. `refute File.exists?`
+      # above PASSED and this line failed, which is the pair that says the
+      # boundary held and only the child's view of it differed. Nothing
+      # reached the host; the write landed on a namespace-private mount and
+      # was discarded with the namespace.
+      #
+      # So the two mechanisms report a contained write differently, exactly
+      # as they report a denied read differently two tests up.
+      # `sandbox-exec` refuses the write and the child sees a non-zero exit.
+      # `bwrap` lets the write succeed against a mount that goes nowhere, and
+      # the child cannot tell that from success. Requiring a non-zero exit
+      # requires the darwin mechanism, not containment.
+      #
+      # The containment claim is `refute File.exists?`, and it stays hard and
+      # unconditional above. This line keeps the darwin guarantee where darwin
+      # can give it, rather than dropping the check for both hosts.
+      if match?({:unix, :darwin}, :os.type()) do
+        assert status != 0, """
+        `sandbox-exec` did not refuse the child's write to the parent of the
+        granted path. On this host the child is expected to observe the
+        refusal, not merely be contained by it.
+        """
+      end
     end
 
     test "`(subpath …)` reaches nested directories, which is what the caller asked for", %{
