@@ -89,6 +89,25 @@ defmodule ExSandbox.MixProject do
       main: "readme",
       source_ref: "v#{@version}",
       source_url: @source_url,
+      # ⚠️ Two consumers read `priv/boundary.md` and they want opposite things
+      # from the same row, which is why this option exists rather than an edit
+      # to the document.
+      #
+      # `ExSandbox.Application` is `@moduledoc false`, and the row that names it
+      # is the row declaring it PRIVATE -- naming it is the whole point. ExDoc
+      # autolinks any module in backticks and warns when the target is hidden,
+      # so `mix docs --warnings-as-errors` fails on a document that is correct.
+      # The strict parser in `library_boundary_test.exs` (here and in the
+      # originating umbrella) requires those backticks: a row without them is a
+      # malformed table and it raises rather than skipping.
+      #
+      # MEASURED, and in that order: the backticks were lost during extraction,
+      # which made `mix docs` pass and the parser refuse the whole table.
+      # Restoring them fixed the parser and broke the docs build -- on CI, not
+      # locally, because `precommit` did not run `mix docs` until this commit.
+      # Dropping the backticks again would trade a build failure for a silent
+      # contract failure, which is the worse of the two.
+      skip_code_autolink_to: ["ExSandbox.Application"],
       extras: [
         "README.md",
         "CHANGELOG.md",
@@ -155,6 +174,20 @@ defmodule ExSandbox.MixProject do
         # `deps.unlock --unused`: the latter rewrites the tree and exits 0, so as
         # a gate step it cannot fail and would never gate anything.
         "deps.unlock --check-unused",
+        # ⚠️ Added after CI caught what this gate could not. `mix docs
+        # --warnings-as-errors` is a real gate step -- it rejects a broken
+        # autolink, a missing extra, and a reference to a hidden module -- and
+        # it ran ONLY on CI, so the first push failed on a defect that had been
+        # committed and locally green for two commits. A gate that a consumer's
+        # CI enforces and the author's machine does not is a gate that reports
+        # late, and the cost of running it here is one ex_doc compile that Mix
+        # then caches.
+        # ⚠️ `cmd`, and via `MIX_ENV=dev`, because `ex_doc` is `only: :dev`
+        # while `preferred_envs` puts this whole alias in `:test`. Written
+        # as a plain `"docs --warnings-as-errors"` step it fails with
+        # `The task "docs" could not be found` -- a gate that reports a
+        # missing task rather than a documentation defect.
+        "cmd env MIX_ENV=dev mix docs --warnings-as-errors",
         "test"
       ]
     ]
