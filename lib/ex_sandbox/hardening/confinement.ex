@@ -551,6 +551,26 @@ defmodule ExSandbox.Hardening.Confinement do
   # cause for -- confinement WAS the cause, just not the flag that research
   # tested. With `/etc` granted, MEASURED: `getent`/`curl` resolve and connect
   # in double-digit milliseconds, same as unconfined.
+  # ⚠️ `/private/var/db/timezone` is the local time zone database, and its
+  # absence killed the confined CLI outright rather than confining it -- the
+  # failure mode the moduledoc's "names too little" section describes, arriving
+  # by a path nobody had checked.
+  #
+  # MEASURED 2026-08-28 on darwin 25.5.0 with `claude` 2.1.238 under the profile
+  # this module generates: `-p "say ok"` exited **137** having written **zero
+  # bytes**, and adding this one subpath took it to the CLI's own first
+  # diagnostic. Bisected against `/Library` and `/private/etc`, which changed
+  # nothing. `/etc/localtime` is a symlink into here (`/var/db/timezone/zoneinfo/…`)
+  # and SBPL resolves symlinks before matching a path filter, so a grant on
+  # `/etc` would never have matched -- the same trap `resolve_executable/1`
+  # documents from the other direction.
+  #
+  # ⚠️ `--version` survives without it. A liveness probe built on that flag
+  # reports the backend healthy in exactly the environment where every real
+  # invocation is killed, which is the trap `DelegatedCli.scrubbed_env_vars/0`
+  # already records for `CLAUDECODE`.
+  #
+  # Linux drops it on the `File.exists?/1` filter below, so `bwrap` is untouched.
   defp runtime_read_paths do
     [
       to_string(:code.root_dir()),
@@ -561,7 +581,8 @@ defmodule ExSandbox.Hardening.Confinement do
       "/sbin",
       "/System",
       "/dev",
-      "/etc"
+      "/etc",
+      "/private/var/db/timezone"
     ]
     |> Enum.uniq()
     |> Enum.filter(&File.exists?/1)
