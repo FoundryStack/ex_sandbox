@@ -299,12 +299,22 @@ defmodule ExSandbox.Hardening.Confinement do
   end
 
   defp wrap({:unix, :linux}, command, args, permit_path, extras) do
-    if System.find_executable("bwrap") do
-      {:ok, "bwrap", bwrap_args(command, args, permit_path, extras)}
-    else
-      {:error,
-       {:cannot_enforce, :path_confinement,
-        "bubblewrap (`bwrap`) is not on PATH; the path boundary cannot be built"}}
+    # ⚠️ The resolved path, not the name. This branch looked the executable up
+    # and then threw the answer away, returning the literal "bwrap" while the
+    # darwin branch below returns what `find_executable/1` gave it. The
+    # asymmetry is not cosmetic: a bare name is resolved again by PATH at exec
+    # time, so what gets launched can change between the availability check
+    # here and the exec that follows it -- in the one process that builds the
+    # boundary. Resolving once closes that window, and makes both branches
+    # answer the same question the same way.
+    case System.find_executable("bwrap") do
+      nil ->
+        {:error,
+         {:cannot_enforce, :path_confinement,
+          "bubblewrap (`bwrap`) is not on PATH; the path boundary cannot be built"}}
+
+      bwrap ->
+        {:ok, bwrap, bwrap_args(command, args, permit_path, extras)}
     end
   end
 
