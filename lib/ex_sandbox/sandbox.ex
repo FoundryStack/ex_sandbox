@@ -32,6 +32,7 @@ defmodule ExSandbox.Sandbox do
           memory_limit_mb: non_neg_integer() | nil,
           disk_quota_mb: non_neg_integer() | nil,
           mechanism_ref: String.t() | nil,
+          workspace_path: String.t() | nil,
           context: term()
         }
 
@@ -46,6 +47,18 @@ defmodule ExSandbox.Sandbox do
     :disk_quota_mb,
     # An opaque handle the mechanism assigns once the sandbox exists (003 R5).
     :mechanism_ref,
+    # An absolute host directory the sandbox's contents live in, supplied by the
+    # host and made reachable from inside by whatever means the mechanism has.
+    #
+    # ⚠️ NOT opaque, unlike the three fields below it. A mechanism reads this
+    # one and acts on it, which is why it is a path rather than a reference: the
+    # host is what knows where a tenant's files live (`FR-008` keeps tenancy out
+    # of this library), and the mechanism is what knows how to put a directory
+    # inside a sandbox. Neither can do the other's half.
+    #
+    # `nil` means the sandbox has no workspace, which a mechanism must treat as
+    # "mount nothing" rather than as "mount somewhere sensible".
+    :workspace_path,
     context: nil
   ]
 end
