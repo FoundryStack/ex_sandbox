@@ -71,8 +71,8 @@ consumer's own module.
 what defines the boundary — lacking the prefix does not make a module public. There is no
 compatibility promise for private modules; calling one from a consuming application is the
 coupling `012-FR-004` forbids. A consuming application can check for it mechanically:
-`docs/boundary.md` ships inside the package and resolves at runtime through
-`Application.app_dir(:ex_sandbox, "docs/boundary.md")`, so a consumer's own test can read the
+`priv/boundary.md` ships inside the package and resolves at runtime through
+`Application.app_dir(:ex_sandbox, "priv/boundary.md")`, so a consumer's own test can read the
 public-interface table from the installed dependency rather than restating it.
 
 The authoritative list lives in `ExSandbox`'s own `@moduledoc`. This README summarises it; if the

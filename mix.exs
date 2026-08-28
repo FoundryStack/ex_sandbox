@@ -1,7 +1,7 @@
 defmodule ExSandbox.MixProject do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "1.0.1"
   @source_url "https://github.com/MaxSvargal/ex_sandbox"
 
   def project do
@@ -49,10 +49,21 @@ defmodule ExSandbox.MixProject do
   # place a reader looks for a packaging defect. T8.2 verifies the built tarball
   # with `tar tzf` rather than trusting this list, for exactly that reason.
   #
-  # `docs/` ships because `boundary.md` is READ AT RUNTIME rather than copied: a
-  # consumer checking its own boundary resolves the public-interface table through
-  # `Application.app_dir(:ex_sandbox, ...)`, so a tarball without it silently
-  # removes the consumer's ability to check.
+  # ⚠️ `boundary.md` lives under `priv/` and NOT under `docs/`, and that is a
+  # correctness requirement rather than a filing preference. It is READ AT
+  # RUNTIME: a consumer checking its own boundary resolves the public-interface
+  # table through `Application.app_dir(:ex_sandbox, "priv/boundary.md")` and
+  # parses it, instead of keeping a copy that drifts.
+  #
+  # MEASURED, and 1.0.0 shipped it wrong. Mix links exactly `ebin` and `priv`
+  # into an application's build directory -- `_build/<env>/lib/ex_sandbox` held
+  # `.mix/`, `ebin/` and a `priv` symlink, and nothing else. So the file was in
+  # the tarball, `tar tzf` found it, and `Application.app_dir/2` still could not:
+  # `File.exists?` on the documented path returned false in the first consumer
+  # that tried it. A packaging check that stops at "is it in the tarball" cannot
+  # see this, because the tarball was never the thing that was wrong.
+  #
+  # `docs/` still ships, for `requirement-ids.md`, which is read by people.
   defp package do
     [
       name: "ex_sandbox",
@@ -82,7 +93,7 @@ defmodule ExSandbox.MixProject do
         "README.md",
         "CHANGELOG.md",
         "docs/requirement-ids.md",
-        "docs/boundary.md"
+        "priv/boundary.md"
       ],
       groups_for_modules: [
         Interface: [ExSandbox, ExSandbox.Mechanism, ExSandbox.Sandbox, ExSandbox.Capability],

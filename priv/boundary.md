@@ -10,10 +10,16 @@ public. There is no compatibility promise for a private module, and calling one 
 application is the coupling `012-FR-004` forbids.
 
 ⚠️ **This file ships inside the package and is read at runtime**, via
-`Application.app_dir(:ex_sandbox, "docs/boundary.md")`. A consumer can therefore check its own
+`Application.app_dir(:ex_sandbox, "priv/boundary.md")`. A consumer can therefore check its own
 usage against the real list mechanically instead of trusting a copy: parse the table below and
 fail on any reference to a module it does not name. Removing this file from `package/0`'s `files:`
 would silently remove every consumer's ability to run that check.
+
+⚠️ `priv/`, not `docs/`, and 1.0.0 had it under `docs/`. Mix links only `ebin` and `priv` into an
+application's build directory, so a file shipped anywhere else is present in the tarball and
+absent from `Application.app_dir/2` -- which is the only path a consumer has at runtime. Moving
+this file is therefore a breaking change to anything that read the 1.0.0 location, and 1.0.1 is
+the release that makes the documented call actually resolve.
 
 ⚠️ Parse it, do not copy it. The consumer this document was written against kept a hand-maintained
 copy of the list for three revisions, and every drift recorded further down was found *because*
@@ -51,7 +57,7 @@ measured against, never as a dependency.
 | `ExSandbox.Conformance.Credentials.Probe` | The behaviour a host implements so the credentials group can attempt real connections | Public |
 | `ExSandbox.Egress.Allowlist` | Parses a project's configured destinations into the form the mechanism enforces (`005-FR-011a`, `013-FR-014b`) | Public — the host resolves the allowlist |
 | `ExSandbox.Egress.HostAliases` | Discovers every address that **is this host**, for the `029-FR-015` exclusion `Allowlist.parse/2` takes as data | Public — the host supplies the alias set |
-| ExSandbox.Application, anything under `ExSandbox.Internal.*` | Implementation | **Private — no compatibility promise** |
+| `ExSandbox.Application`, anything under `ExSandbox.Internal.*` | Implementation | **Private — no compatibility promise** |
 
 **Mechanism-specific functions are public but not portable.** `ExSandbox.Mechanism.Beam` exports
 `provision_failure_reason/1` (`005`'s hardening contract -- see

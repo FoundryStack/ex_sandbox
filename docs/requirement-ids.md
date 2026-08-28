@@ -66,7 +66,7 @@ this package — the ones that matter to a reader here are summarised by the cod
 | `007` | agent-runtime | Consumer-side context for how sandboxes are driven. |
 | `008` | generation-verification | Evidence and verification requirements — why a claim needs an observed breach behind it. |
 | `010` | observability | Telemetry event shape. |
-| `012` | sandbox-libraries | **The extraction itself**: `FR-001` (no host application, no Ash, no web framework), `FR-004` and `FR-014` (the public/private boundary), `FR-016` (the third outcome). See [boundary.md](boundary.md). |
+| `012` | sandbox-libraries | **The extraction itself**: `FR-001` (no host application, no Ash, no web framework), `FR-004` and `FR-014` (the public/private boundary), `FR-016` (the third outcome). See [boundary.md](../priv/boundary.md). |
 | `013` | deployment-topology | Deployment separation, and the narrowed privilege grant the isolation harness runs under (`FR-006b`, `FR-006f`). |
 | `014` | desktop-deployment | The macOS resource-cap floor — the `:darwin_hardening` tagged tests. |
 | `015` | model-access | Consumer-side context for credential handling. |

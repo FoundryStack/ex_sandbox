@@ -42,8 +42,8 @@ defmodule ExSandbox do
   There is no compatibility promise for private modules. Calling one from a
   consuming application is the coupling `FR-004` forbids, and a consumer can
   check for it mechanically rather than by review: this table also ships as
-  `docs/boundary.md` inside the package, resolvable at runtime through
-  `Application.app_dir(:ex_sandbox, "docs/boundary.md")`. A consumer's own test
+  `priv/boundary.md` inside the package, resolvable at runtime through
+  `Application.app_dir(:ex_sandbox, "priv/boundary.md")`. A consumer's own test
   reads the installed copy instead of restating it, so the check cannot drift
   from the list it is checking against.
 

@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.0.1 — 2026-08-28
+
+### `boundary.md` moved to `priv/`, so the documented lookup resolves
+
+1.0.0 shipped `docs/boundary.md` and told consumers to read it with
+`Application.app_dir(:ex_sandbox, "docs/boundary.md")`. That call cannot work. Mix links exactly
+`ebin` and `priv` into an application's build directory, so a file shipped under any other
+top-level directory is present in the tarball and absent from `app_dir/2` -- and `app_dir/2` is
+the only path a consumer has at runtime.
+
+Found the first time a consumer actually made the call: `File.exists?` on the documented path
+returned false against an installed 1.0.0, while `tar tzf` on the same release listed the file.
+A packaging check that stops at "is it in the tarball" cannot see this, because the tarball was
+never the thing that was wrong.
+
+The file is now `priv/boundary.md`. Its content is unchanged.
+
+**If you read the 1.0.0 path, update the call:**
+
+```elixir
+# before -- returns a path that does not exist
+Application.app_dir(:ex_sandbox, "docs/boundary.md")
+
+# after
+Application.app_dir(:ex_sandbox, "priv/boundary.md")
+```
+
+Nothing else changed: no module, function, behaviour or configuration key differs from 1.0.0.
+
 ## 1.0.0 — 2026-08-28
 
 ### Extracted from the Axonn umbrella; first public release

@@ -8,14 +8,22 @@ defmodule ExSandbox.LoopFormatter do
   the several others this suite already applies (`:playwright`,
   `:integration_caddy`, `:integration_cli`).
 
-  ## Why it lives in `ex_sandbox`
+  ## Why it lives in `ex_sandbox`, and why in `lib/`
 
-  Every other umbrella app depends on `ex_sandbox`, and nothing depends on the
-  others in a way that reaches all of them. Its `test/support` is on
-  `elixirc_paths` under `MIX_ENV=test`, so the compiled module lands in
-  `_build/test/lib/ex_sandbox/ebin` and every app's `mix test` can load it.
-  Placing it in any single app's `test/support` would make it invisible to the
-  other four.
+  A consumer with several applications needs one formatter every one of their
+  suites can load, and the only module that qualifies is one they all already
+  depend on. This library is that module for its own consumers, which is the
+  whole of the reason — nothing here is about sandboxing, and nothing here
+  names any particular application.
+
+  ⚠️ `lib/`, and it was `test/support/` until 1.0.1. Inside an umbrella that
+  worked, because `test/support` is on `elixirc_paths` under `MIX_ENV=test` and
+  the compiled module landed in `_build/test/lib/ex_sandbox/ebin` where every
+  sibling app's `mix test` could load it. A published package has no such
+  arrangement: `test/` is not in `package/0`'s `files:`, so 1.0.0 listed this
+  module as Public in `priv/boundary.md` and shipped a release that does not
+  contain it. The consumer's own `--formatter ExSandbox.LoopFormatter` then
+  fails to load a module its dependency promised.
 
   ## Why TSV rather than JSON
 

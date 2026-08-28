@@ -128,13 +128,20 @@ jobs:
       # Named rather than globbed. `priv/egress/nsacceptor.py` in particular is
       # the one whose absence would pass every unit test in a consumer's tree and
       # fail only at policed-launch time.
+      #
+      # ⚠️ This step proves a file is IN the tarball and nothing more, which is a
+      # weaker claim than it reads as. 1.0.0 passed a check of exactly this shape
+      # while shipping `boundary.md` somewhere `Application.app_dir/2` could not
+      # reach, because Mix links only `ebin` and `priv` into a built application.
+      # Reachability is asserted by `ShippedBoundaryDocumentTest`, which makes the
+      # call a consumer makes; keep both, they check different things.
       - name: Package contents
         run: |
           set -euo pipefail
           mix hex.build
           tar xOf ex_sandbox-*.tar contents.tar.gz | tar tzf - | sort > /tmp/contents.txt
           for f in LICENSE README.md CHANGELOG.md mix.exs \
-                   priv/egress/nsacceptor.py docs/boundary.md docs/requirement-ids.md; do
+                   priv/egress/nsacceptor.py priv/boundary.md docs/requirement-ids.md; do
             grep -qx "$f" /tmp/contents.txt || { echo "::error::$f missing from the package tarball"; exit 1; }
           done
           if grep -q '__pycache__\|\.pyc$' /tmp/contents.txt; then
