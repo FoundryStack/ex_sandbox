@@ -128,7 +128,20 @@ defmodule ExSandbox.Hardening.ConfinementExtraSubpathsTest do
       module exists to deny — deny-by-default did not survive the grant.
       """
 
-      assert out =~ "Operation not permitted"
+      # ⚠️ The two mechanisms deny in different words, and neither is weaker.
+      # `sandbox-exec` leaves the path visible and refuses the open: EPERM.
+      # `bwrap` denies by never binding the path, so the child cannot see it
+      # at all: ENOENT. Asserting only EPERM asserted that the host was
+      # darwin. The sibling case above ("a path outside P is denied without
+      # it") already accepts both; this one did not, and only CI could tell,
+      # because the suite is written on the host that produces EPERM.
+      assert out =~ "Operation not permitted" or out =~ "No such file"
+
+      # ENOENT is conclusive only if the file is really there to be missed.
+      # Without this, a setup that never wrote it would satisfy the assertion
+      # above while proving nothing.
+      assert File.read!(Path.join(denied, "secret.txt")) == "must-not-be-readable",
+             "the denied file must exist on the host, or ENOENT above means nothing"
     end
 
     test "the parent of the granted path is not itself writable", %{
@@ -141,8 +154,31 @@ defmodule ExSandbox.Hardening.ConfinementExtraSubpathsTest do
       {_out, status} =
         run(p, "sh", ["-c", "echo escaped > #{target}"], permit_extra_subpaths: [extra])
 
-      assert status != 0
-      refute File.exists?(target)
+      # ⚠️ Order matters here, and it was the other way round. This is the
+      # assertion that states the security claim: whatever the child did, the
+      # parent of the granted path did not receive a file. `status` reports
+      # what the child observed, which is a weaker and mechanism-specific
+      # thing — under `bwrap` a write can succeed against a namespace-private
+      # mount and return 0 while nothing reaches the host. With the status
+      # assertion first, CI reported a non-zero exit and never evaluated the
+      # escape, so the one fact worth knowing was the one it did not print.
+      refute File.exists?(target), """
+      The parent of the granted path received a file. `:permit_extra_subpaths`
+      widened past the directory it named, on the host and not merely inside
+      the namespace. This is an escape, not a mechanism difference.
+      """
+
+      assert status != 0, """
+      The child's write to the parent of the granted path returned 0.
+
+      Nothing reached the host — the assertion above already established that
+      — so this is a statement about which mechanism denied it and when.
+      `sandbox-exec` refuses the write and the child sees the failure.
+      Under `bwrap` the write can land on a namespace-private mount and be
+      discarded with the namespace, which the child cannot distinguish from
+      success. Decide which of those the contract requires before changing
+      this line; do not relax it merely because CI is red.
+      """
     end
 
     test "`(subpath …)` reaches nested directories, which is what the caller asked for", %{
