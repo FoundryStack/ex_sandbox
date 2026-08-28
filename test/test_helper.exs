@@ -132,6 +132,24 @@ excluded = if linux? and missing_capabilities == [], do: [], else: [:isolation, 
 darwin? = match?({:unix, :darwin}, :os.type())
 darwin_excluded = if darwin?, do: [], else: [:darwin_hardening]
 
+# ⚠️ The same argument again, for a mechanism whose capabilities come from a
+# container runtime rather than from this kernel (`host-sandbox-and-agent-workspace`).
+#
+# `ExSandbox.Mechanism.Docker` builds its own confinement, so its tests cannot
+# be predicated on a host capability the way the two blocks above are -- the
+# whole point of that mechanism is that the host lacks what it needs. What they
+# CAN be predicated on is whether a daemon answered, and that is a fact about
+# this machine that `ExSandbox.Test.DockerDaemon` asks once, before anything is
+# excluded.
+#
+# ⚠️ Exclusion alone is not enough, and this is the failure the `014` block
+# above already records: a group that is quietly absent reads as "0 failures".
+# `ExSandbox.Mechanism.DockerTagTest` carries the canary -- a `:docker` test
+# that FAILS if it executes on a host with no daemon -- so a missed exclusion
+# lands as a failure rather than as a green run that verified no container.
+docker_reachable? = ExSandbox.Test.DockerDaemon.reachable?()
+docker_excluded = if docker_reachable?, do: [], else: [:docker]
+
 cond do
   not linux? ->
     IO.puts("""
@@ -169,6 +187,18 @@ cond do
     :ok
 end
 
+if docker_excluded != [] do
+  IO.puts("""
+  \n\e[33mhost-sandbox-and-agent-workspace: skipping #{Enum.join(docker_excluded, ", ")} tests.
+  #{ExSandbox.Test.DockerDaemon.unreachable_reason()}
+
+  `ExSandbox.Mechanism.Docker`'s resource caps, network denial and filesystem
+  confinement are NOT verified by this run. Start a container runtime and
+  re-run before reading this as evidence that a Docker-backed sandbox confines
+  anything.\e[0m
+  """)
+end
+
 if darwin_excluded != [] do
   IO.puts("""
   \n\e[33m014: skipping #{Enum.join(darwin_excluded, ", ")} tests on #{elem(:os.type(), 1)}.
@@ -177,4 +207,4 @@ if darwin_excluded != [] do
   """)
 end
 
-ExUnit.start(exclude: excluded ++ darwin_excluded)
+ExUnit.start(exclude: excluded ++ darwin_excluded ++ docker_excluded)

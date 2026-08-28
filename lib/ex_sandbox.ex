@@ -176,8 +176,30 @@ defmodule ExSandbox do
   @spec capabilities() :: [Capability.t()]
   def capabilities, do: Capability.check_all()
 
+  # ⚠️ **A required capability is satisfied by the HOST providing it or by the
+  # MECHANISM constructing it, and the subtraction is the whole change.**
+  #
+  # `Capability.missing/1` asks whether *this host* can confine a process
+  # directly. That was the only question worth asking while every mechanism
+  # confined by wrapping a host process. It stopped being sufficient the moment
+  # a mechanism could bring its own isolation: on darwin all five gating names
+  # report unavailable, and each `do_check/2` clause says so in terms of the BEAM
+  # mechanism -- `sandbox-exec` not being what it binds with, a profile not
+  # surviving an exec. A container satisfies the same names by a different
+  # construction, and the probe has no way to be told.
+  #
+  # ⚠️ Subtracting BEFORE the probe rather than filtering the result after it.
+  # The two are not equivalent: `missing/1` runs a live check per name, several
+  # of which shell out, and a name the mechanism constructs is one whose host
+  # answer is irrelevant. Filtering afterwards would pay for the probe and then
+  # discard it, and on a host where a probe is slow or noisy that cost is real.
+  #
+  # A mechanism exporting neither callback subtracts `[]` from
+  # `Capability.gating_defaults/0`, which is exactly the pre-existing gate.
   defp ensure_capable(mechanism, sandbox) do
-    case Capability.missing(required_capabilities(mechanism)) do
+    host_must_provide = required_capabilities(mechanism) -- constructed_capabilities(mechanism)
+
+    case Capability.missing(host_must_provide) do
       [] ->
         :ok
 
@@ -199,6 +221,27 @@ defmodule ExSandbox do
   # only, so under lazy loading it reports false for a callback the mechanism
   # does export -- which would silently promote every mechanism to requiring
   # every capability.
+  # ⚠️ `[]` when absent, which is the opposite default from
+  # `required_capabilities/1` below -- and both defaults lean the same way.
+  # There, a mechanism that declares nothing is assumed to need everything;
+  # here, one that declares nothing is assumed to build nothing. Each choice
+  # makes silence produce the STRICTER gate, so omitting a callback can never be
+  # a route to a weaker check (`FR-012b`).
+  #
+  # `ensure_loaded?` first, for the reason spelled out under
+  # `required_capabilities/1`: `function_exported?/3` answers for loaded modules
+  # only. Getting it wrong here fails in the safe direction rather than the
+  # unsafe one -- an unloaded mechanism would report constructing nothing and be
+  # refused -- but a gate that depends on load order is not a gate.
+  defp constructed_capabilities(mechanism) do
+    if Code.ensure_loaded?(mechanism) and
+         function_exported?(mechanism, :constructed_capabilities, 0) do
+      mechanism.constructed_capabilities()
+    else
+      []
+    end
+  end
+
   defp required_capabilities(mechanism) do
     if Code.ensure_loaded?(mechanism) and
          function_exported?(mechanism, :required_capabilities, 0) do

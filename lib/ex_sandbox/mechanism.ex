@@ -20,8 +20,8 @@ defmodule ExSandbox.Mechanism do
   ## Why more callbacks than the obvious four
 
   The natural first cut of this API is `compile` / `start` / `stop` / `proxy`.
-  Three of the seven here exist for a specific reason rather than for symmetry,
-  and each would be easy to leave out:
+  Several of the callbacks here exist for a specific reason rather than for
+  symmetry, and each would be easy to leave out:
 
     * `status` — `003-FR-024` requires distinguishing "starting" from "not
       running". `:absent` and `:unknown` must not collapse into each other:
@@ -64,6 +64,25 @@ defmodule ExSandbox.Mechanism do
   any of them is unavailable on this host. A mechanism that does **not** export
   it is treated as requiring all of them — under-declaring must not be a way to
   escape the check (`FR-012b`).
+
+  ## Optional: declaring constructed capabilities
+
+  A mechanism may also export `constructed_capabilities/0`. ⚠️ **It is the
+  opposite claim from `required_capabilities/0`, and confusing the two inverts
+  the gate.** One says *what this mechanism needs the host to already provide*;
+  the other says *what this mechanism builds itself, whether or not the host
+  can*.
+
+  The distinction exists because the host probe answers a narrower question than
+  the gate asks. `ExSandbox.Capability` reports whether **this host** can confine
+  a process directly — on darwin every answer is reasoning about a BEAM node
+  under `sandbox-exec`. A mechanism whose isolation is a container satisfies the
+  same names by a different construction, and before this callback existed there
+  was no argument position in which to say so: the report was a host probe
+  wearing one mechanism's reasoning.
+
+  Omitting it reports nothing, so the gate is the host probe alone and every
+  mechanism written before this callback behaves exactly as it did.
   """
 
   alias ExSandbox.Sandbox
@@ -208,5 +227,28 @@ defmodule ExSandbox.Mechanism do
   """
   @callback required_capabilities() :: [ExSandbox.Capability.name()]
 
-  @optional_callbacks required_capabilities: 0
+  @doc """
+  Capabilities this mechanism constructs for whatever it runs.
+
+  Optional; a mechanism that omits it constructs nothing as far as the gate is
+  concerned, which is the safe direction and is exactly the pre-existing
+  behaviour.
+
+  ⚠️ **Not the inverse-named twin of `required_capabilities/0` — the opposite
+  claim.** See the moduledoc. A mechanism that lists a name here is asserting
+  that a sandbox it starts is subject to that confinement even on a host whose
+  own probe reports it unavailable.
+
+  ⚠️ **Nothing in this behaviour verifies the claim.** A mechanism that lists a
+  name it does not build has widened its own gate, and the compiler cannot tell.
+  `ExSandbox.Conformance` is what establishes such a claim, by observing a
+  breach being stopped rather than by confirming a limiter was invoked — the
+  discipline `005` R9b exists to enforce, where a cap was applied, silently lost
+  across an exec, and the process allocated 300 MB under a nominal 100 MB cap
+  and exited 0. Until a mechanism passes conformance, a name here is a promise
+  backed only by that mechanism's own tests.
+  """
+  @callback constructed_capabilities() :: [ExSandbox.Capability.name()]
+
+  @optional_callbacks required_capabilities: 0, constructed_capabilities: 0
 end
