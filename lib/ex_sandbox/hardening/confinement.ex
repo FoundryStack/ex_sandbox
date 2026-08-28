@@ -536,8 +536,33 @@ defmodule ExSandbox.Hardening.Confinement do
   # dies rather than being confined. ⚠️ That grants READS only; the write half
   # lives in `writable_devices/0`, narrowly, and was missing until D14a measured
   # `echo x > /dev/null` failing.
+  #
+  # ⚠️ `/etc` is here for DNS, and its absence was this module's own unnamed bug.
+  # MEASURED: without it, `getent hosts` and `curl` both fail **instantly**
+  # (`getent` exit 2, `curl` exit 6 "Couldn't resolve host") because neither can
+  # read `/etc/resolv.conf` or `/etc/nsswitch.conf` -- this profile denies `/etc`
+  # like everything else not named here. The delegated CLI does not fail the
+  # same way: lacking a working resolver, its bundled Node/c-ares stack falls
+  # back through some slower internal path and MEASURED taking **~190-195s**
+  # before either succeeding or printing the bare-text "Request timed out" that
+  # `Reply.decode/1` then (correctly) reports as an unparseable plan. This is
+  # what the moduledoc's own `pinned_config_args/1` docstring recorded as an
+  # unexplained "FR-017 pre-first-byte stall" and ruled out confinement as a
+  # cause for -- confinement WAS the cause, just not the flag that research
+  # tested. With `/etc` granted, MEASURED: `getent`/`curl` resolve and connect
+  # in double-digit milliseconds, same as unconfined.
   defp runtime_read_paths do
-    [to_string(:code.root_dir()), "/usr", "/lib", "/lib64", "/bin", "/sbin", "/System", "/dev"]
+    [
+      to_string(:code.root_dir()),
+      "/usr",
+      "/lib",
+      "/lib64",
+      "/bin",
+      "/sbin",
+      "/System",
+      "/dev",
+      "/etc"
+    ]
     |> Enum.uniq()
     |> Enum.filter(&File.exists?/1)
     |> Enum.reject(&nested_in_other?(&1, ["/usr", "/lib", "/System"]))
