@@ -1,22 +1,27 @@
 defmodule ExSandbox.MixProject do
   use Mix.Project
 
+  @version "1.0.0"
+  @source_url "https://github.com/MaxSvargal/ex_sandbox"
+
   def project do
     [
       app: :ex_sandbox,
-      version: "1.0.0",
-      build_path: "../../_build",
-      config_path: "../../config/config.exs",
-      deps_path: "../../deps",
-      lockfile: "../../mix.lock",
-      # A floor, not the platform's version. Pinning this to whatever Axonn
-      # happens to run on would force every consumer onto Axonn's Elixir, which
-      # is the opposite of what extracting the library is for (T003).
+      version: @version,
+      # A floor, not the platform's version. Pinning this to whatever the host
+      # application happens to run on would force every consumer onto that
+      # application's Elixir, which is the opposite of what extracting this
+      # library was for (T003).
       elixir: "~> 1.14",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
-      deps: deps()
+      deps: deps(),
+      name: "ExSandbox",
+      description: description(),
+      package: package(),
+      docs: docs(),
+      source_url: @source_url
     ]
   end
 
@@ -30,29 +35,93 @@ defmodule ExSandbox.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
-  # Deliberately empty, and checked by `test/dependency_tree_test.exs` (T004,
-  # T015). FR-001 forbids Ash, any web framework, and Axonn. Elixir/OTP only.
-  defp deps do
+  defp description do
+    "Isolated execution sandboxes: a composition and evidence layer over " <>
+      "operating-system containment facilities, which refuses to run rather " <>
+      "than confine partially."
+  end
+
+  # ⚠️ `priv/` is not optional and is the easiest thing here to lose.
+  # `ExSandbox.Egress.Acceptor` launches `priv/egress/nsacceptor.py` by resolved
+  # path inside each sandbox's network namespace. A tarball without it builds,
+  # installs, compiles and passes every unit test in a consumer's tree -- and then
+  # every policed launch fails where the acceptor is spawned, which is the last
+  # place a reader looks for a packaging defect. T8.2 verifies the built tarball
+  # with `tar tzf` rather than trusting this list, for exactly that reason.
+  #
+  # `docs/` ships because `boundary.md` is READ AT RUNTIME rather than copied: a
+  # consumer checking its own boundary resolves the public-interface table through
+  # `Application.app_dir(:ex_sandbox, ...)`, so a tarball without it silently
+  # removes the consumer's ability to check.
+  defp package do
     [
-      # The only dependency, and a deliberate one. `FR-001` forbids Axonn, Ash,
-      # and web frameworks; `:telemetry` is none of those -- it is a leaf
-      # Erlang library with no dependencies of its own, and the conventional
-      # way a library emits events without dictating how they are consumed.
-      #
-      # The alternative -- a host-supplied callback module -- would make every
-      # consumer write the plumbing `:telemetry` already standardises, and
-      # would still not let two libraries' events be handled uniformly.
-      {:telemetry, "~> 1.0"}
+      name: "ex_sandbox",
+      licenses: ["Apache-2.0"],
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => @source_url <> "/blob/main/CHANGELOG.md"
+      },
+      files: ~w(lib priv docs mix.exs README.md CHANGELOG.md LICENSE),
+      # ⚠️ MEASURED, not precautionary. The first `mix hex.build` shipped
+      # `priv/egress/__pycache__/nsacceptor.cpython-313.pyc` -- a Python bytecode
+      # cache CPython writes beside the acceptor the first time it is imported. It
+      # is untracked by git, so nothing in the repository hinted at it; `files:`
+      # globs the working directory, not the index. A stale `.pyc` compiled by a
+      # different CPython is at best dead weight in the tarball and at worst what
+      # a consumer's interpreter loads instead of the source beside it.
+      exclude_patterns: ["priv/egress/__pycache__"]
     ]
   end
 
-  # Per-app rather than inherited: the umbrella root alias does not fail on a
-  # child app's warnings, and `--warnings-as-errors` is this library's *boundary
-  # enforcement*, not a style preference (research R2, T009).
+  defp docs do
+    [
+      main: "readme",
+      source_ref: "v#{@version}",
+      source_url: @source_url,
+      extras: [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/requirement-ids.md",
+        "docs/boundary.md"
+      ],
+      groups_for_modules: [
+        Interface: [ExSandbox, ExSandbox.Mechanism, ExSandbox.Sandbox, ExSandbox.Capability],
+        Mechanisms: [ExSandbox.Mechanism.Beam, ExSandbox.Mechanism.Docker],
+        Conformance: [~r/^ExSandbox\.Conformance/],
+        Hardening: [~r/^ExSandbox\.Hardening/],
+        Egress: [~r/^ExSandbox\.Egress/]
+      ]
+    ]
+  end
+
+  # One runtime dependency, and `test/dependency_tree_test.exs` asserts the
+  # resolved tree is exactly that and nothing else.
+  defp deps do
+    [
+      # The only one, and a deliberate one. `FR-001` forbids a host application,
+      # Ash, and web frameworks; `:telemetry` is none of those -- it is a leaf
+      # Erlang library with no dependencies of its own, and the conventional way
+      # a library emits events without dictating how they are consumed.
+      #
+      # The alternative -- a host-supplied callback module -- would make every
+      # consumer write the plumbing `:telemetry` already standardises, and would
+      # still not let two libraries' events be handled uniformly.
+      {:telemetry, "~> 1.0"},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+    ]
+  end
+
+  # Per-app rather than inherited, from when this lived in an umbrella whose root
+  # alias did not fail on a child app's warnings. It stays because
+  # `--warnings-as-errors` is this library's *boundary enforcement*, not a style
+  # preference (research R2, T009): a wrong-direction reference compiles cleanly,
+  # exits 0, passes `mix deps.tree`, and fails only at runtime inside a
+  # third-party consumer's application.
+  #
   # `precommit` runs `test`, and a `test` invoked from inside another command
-  # inherits that command's environment -- which is `dev`, where the test
-  # helpers are not compiled. Without this the gate fails on its own plumbing
-  # rather than on anything it is checking.
+  # inherits that command's environment -- which is `dev`, where the test helpers
+  # are not compiled. Without this the gate fails on its own plumbing rather than
+  # on anything it is checking.
   def cli do
     [preferred_envs: [precommit: :test]]
   end
@@ -61,21 +130,20 @@ defmodule ExSandbox.MixProject do
     [
       precommit: [
         "compile --warnings-as-errors --force",
-        # No `deps.unlock --check-unused` here. This app's `lockfile` points at
-        # the umbrella's SHARED `../../mix.lock`, so the check can only ever be
-        # meaningful when run against every app's `deps()` at once -- which is
-        # exactly what root `mix.exs`'s own `precommit` alias does, and its gate
-        # already covers this file. Run scoped to just this directory (as CI's
-        # library-boundary job does, deliberately, so a root-level `deps.get`
-        # doesn't leave this child unlocked) it sees only `deps/0` below and
-        # reports every package the REST of the umbrella needs -- phoenix,
-        # ash_postgres, oban, all of it -- as unused. Not flaky: MEASURED, it
-        # fails 100% of the time. It used to "pass" here because the alias ran
-        # the mutating `deps.unlock --unused` instead, which -- per the root
-        # `mix.exs` comment on the same anti-pattern -- exits 0 regardless of
-        # what it finds and so was never actually gating anything.
+        # ⚠️ It used to be listed twice, which did nothing the once did not.
         "format --check-formatted",
-        "format --check-formatted",
+        # ⚠️ NEW, and only possible now. In the umbrella this app's `lockfile`
+        # pointed at the SHARED `../../mix.lock`, so run scoped to this directory
+        # the check saw only `deps/0` and reported every package the REST of the
+        # umbrella needed -- phoenix, ash_postgres, oban, all of it -- as unused.
+        # MEASURED: it failed 100% of the time, which is why it was absent here
+        # and why the comment in its place explained the absence at length.
+        #
+        # The lockfile is this repository's own now, so the check finally means
+        # what it says. Note `deps.unlock --check-unused`, not the mutating
+        # `deps.unlock --unused`: the latter rewrites the tree and exits 0, so as
+        # a gate step it cannot fail and would never gate anything.
+        "deps.unlock --check-unused",
         "test"
       ]
     ]

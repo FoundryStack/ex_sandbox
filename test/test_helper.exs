@@ -168,8 +168,8 @@ cond do
     # `excluded == []` -- so it printed "skipping  tests" with an empty list and
     # then "they are NOT RUNNING" about 32 tests that were running and failing
     # in the lines directly below. The banner and the run disagreed, and the
-    # banner is what a reader believes; `sandbox_gateway`'s own test_helper
-    # records the same failure shape from the other direction. Predicating
+    # banner is what a reader believes; a sibling application's test helper
+    # recorded the same failure shape from the other direction. Predicating
     # `excluded` on the capability is what makes both sentences true.
     IO.puts("""
     \n\e[31m005: skipping #{Enum.join(excluded, ", ")} tests on a Linux host that

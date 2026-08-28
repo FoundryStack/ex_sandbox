@@ -1,0 +1,180 @@
+# ⚠️ A green run of the `boundary` job below says nothing about whether tenant
+# code is contained.
+#
+# It runs on `ubuntu-latest` with the capabilities installed, so it verifies far
+# more than a developer's macOS `mix test` does -- but `:isolation` and
+# `:reclamation` still need systemd as PID 1 with cgroup delegation, which a
+# GitHub runner's default container does not give. That is what `isolation` is
+# for, and it runs on a schedule rather than per pull request because it builds
+# a full systemd image.
+#
+# The consequence is worth stating plainly: a pull request touching
+# `ExSandbox.Hardening.*`, `ExSandbox.Egress.*` or either mechanism can be merged
+# on a green `boundary` and be broken. Run the compose harness locally, or
+# dispatch `isolation` from the Actions tab, before merging one.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 04:00 UTC. Nothing depends on the hour beyond it being outside the hours
+    # anyone waits on a pull request.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  MIX_ENV: test
+
+jobs:
+  boundary:
+    name: Boundary gate (required)
+    # Not on a schedule: it has already run on the commit that produced this
+    # state, and a nightly rerun of a deterministic gate is noise.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ⚠️ One version, and the `elixir: "~> 1.14"` floor in `mix.exs` is
+      # therefore DECLARED RATHER THAN VERIFIED. A consumer on 1.14 is trusting
+      # a claim nothing here exercises. Adding a floor leg to a matrix is the
+      # fix, and it is real work rather than a line: 1.14 pairs with OTP 25, and
+      # whether this source compiles there is unknown, not assumed-yes.
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20"
+          otp-version: "29"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+
+      # `bwrap` is what `ExSandbox.Hardening.Linux` builds every path boundary
+      # from, and `ubuntu-latest` does not ship it. MEASURED: without it
+      # `capabilities/0` reports four of five absent and 93 tests fail
+      # `:path_confinement`.
+      #
+      # Those tests do not skip, deliberately. A confinement profile that
+      # refuses to build denies every path, so it satisfies every breach
+      # assertion for the wrong reason -- `ConfinementTest` flunks rather than
+      # let that read as a pass. Installing the capability is therefore the only
+      # fix; widening the exclusion would turn the job green and leave CI
+      # verifying nothing about containment.
+      #
+      # `passt` supplies `pasta`, which `probe_network_policy/0` requires
+      # alongside `--unshare-net`. `util-linux` supplies `setpriv` for
+      # `probe_setpriv/0`. `python3` is what `priv/egress/nsacceptor.py` runs
+      # under.
+      - name: Install sandbox capabilities
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap passt util-linux python3
+
+          # Ubuntu 24.04 restricts unprivileged user namespaces through
+          # AppArmor, so bwrap installs cleanly and every mount namespace it
+          # tries to build still fails. Without this the step above changes
+          # nothing and the 93 failures look exactly as they did before.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+          # The grader for the two lines above. An install that cannot actually
+          # unshare is indistinguishable from no install at all by the time the
+          # suite reports, and this is the last point where the cause is still
+          # legible. Fail here, loudly, rather than in 93 test failures that
+          # name a capability and not a runner.
+          if ! bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true; then
+            echo "::error::bwrap cannot create a namespace on this runner; the AppArmor sysctl above did not take effect"
+            exit 1
+          fi
+          setpriv --help >/dev/null
+          pasta --version >/dev/null 2>&1 || echo "::warning::pasta absent; network_restriction stays unverified"
+
+      # ⚠️ The gate that decides whether a container run is green, executed
+      # rather than reviewed. It needs no BEAM, no Docker and no container, so
+      # it runs here rather than in the nightly job -- an hour's wait to learn
+      # the gate is broken is an hour the gate was not gating.
+      #
+      # This project has found four guards that read correctly and returned the
+      # wrong answer on the exact path they were written to catch, one of them
+      # inside this gate. None was caught by review.
+      - name: Census gate
+        run: bash docker/census-gate-test.sh
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      # `precommit` chains `compile --warnings-as-errors --force`,
+      # `format --check-formatted`, `deps.unlock --check-unused` and `test`.
+      #
+      # The warnings flag is this library's boundary enforcement rather than a
+      # style preference (research R2): a wrong-direction reference compiles
+      # cleanly, exits 0, passes `mix deps.tree`, and fails only at runtime
+      # inside a third-party consumer's application.
+      - name: Boundary gate
+        run: mix precommit
+
+      # The package is what consumers actually receive, and `files:` globs the
+      # working directory rather than the git index -- so a build artefact
+      # nothing tracks can ship. MEASURED: the first `mix hex.build` included a
+      # `__pycache__` bytecode file for exactly that reason.
+      #
+      # Named rather than globbed. `priv/egress/nsacceptor.py` in particular is
+      # the one whose absence would pass every unit test in a consumer's tree and
+      # fail only at policed-launch time.
+      - name: Package contents
+        run: |
+          set -euo pipefail
+          mix hex.build
+          tar xOf ex_sandbox-*.tar contents.tar.gz | tar tzf - | sort > /tmp/contents.txt
+          for f in LICENSE README.md CHANGELOG.md mix.exs \
+                   priv/egress/nsacceptor.py docs/boundary.md docs/requirement-ids.md; do
+            grep -qx "$f" /tmp/contents.txt || { echo "::error::$f missing from the package tarball"; exit 1; }
+          done
+          if grep -q '__pycache__\|\.pyc$' /tmp/contents.txt; then
+            echo "::error::the package tarball contains Python bytecode"
+            exit 1
+          fi
+
+      # ex_doc warnings are broken references, and hexdocs is where a consumer
+      # meets them. `--warnings-as-errors` here rather than a manual read.
+      - name: Docs
+        run: MIX_ENV=dev mix docs --warnings-as-errors
+
+  isolation:
+    name: Sandbox isolation
+    # Scheduled and on demand only. It builds a systemd image and boots it; that
+    # is a poor trade on every pull request and a good one once a night.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The census gate inside the container decides the exit status, and
+      # `--exit-code-from isolation` carries it out. ⚠️ Both halves are needed:
+      # without `--abort-on-container-exit` compose waits, and without
+      # `--exit-code-from` a failing suite exits 0.
+      - name: Isolation suite
+        run: >
+          docker compose -f docker/compose.isolation.yml up --build
+          --abort-on-container-exit --exit-code-from isolation isolation
+
+      # The suite's log and the conformance census, which systemd writes to a
+      # bind mount precisely because the journal dies with the container and
+      # `docker logs` returns zero bytes. Without this the failure output does
+      # not survive the job, and a red nightly nobody can read is a red nightly
+      # nobody acts on.
+      - name: Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolation-results
+          path: docker/results/
+          if-no-files-found: warn

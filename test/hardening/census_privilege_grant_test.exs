@@ -44,7 +44,7 @@ defmodule ExSandbox.Hardening.CensusPrivilegeGrantTest do
   """
   use ExUnit.Case, async: true
 
-  @compose Path.join([__DIR__, "..", "..", "..", "..", "docker", "compose.isolation.yml"])
+  @compose Path.join([__DIR__, "..", "..", "docker", "compose.isolation.yml"])
 
   # The services that boot systemd and launch sandboxes. `postgres` is a plain
   # unprivileged image and is deliberately not listed.

@@ -75,7 +75,8 @@ defmodule ExSandbox.Egress.Resolver do
 
   A name that resolves into a rotation gives a different member on each query,
   and a connection opened against the first answer while the second is being
-  recorded must not be refused for it. `Registry.record_resolution/4` unions.
+  recorded must not be refused for it. `ExSandbox.Egress.Registry.record_resolution/4`
+  unions.
   The set is bounded by the sandbox's own lifetime, because it lives in the
   registry entry that `Binding.release/2` deletes.
 

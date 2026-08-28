@@ -5,7 +5,8 @@ defmodule ExSandbox.Egress.Relay do
 
   ## Why this is a module and not three lines in the pool
 
-  `ExSandbox.Egress.Pool.relay/2` was a placeholder that logged and closed. That
+  ExSandbox.Egress.Pool's `relay/2` -- since removed -- was a placeholder that
+  logged and closed. That
   was the honest shape while the netns did not exist — it denies something the
   policy allows, which fails *closed* and is visible as the "permitted
   destination is reachable" check not passing. It was never a false pass.

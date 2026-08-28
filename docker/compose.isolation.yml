@@ -1,0 +1,230 @@
+# The isolation harness: a real Linux host with systemd as PID 1, all five
+# capabilities genuinely constructed, and nothing stubbed.
+#
+#     docker compose -f docker/compose.isolation.yml up --build \
+#       --abort-on-container-exit --exit-code-from isolation isolation
+#     # results: docker/results/suite.log, census: docker/results/census.txt
+#
+# ⚠️ Not `run --rm ... isolation sh -c ...`. A container command displaces
+# systemd as PID 1, `probe_cgroups/0` then reports no cgroup delegation, and
+# every isolation check fails with an R9 refusal that reads as a mechanism defect
+# rather than as an artefact of how it was launched (measured: 5/33).
+#
+# ⚠️ And not a bare `run --rm --build isolation` either, which is the subtler
+# of the two. Without a command it boots systemd correctly and the suite runs
+# exactly as it should -- then the container keeps running, because systemd is
+# PID 1 and PID 1 does not exit when a unit finishes. The terminal hangs after
+# the census has already printed, and `--exit-code-from` is an `up` flag, so
+# nothing propagates the gate's verdict to the shell. `up --abort-on-container-exit
+# --exit-code-from isolation` is what turns the gate into this command's exit
+# status, which is the only form CI can act on. Two hints in
+# `test/mechanism/beam/conformance_test.exs` printed the `run` form until they
+# were corrected to match this file.
+#
+# ⚠️ There is no `postgres` service here, and its absence is a statement rather
+# than an omission. This library has no data store (`012-FR-001`), so its
+# conformance run supplies no credential probe and the credentials group reports
+# `host capability unavailable` -- the third outcome, which is neither a pass nor
+# a breach. A consumer with a database instantiates the same suite with its own
+# probe; that is where those six checks are demonstrated. Adding Postgres here to
+# turn them green would mean this library had grown the database concept it is
+# defined by not having.
+
+# ⚠️ Named explicitly, and the default is actively wrong here.
+#
+# compose derives a project name from the compose file's PARENT DIRECTORY, which
+# is `docker` -- the same name the originating umbrella's harness derives, since
+# its compose files live in a directory called `docker` too. Both then share one
+# project: MEASURED on the first run of this file, which reported
+# `Found orphan containers ([docker-postgres-1])` and offered to remove them.
+# Those are the umbrella's. A `down -v` from either side would take the other's
+# containers, networks and volumes with it.
+name: ex-sandbox-isolation
+
+services:
+  isolation:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.isolation
+
+    # ⚠️ Pinned, because `Dockerfile.pastareclaim` says `FROM` this exact tag and
+    # the default is not stable. compose names an image `<project>-<service>`, so
+    # the default moved from `docker-isolation` to `ex-sandbox-isolation-isolation`
+    # the moment `name:` above was set -- MEASURED, and it broke the reclamation
+    # image's base with a "pull access denied" that reads as a registry problem
+    # rather than as a consequence of renaming the project. Naming the image here
+    # decouples the two entirely.
+    image: ex-sandbox-isolation:latest
+
+    # systemd needs a real PID 1 with cgroup delegation. Every setting below is
+    # load-bearing for at least one capability probe; none is decoration.
+    #
+    # ⚠️ `privileged: true` was here until T060a10, and dropping it is what
+    # `013-FR-006b` requires: a deployment enabling only the runtime-level
+    # mechanism must run the execution plane WITHOUT the elevated privileges
+    # nested containerisation needs.
+    #
+    # What replaced it is `systempaths=unconfined` plus `CAP_SYS_PTRACE` and
+    # `CAP_SYS_ADMIN` below, and the substitution was measured rather than
+    # reasoned.
+    #
+    # The grant is THREE pieces, each answering a different question, and each
+    # was found only by running the census and reading what broke:
+    #
+    #   * `systempaths=unconfined` lets bwrap BUILD the mount confinement
+    #   * `CAP_SYS_PTRACE`         lets the launcher VERIFY it was built
+    #   * `CAP_SYS_ADMIN`          lets the acceptor JOIN the sandbox netns
+    #
+    # ⚠️ Each was invisible until the one before it was granted, and that is the
+    # useful lesson rather than an incidental annoyance. Granting the first
+    # produces a host where `capabilities/0` reports all five `ok` and every
+    # launch is then refused at verification; granting the second produces a
+    # host where launches succeed and all five network checks fail. A privilege
+    # audit that stops at the first green signal stops two layers early.
+    #
+    # ⚠️ The initial probe suggested "no capability needed at all" -- it tested
+    # only bwrap, which is the one layer that genuinely needs none. That answer
+    # was measured, correct about what it measured, and badly wrong as a
+    # description of the deployment. The gap between "the probe passed" and "the
+    # system works" is the thing worth keeping.
+    #
+    # ⚠️ `ExSandbox.Hardening.CensusPrivilegeGrantTest` ASSERTS on this file.
+    # Restoring `privileged: true` would make the census pass again while
+    # silently abandoning `013-FR-006b` -- nothing else in the suite would
+    # notice, because a privileged host is a superset of what this grants and
+    # every check would stay green.
+    security_opt:
+      # `bwrap --unshare-pid --proc /proc` -- the confinement `confinement_args/2`
+      # builds -- is refused in a default container, and NOT for want of a
+      # capability. Docker over-mounts `/proc/kcore`, `/proc/keys` and
+      # `/proc/timer_list` with tmpfs and re-mounts `/proc/bus`, `/proc/fs`,
+      # `/proc/irq`, `/proc/sys`, `/proc/sysrq-trigger`, `/proc/scsi` read-only.
+      # The kernel will not let a new namespace mount a fresh `proc` over a
+      # `/proc` carrying such over-mounts, since that would uncover what they
+      # hide. Unmasking them is the whole grant.
+      #
+      # ⚠️ Strictly smaller than `privileged: true`, which is the point under
+      # `013-FR-006f`: this adds NO capability, no device access beyond the
+      # explicit `devices:` entry below, and no writable `/sys`. seccomp and any
+      # LSM profile stay in force.
+      #
+      # ⚠️ It does widen what the *container* can read from its own `/proc` --
+      # `/proc/kcore` is host kernel memory. That is a real cost, accepted here
+      # because this container is a test harness, and because the tenant code it
+      # runs sees `bwrap`'s own `/proc`, not this one. A production execution
+      # plane should prefer a host that does not mask these paths to begin with.
+      - systempaths=unconfined
+
+    cap_add:
+      # `verify_applied/1` reads `/proc/<pid>/ns/mnt` for a sandbox running as
+      # another uid after `setpriv`. Without this the launch succeeds and
+      # verification fails, which the mechanism correctly treats as a refusal.
+      - SYS_PTRACE
+      # `nsacceptor.py` joins the sandbox netns via `nsenter`, i.e. `setns(2)`
+      # into another process's namespace. Without this every network check fails
+      # while the sandbox itself launches fine.
+      - SYS_ADMIN
+
+    cgroup: host
+
+    devices:
+      # `pasta` needs a tun device to build the sandbox's network namespace.
+      - /dev/net/tun:/dev/net/tun
+
+    stop_signal: SIGRTMIN+3
+
+    tmpfs:
+      - /run
+      - /run/lock
+      # ⚠️ `exec` is load-bearing, and its absence produced a failure that read
+      # as a defect in the code under test. Docker mounts tmpfs `noexec` by
+      # default. `ExSandbox.Hardening.ConfinementTest` builds its exec probe
+      # under `System.tmp_dir!()`, which is `/tmp` here, so `execvp` returned
+      # EACCES and the suite reported "a confined child could not execute a
+      # binary under a denied path" -- the test's own diagnostic, which then
+      # sends a reader to `command_bind/2` and the `--ro-bind` it emits. Nothing
+      # there is wrong. The binary was never executable on this host.
+      #
+      # The test's message predicts ENOENT for the defect it names ("bwrap:
+      # execvp ...: No such file or directory", exit 1). What arrived was
+      # "Permission denied", exit 1. Same status, different errno, and the errno
+      # is the whole diagnosis.
+      - /tmp:exec
+
+    volumes:
+      # cgroup v2 must be writable: `systemd-run --scope` creates a scope under
+      # it, and a read-only mount fails `probe_cgroups/0` while every binary the
+      # probe looks for is still present -- capabilities false for a reason no
+      # error message states.
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # The suite's output, on the host, surviving the container.
+      #
+      # ⚠️ Not a convenience. systemd routes unit output to the journal, and the
+      # journal dies with the container -- `docker logs` returns **zero bytes**
+      # even with `StandardOutput=journal+console`, because the console is not
+      # the container's stdout. A failing run was therefore indistinguishable
+      # from one that never booted, which cost a full debugging cycle chasing a
+      # boot failure that never happened. The unit tees to a file here so the
+      # result is readable after the fact, whatever systemd decides to do.
+      - ./results:/var/log/ex_sandbox:rw
+      # `probe_disk_quota/0` asks `stat -f -c %T` and accepts only xfs, ext2/3/4,
+      # or btrfs. The container's own root is `overlayfs`, which it rejects --
+      # correctly, since overlayfs cannot carry a quota. A *named volume* is
+      # backed by the VM's real ext4 and reports `ext2/ext3`, so the storage root
+      # has to be a volume rather than an image directory.
+      - sandbox-storage:/var/lib/ex_sandbox/sandboxes
+
+    # ⚠️ Deliberately no bind mount of the source tree. The image COPYs it
+    # instead: a macOS bind mount would shadow the compiled build and reintroduce
+    # the host filesystem the probes reject. Rebuilding on change is the cost.
+    #
+    # ⚠️ No `command:` override, and that is not an omission. Setting one
+    # replaces the image's `CMD ["/lib/systemd/systemd"]`, so the test script
+    # becomes PID 1 and systemd never boots -- leaving `systemd-run --user` with
+    # no manager to talk to. `probe_cgroups/0` then returns false, `available?/0`
+    # returns false, and every isolation test skips. The container exits 0 having
+    # verified nothing, which is the exact failure mode this harness exists to
+    # eliminate. The suite runs as a unit instead (see `isolation-tests.service`).
+    #
+    # `init: false` is the default and must stay that way for the same reason:
+    # an init shim would also take PID 1.
+    init: false
+
+  # T060a6: does `pasta` survive `destroy/1`? Same host shape as `isolation`,
+  # with the probe unit swapped in for the suite unit.
+  #
+  # ⚠️ Built `FROM ex-sandbox-isolation:latest` -- the tag pinned on the service
+  # above -- so the `isolation` service must be built first. compose does not order BUILDS by anything, only starts, so
+  # `up --build isolation` then `up --build pasta-reclaim` is the working order.
+  # A first-ever `up --build pasta-reclaim` fails on a missing base image, which
+  # reads as a registry problem rather than an ordering one.
+  #
+  # ⚠️ Its privilege grant is identical to `isolation`'s ON PURPOSE, and
+  # `CensusPrivilegeGrantTest` asserts both services carry all three. A probe
+  # running under a wider grant than the suite would report reclamation working
+  # on a host the suite could never run on.
+  pasta-reclaim:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pastareclaim
+    security_opt:
+      - systempaths=unconfined
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    cgroup: host
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp:exec
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./results:/var/log/ex_sandbox:rw
+      - sandbox-storage:/var/lib/ex_sandbox/sandboxes
+    init: false
+
+volumes:
+  sandbox-storage:

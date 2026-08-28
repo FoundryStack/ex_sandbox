@@ -1,0 +1,143 @@
+# Baseline for the census's `unavailable` count (005 T060e, 012-FR-016a).
+#
+# The third outcome is honest, but nothing stops it from *growing*. A mechanism
+# that quietly stopped demonstrating a guarantee -- a handle no longer
+# published, a capability probe that started returning false -- converts
+# failures into `unavailable`, and a runner gating only on `failed=0` still
+# exits 0. The suite would report a smaller set of guarantees every release and
+# stay green the whole way.
+#
+# ⚠️ This is a ceiling, not an equality. The count is *expected* to move in both
+# directions: it went 6 → 9 when the network group landed (three new checks with
+# no mechanism able to demonstrate them yet), and T060a should take it back to
+# 6 by giving the BEAM mechanism a real network namespace. Going **down** is
+# progress and never fails; going **up** requires editing this file, which is
+# the deliberate step that makes a silent regression impossible.
+#
+# Format: `<phase> <max-unavailable>`. Phases not listed are not gated.
+
+# The BEAM mechanism under `--unshare-net`: six credentials checks (ex_sandbox
+# has no data store by 012-FR-001, so no probe is supplied there) and four
+# network checks (no address, no allowlist, no policy handle until T060a --
+# plus the denied-destination check, see the credentials note below).
+# ⚠️ Lowered 10 -> 9 on 2026-08-18 (run `2026-08-18T09:49:40Z-97`), and the
+# check that moved is the one T060j opened.
+#
+# `a destination outside the environment's allowlist is refused` now PASSES, in
+# both phases, and it earned it. The denied destination used to be RFC 5737
+# TEST-NET-1; `attempt_reach_denied_host/2` gates on a host control probe
+# against that same address, nobody routes it, so the control said `:no` on
+# every host and the check reported the third outcome permanently. With a
+# genuinely reachable denied address (`8.8.8.8:53`) the control succeeds, the
+# check runs, and the sandbox -- still under `--unshare-net` -- cannot reach it.
+#
+# ⚠️ Note what this does and does not establish. The pass is honest: the host
+# reaches the address and the sandbox does not, which is the one configuration
+# where the difference is attributable to the boundary. But blanket denial also
+# produces it, so this check alone still cannot distinguish an allowlist from
+# `--unshare-net` -- that is the permitted half's job, and it is one of the
+# three still reporting the third outcome. Measured: `passed=435
+# unavailable=9 failed=0 ran=444`.
+# ⚠️ Lowered 9 -> 7 on 2026-08-18 after T060a4e: the policed launch boots, so
+# three of the four network checks moved from the third outcome to PASSING.
+# `LaunchPlan.build/4` now inserts `pasta` AFTER the privilege drop instead of
+# wrapping the command in it, and the ordering was measured rather than argued
+# (`docker/launch-ordering-probe.sh`) -- both that pasta composes after the drop
+# and that the scope's caps survive two intervening execs.
+#
+# The remaining 7 decompose as **6 credentials + 1 network**. The six are
+# structural (`ex_sandbox` has no database concept per `012-FR-001`, so it
+# supplies no `credential_probe`) and are not what T060a moves. The one is
+# `reaching another sandbox over the network is refused`.
+#
+# ⚠️ **Corrected 2026-08-18: that one is a floor too.** This line previously
+# said it "needs `context.address` as `{host, port}` with a real listener behind
+# it (T060a4)", and a real listener does not make it dialable -- pasta gives
+# every netns the host's own address, so A's dial of B's address reaches A's own
+# listener. See the credentials note at the foot of this file for the
+# measurement. Both remaining counts are now expected to stay where they are.
+#
+# ⚠️ Note what the newly-passing checks establish that the old ones did not.
+# `a destination inside the environment's allowlist is reachable` is the only
+# check in the group that can tell an allowlist from blanket denial -- every
+# denial check passes against `--unshare-net`, which enforces no policy at all.
+# It is now passing on merit: the tenant reaches 1.1.1.1:443 through the
+# acceptor, the verdict server answers PERMIT for its source key, and a denied
+# destination on the same path is refused.
+# ⚠️ Raised 7 -> 8 on 2026-08-24 by 029 T034a, for **one named new check** and
+# for nothing else: `every published handle of another sandbox is refused from
+# inside` (`029-FR-017`).
+#
+# ⚠️ Read the raise as +1, not as 8. The seven above are unchanged and still
+# decompose as 6 credentials + 1 network; not one of them moved, and none of
+# them is covered by this line. The failure this file warns about is a ceiling
+# raised to absorb a check that *stopped* being demonstrated, and the way to
+# tell the two apart is whether the raise names a check that did not exist
+# before. This one did not exist before.
+#
+# It reports the third outcome because the BEAM mechanism declares no dialable
+# peer handle -- `context.address` is `"peer:" <> id` (`beam.ex:582`), which is
+# not a `{host, port}`. That is the same fact the note above already records
+# about the peer check, observed by a second check that asks a wider question:
+# not "is `context.address` refused?" but "is EVERY handle the platform
+# publishes refused, and was any of them live enough for the refusal to mean
+# anything?".
+#
+# ⚠️ It is expected to go DOWN, and 029 T034b is the task that does it. This is
+# the check that must be seen refusing something before Phase 3 closes; the
+# rule and its check land before the dialable address (owner's ordering,
+# 2026-08-24) precisely so the address never exists ungoverned.
+#
+# Not a floor, unlike the peer check above. The measured reason that one is a
+# floor -- pasta assigns every netns the host's own address, so A's dial of B's
+# address lands on A's own listener -- is a fact about `context.address`. A
+# host-side tuple (T033) is not that address, and the liveness control this
+# check gates on is what would make its refusal attributable.
+isolation 8
+
+# ⚠️ Lowered 29 -> 10 on 2026-08-18, and the raise it reverses was WRONG.
+#
+# The raise to 29 was written from reasoning, never measured: it predicted that
+# nineteen `@tag :isolation` tests calling `IsolationLaunch.provision_or_skip/2`
+# would report the third outcome, because `network_restriction` had begun
+# honestly reporting `false` and `require_hardening/0` refuses to launch when
+# any capability is missing.
+#
+# Measured on this host (run `2026-08-18T07:50:18Z-97`, after the corrected
+# probe landed): `passed=380 unavailable=10 failed=0 ran=390`, with
+# `available?: true` and all five capabilities `ok` -- `network_restriction`
+# included. The nineteen launch, and they PASS. There was never anything for the
+# baseline to absorb.
+#
+# ⚠️ The failure mode this reverses is the loose ceiling, and it is the same
+# species as every other defect in this feature. The gate compares
+# `unavailable <= baseline`, so `29` did not merely overstate the number: it
+# licensed nineteen checks to stop being demonstrated, silently, while the run
+# still exited 0. A baseline raised on prediction rather than measurement is a
+# hole in the gate that exists to catch exactly that.
+#
+# The lesson is the one this file already teaches in the other direction: the
+# raise below (credentials 3 -> 4) was made against a measured run and names the
+# check it covers. This one named a host limitation the host does not have.
+
+# ⚠️ A `credentials` phase used to be keyed here, and its removal is part of the
+# extraction rather than a lost entry.
+#
+# That phase ran in the originating application, where a credential probe IS
+# supplied and the six credentials checks run for real. This package has no data
+# store and must not grow one (`012-FR-001`), so it supplies no probe: those six
+# report the third outcome inside the `isolation` phase above, and are part of
+# its 8. Nothing here calls `census_gate` with the key `credentials`, so leaving
+# the entry would have been configuration that gates nothing while reading as
+# though it does.
+#
+# ⚠️ Its history recorded one thing that still applies here, so it is kept rather
+# than deleted with the rest: **the peer-reachability check is a FLOOR, not a
+# pending task.** Publishing the `{host, port}` tuple it would dial makes the
+# check MEANINGLESS, because pasta assigns every netns the host's own address --
+# measured twice: two sandboxes both come up as `172.17.0.2`, and A's connect to
+# that address lands on A's OWN listener while B never accepts. `003-FR-002`
+# cannot be demonstrated by dialling, and the third outcome is the honest
+# report; `FR-011c` is satisfied structurally instead, since sandbox B's address
+# is not an address sandbox A can name. `BeamContextTest` pins the tuple out so
+# a later reader cannot "fix" the count above by publishing one.

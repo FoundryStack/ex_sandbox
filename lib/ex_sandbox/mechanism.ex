@@ -203,8 +203,10 @@ defmodule ExSandbox.Mechanism do
   silently lost across an intervening exec, allocating 300 MB under a nominal
   100 MB cap and **exiting 0**. A limit re-applied at execution time is a limit
   applied after the process it governs already exists, which is the shape that
-  fails open. The sandbox is launched under `ExSandbox.Hardening.apply/2`, and
-  what runs inside it inherits that confinement or the mechanism has none.
+  fails open. The sandbox is launched under the hardening layer's own command
+  construction -- `ExSandbox.Hardening.Linux.build_command/2` on Linux,
+  `ExSandbox.Hardening.Darwin.apply/3` on macOS -- and what runs inside it
+  inherits that confinement or the mechanism has none.
 
   ## Options
 

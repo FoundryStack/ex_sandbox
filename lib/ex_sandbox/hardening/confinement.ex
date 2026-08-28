@@ -87,7 +87,7 @@ defmodule ExSandbox.Hardening.Confinement do
   @typedoc """
   How to launch the confined process.
 
-  Deliberately the same shape as `ExSandbox.Hardening.launch_spec/0`: the caller
+  Deliberately the same shape as `t:ExSandbox.Hardening.launch_spec/0`: the caller
   launches **this**, not the command it asked about, because the returned `cmd`
   is the confinement wrapper.
   """

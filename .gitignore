@@ -22,3 +22,11 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 ex_sandbox-*.tar
 
+# CPython writes these beside priv/egress/nsacceptor.py on first import.
+__pycache__/
+*.pyc
+
+# Isolation-harness output. `compose.isolation.yml` bind-mounts this directory so
+# the census and suite log survive the container; every file in it is one run's
+# artefact, and the runner clears them at start.
+docker/results/

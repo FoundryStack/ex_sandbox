@@ -1,0 +1,13 @@
+# ⚠️ The tag `compose.isolation.yml` pins on its `isolation` service, NOT a
+# compose-derived default. The default is `<project>-<service>` and therefore
+# changes with the project name; this does not.
+#
+# The `isolation` service must be built first -- compose orders starts, never
+# builds, so a first-ever `up --build pasta-reclaim` fails on a missing base
+# image and reads as a registry problem rather than an ordering one.
+FROM ex-sandbox-isolation:latest
+COPY docker/pasta-reclaim-probe.py /usr/local/bin/pasta-reclaim-probe
+COPY docker/pasta-reclaim-probe.service /etc/systemd/system/pasta-reclaim-probe.service
+RUN chmod +x /usr/local/bin/pasta-reclaim-probe \
+ && systemctl disable isolation-tests.service \
+ && systemctl enable pasta-reclaim-probe.service

@@ -1,0 +1,58 @@
+[Unit]
+# Runs `005`'s isolation suite once systemd is up, then halts the container with
+# the suite's own exit code.
+#
+# A unit rather than the container command: `systemd-run --user` needs a running
+# manager, so systemd must hold PID 1. See compose.isolation.yml for what
+# happens when it does not.
+Description=005 isolation and reclamation suites
+After=multi-user.target dbus.service user@0.service
+Requires=dbus.service user@0.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/app
+Environment=MIX_ENV=test
+Environment=HOME=/root
+Environment=LANG=C.UTF-8
+# ⚠️ Not inherited -- set here or not at all. A systemd service starts with an
+# empty environment: neither the image's `ENV` nor compose's `environment:` key
+# reaches it, because both land on PID 1 (systemd itself) and systemd does not
+# pass its own environment down to units. Measured: with `ENV AXONN_DB_HOST=postgres`
+# baked into the image and set again in compose, the unit still resolved the
+# `config.exs` defaults and dialled `localhost:5434`, which reads as a compile-time
+# config bug rather than an environment-propagation one. It cost a debugging cycle.
+# `--user` scopes need a session bus; without it `probe_cgroups/0` fails for a
+# reason that reads as "no cgroup support" rather than "no bus".
+# ⚠️ `AXONN_DB_HOST`/`AXONN_DB_PORT` were set here in the umbrella's copy and are
+# gone deliberately. This library has no data store (`012-FR-001`), the compose
+# file runs no `postgres` service, and a unit exporting a database host that
+# nothing connects to invites the next reader to look for the database.
+Environment=XDG_RUNTIME_DIR=/run/user/0
+# `user@0.service` is what creates the user session bus that `systemd-run --user`
+# connects to. Verified the hard way: with systemd correctly running as PID 1 and
+# `--system` scopes working fine, `--user` still failed with "Failed to connect
+# to user scope bus" until this manager was started. `Requires=` above makes it a
+# hard dependency -- without the bus the probe reports no cgroup delegation,
+# which reads as a missing kernel feature rather than a missing unit.
+ExecStartPre=/bin/mkdir -p /run/user/0
+ExecStartPre=/bin/mkdir -p /var/log/ex_sandbox
+# ⚠️ Tee, don't just log. Journal output does not survive the container and does
+# not reach `docker logs`; see the bind mount in compose.isolation.yml. `pipefail`
+# keeps the suite's exit code rather than `tee`'s, or a failing run would report
+# success -- the exact false pass this container exists to prevent.
+ExecStart=/bin/bash -o pipefail -c '/usr/local/bin/run-isolation-tests 2>&1 | tee /var/log/ex_sandbox/suite.log'
+
+# The exit code is the whole product of this container. `SuccessExitStatus` is
+# deliberately not widened: a non-zero test run must halt non-zero, or CI reads
+# a failed isolation suite as a pass.
+# `$EXIT_STATUS` is set by systemd to the numeric exit code for a service that
+# ran and exited. `$SERVICE_RESULT` is "success" when it exited 0. Both are used
+# because `$EXIT_STATUS` is empty when the service was killed by a signal, and
+# defaulting an empty value to 0 would turn a crashed suite into a green CI run.
+ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" = "success" ]; then systemctl exit 0; else systemctl exit "${EXIT_STATUS:-1}"; fi'
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

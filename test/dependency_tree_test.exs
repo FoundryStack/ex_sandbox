@@ -57,7 +57,21 @@ defmodule ExSandbox.DependencyTreeTest do
   @app_dir Path.expand(Path.join(__DIR__, ".."))
 
   # Any of these appearing in `ex_sandbox`'s tree is a FR-001 violation.
-  @forbidden ~w(ash ash_postgres ecto ecto_sql phoenix plug axonn axonn_web)
+  #
+  # ⚠️ This list USED TO END `axonn, axonn_web`, and dropping those two names
+  # was part of extracting the library rather than an accidental loosening. While
+  # this lived inside Axonn's umbrella, "does the tree mention axonn" was a sharp
+  # question -- Axonn was the sibling one wrong `in_umbrella: true` away. Outside
+  # it, `axonn` is one arbitrary package name among all the ones not listed here,
+  # and a denylist that happens to name it while permitting every other host
+  # application reads as a stronger check than it is.
+  #
+  # What replaces it is the ALLOWLIST in `consumer_facing_deps/0` below: the tree
+  # a consumer receives is exactly `telemetry`, so every host application is
+  # excluded by construction rather than by enumeration. This denylist stays for
+  # the frameworks, where naming them buys a failure message that says which
+  # forbidden thing arrived instead of only that something did.
+  @forbidden ~w(ash ash_postgres ecto ecto_sql phoenix plug)
 
   # A dependency line in `--format plain`: an indent built from four-column
   # units (`|   ` under a continuing branch, four spaces under a closed one),
@@ -109,24 +123,79 @@ defmodule ExSandbox.DependencyTreeTest do
   # the dependency belongs.
   @allowed ~w(telemetry)
 
+  # ⚠️ `mix deps.tree` prints DECLARATIONS, not what any particular environment
+  # resolves. `MIX_ENV=prod mix deps.tree` prints `ex_doc` and its six
+  # transitive packages exactly as `MIX_ENV=dev` does -- MEASURED during the
+  # extraction, and it is why the two tests below stopped being able to read
+  # their answer out of the tree alone the moment a `:dev` dependency existed.
+  #
+  # The question FR-001 actually asks is what a CONSUMER receives, and that is
+  # decided by `only:`. Hex omits a dependency scoped away from `:prod` from the
+  # published package's requirements entirely, so `{:ex_doc, only: :dev}` reaches
+  # nobody's application while `{:telemetry, "~> 1.0"}` reaches everyone's.
+  #
+  # Introspecting `Mix.Project.config()` rather than parsing more text: the
+  # declaration is the thing being asserted about, and reading it directly cannot
+  # disagree with itself the way a second parser could.
+  defp consumer_facing_deps do
+    Mix.Project.config()[:deps]
+    |> Enum.reject(fn dep ->
+      only = dep |> dep_opts() |> Keyword.get(:only)
+      only != nil and :prod not in List.wrap(only)
+    end)
+    |> Enum.map(fn dep -> dep |> elem(0) |> Atom.to_string() end)
+    |> Enum.sort()
+  end
+
+  defp dep_opts(dep) when is_tuple(dep) do
+    case Tuple.to_list(dep) do
+      [_name, opts] when is_list(opts) -> opts
+      [_name, _req, opts] when is_list(opts) -> opts
+      _ -> []
+    end
+  end
+
+  # The lines strictly beneath `name`'s own line, i.e. its transitive closure.
+  # A four-column indent unit is the format's nesting, so a child is any
+  # following entry deeper than the parent, up to the next entry at or above the
+  # parent's depth.
+  defp subtree_of(deps, name) do
+    case Enum.split_while(deps, fn {_depth, dep} -> dep != name end) do
+      {_before, []} ->
+        nil
+
+      {_before, [{depth, ^name} | rest]} ->
+        rest
+        |> Enum.take_while(fn {child_depth, _} -> child_depth > depth end)
+        |> Enum.map(fn {_, child} -> child end)
+    end
+  end
+
   test "ex_sandbox depends on nothing beyond :telemetry (FR-001, SC-003)" do
     tree = deps_tree(@app_dir)
 
-    actual =
-      tree
-      |> dependencies!()
-      |> Enum.filter(fn {depth, _name} -> depth == 0 end)
-      |> Enum.map(fn {_depth, name} -> name end)
-      |> Enum.sort()
+    # Parsed for its emptiness guard, so an unreadable tree cannot make the
+    # assertion below vacuous by supplying nothing to compare against.
+    _ = dependencies!(tree)
+
+    actual = consumer_facing_deps()
 
     assert actual == Enum.sort(@allowed),
            """
-           ex_sandbox's dependencies changed. Expected #{inspect(@allowed)}, got #{inspect(actual)}.
+           ex_sandbox's consumer-facing dependencies changed.
+           Expected #{inspect(@allowed)}, got #{inspect(actual)}.
 
-           FR-001 forbids Axonn, Ash, and web frameworks. `:telemetry` is admitted
-           as a leaf Erlang library with no dependencies of its own -- see
-           `ExSandbox.Telemetry`. Anything else needs the same argument made
-           explicitly, here.
+           FR-001 forbids a host application, Ash, and web frameworks.
+           `:telemetry` is admitted as a leaf Erlang library with no dependencies
+           of its own -- see `ExSandbox.Telemetry`. Anything else needs the same
+           argument made explicitly, here.
+
+           A dependency scoped `only: :dev` or `only: :test` is not consumer
+           facing and does not belong on this list -- Hex leaves it out of the
+           published requirements. If you are reading this because you added
+           tooling, scope it rather than widening `@allowed`.
+
+           Declared: #{inspect(Mix.Project.config()[:deps])}
 
            Tree:
            #{tree}
@@ -144,15 +213,31 @@ defmodule ExSandbox.DependencyTreeTest do
     # every direct dependency is a line too, so the list is non-empty on any
     # tree this test is meant to run against, and an empty parse is a failure
     # rather than an exclusion satisfied by having nothing to exclude.
-    transitive =
-      tree
-      |> dependencies!()
-      |> Enum.filter(fn {depth, _name} -> depth > 0 end)
-      |> Enum.map(fn {_depth, name} -> name end)
+    # ⚠️ Scoped to `:telemetry`'s own subtree rather than to "every line at
+    # depth > 0". The broad form was correct while `telemetry` was the only
+    # declaration; with `{:ex_doc, only: :dev}` present it fails on ex_doc's six
+    # transitive packages, which reach no consumer and say nothing about this
+    # claim. Narrowing it keeps the assertion pointed at the dependency the
+    # claim is actually about.
+    deps = dependencies!(tree)
+    transitive = subtree_of(deps, "telemetry")
+
+    refute is_nil(transitive),
+           """
+           `telemetry` does not appear in the dependency tree at all, so this
+           check has nothing to assert about and would pass for free.
+
+           Tree:
+           #{tree}
+           """
 
     assert transitive == [],
            """
-           a dependency of ex_sandbox has dependencies of its own: #{inspect(transitive)}
+           :telemetry has grown dependencies of its own: #{inspect(transitive)}
+
+           Its childlessness is the reason it is admissible at all, so this
+           library's zero-transitive-dependency claim ends here and the decision
+           deserves revisiting rather than the list being widened.
 
            Tree:
            #{tree}
@@ -175,31 +260,14 @@ defmodule ExSandbox.DependencyTreeTest do
     end
   end
 
-  test "ash_sandbox depends on ex_sandbox and Ash, but never on Axonn (FR-002, SC-002)" do
-    tree = deps_tree(Path.expand(Path.join([__DIR__, "..", "..", "ash_sandbox"])))
-    names = dependencies!(tree) |> Enum.map(fn {_depth, name} -> name end)
-
-    # The positive half reads the parse: `tree =~ "ash"` is satisfied by
-    # `ash_postgres`, or by the word appearing in a version requirement, so it
-    # would not distinguish a tree that lost `:ash` itself.
-    assert "ex_sandbox" in names
-    assert "ash" in names
-
-    # The negative half stays raw-text, for the same reason as above.
-    for dep <- ~w(axonn axonn_web) do
-      refute tree =~ ~r/\b#{dep}\b/,
-             "ash_sandbox's dependency tree contains #{dep}:\n#{tree}"
-    end
-  end
-
-  test "neither library declares a dependency on Axonn in its mix.exs" do
-    # The declaration check, separate from the resolved tree: a tree is built
-    # from declarations, so catching it here names the actual line to delete.
-    for app <- ~w(ex_sandbox ash_sandbox) do
-      mix_exs = Path.expand(Path.join([__DIR__, "..", "..", app, "mix.exs"])) |> File.read!()
-
-      refute mix_exs =~ ":axonn",
-             "#{app}/mix.exs declares a dependency on Axonn"
-    end
-  end
+  # ⚠️ Two tests were REMOVED here during the extraction, and neither was
+  # dropped: `ash_sandbox depends on ex_sandbox and Ash, but never on Axonn` and
+  # `neither library declares a dependency on Axonn in its mix.exs` both read
+  # `../../ash_sandbox`, a sibling that exists only inside Axonn's umbrella.
+  #
+  # Kept here they would not merely fail -- they would assert a fact this
+  # repository cannot establish. Whether `ash_sandbox` avoids depending on Axonn
+  # is Axonn's invariant to hold, checkable only where both are present, so they
+  # moved to `apps/ash_sandbox/test/` in that repository rather than being
+  # weakened into something this one could run.
 end

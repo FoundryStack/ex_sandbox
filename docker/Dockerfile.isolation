@@ -1,0 +1,157 @@
+# The Linux host this library's isolation suite needs (T036a).
+#
+# ## Why this image exists
+#
+# Six of `005`'s ten success criteria rest on Linux kernel facilities that macOS
+# does not provide. Without this image, `mix test` on a developer machine excludes
+# `:isolation` and `:reclamation` and prints a warning saying so -- honest, but it
+# would leave the guarantees that matter most verifiable only in CI, which is the
+# worst place to first learn that tenant code is not contained.
+#
+# ⚠️ For an outside contributor this image is not a convenience, it is the only
+# way to run the tests that back this library's central claim. A pull request
+# whose `mix test` is green on macOS has verified nothing about containment.
+#
+# ## Why systemd is PID 1
+#
+# `ExSandbox.Hardening.Linux.probe_cgroups/0` runs `systemd-run --scope --user`
+# and treats a non-zero exit as "no cgroup delegation". That probe *attempts the
+# operation* rather than inferring it from `:os.type()` -- deliberately, per R9 --
+# so no amount of faking `/sys/fs/cgroup` satisfies it. A container with a shell
+# as PID 1 fails the probe, `available?/0` returns false, and every isolation
+# test skips while appearing to run.
+#
+# So: systemd as PID 1, cgroup v2 mounted writable, and the container started
+# with the narrowed privilege grant in the compose file.
+#
+# ## Why not a plain `--cap-add` container
+#
+# `bwrap` needs mount and user namespaces; `setpriv` needs a real uid to drop
+# from; the disk-quota probe needs `stat -f` to report a quota-capable
+# filesystem. Granting these piecemeal produced a host where `available?/0` was
+# true and `verify_applied/1` still failed -- the exact "mostly hardened" state
+# the contract forbids.
+#
+# ⚠️ If a build hangs before printing any step, it is the Docker daemon and not
+# this file. Measured 2026-08-18: `docker build` on an EMPTY context with a
+# two-line Dockerfile spent **119.9s** resolving a base image already present
+# locally, and one attempt failed with `Unavailable: ... "only one connection
+# allowed"`. Tagging the base locally does not help -- BuildKit resolves against
+# the registry regardless -- and `DOCKER_BUILDKIT=0` hangs in context transfer
+# instead. The fix is restarting Docker Desktop. Worth stating because the
+# symptom reads exactly like a slow build, and retrying only stacks up more
+# clients competing for the same saturated connection.
+
+FROM elixir:1.20.2-otp-29
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    container=docker \
+    LANG=C.UTF-8
+
+# `systemd-container` brings the user-scope machinery `systemd-run --user`
+# needs. `bubblewrap` and `util-linux` supply the two binaries the probes look
+# for by name; installing them is what turns three of five capabilities true.
+#
+# `iproute2 passt nftables uidmap` are the egress work's (005 T060a) measurement
+# surface. ⚠️ They are here so that a probe result means something: the first
+# unprivileged run of the pasta spike returned `rc=127` for every probe because
+# none of these were installed, and `rc=127` is "command not found", not a
+# capability verdict. Read quickly, that says "the kernel refused"; it actually
+# says nothing was measured. `uidmap` supplies `newuidmap`/`newgidmap`, without
+# which `pasta` cannot set up the rootless user mapping it requires -- it
+# refuses to run as root ("Started as root, will change to nobody").
+#
+# ⚠️ No `postgresql-client`. This library has no data store and must not grow
+# one (`012-FR-001`), so its conformance run supplies no credential probe and
+# the credentials group reports `host capability unavailable` -- the honest
+# third outcome (`012-FR-016`), not a pass and not a failure. A consumer that
+# HAS a database instantiates the same suite with a probe of its own; that is
+# where those six checks get demonstrated.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      systemd systemd-container dbus \
+      bubblewrap util-linux \
+      iproute2 passt nftables uidmap \
+      build-essential git ca-certificates \
+      procps xfsprogs e2fsprogs \
+      python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make the journal volatile so unit output reaches `docker logs`.
+#
+# ⚠️ Measured, not assumed. The base image ships `/var/log/journal`, whose mere
+# existence switches journald to persistent storage. The suite's output then goes
+# to a journal file inside the container and nowhere else -- `docker logs` returns
+# **zero bytes** even though the unit sets `StandardOutput=journal+console`, and a
+# failing run is indistinguishable from a container that never booted. That cost a
+# debugging cycle: the boot was fine every time, the evidence was just unreachable.
+RUN rm -rf /var/log/journal \
+    && printf '[Journal]\nStorage=volatile\nForwardToConsole=yes\nMaxLevelConsole=info\n' \
+       > /etc/systemd/journald.conf.d-inline \
+    && mkdir -p /etc/systemd/journald.conf.d \
+    && mv /etc/systemd/journald.conf.d-inline /etc/systemd/journald.conf.d/10-container.conf
+
+# systemd in a container: drop the units that assume real hardware, or boot
+# stalls waiting on devices that will never appear.
+RUN find /etc/systemd/system /lib/systemd/system \
+      -path '*.wants/*' \
+      \( -name '*udev*' -o -name '*getty*' -o -name '*remote-fs*' \
+         -o -name '*swap*' -o -name '*mount*' \) \
+      -exec rm -f {} + 2>/dev/null || true
+
+# The mount point only. `probe_disk_quota/0` asks `stat -f -c %T` and accepts
+# only xfs, ext2/3/4, or btrfs -- and the image's own root is `overlayfs`, which
+# it rejects. Measured, not assumed: a directory baked in here reports
+# `overlayfs` and fails the probe. compose mounts a named volume over this path,
+# which reports `ext2/ext3` and passes.
+RUN mkdir -p /var/lib/ex_sandbox/sandboxes
+
+WORKDIR /app
+
+# Deps as their own layer: the source changes on every run, the deps almost
+# never do.
+#
+# ⚠️ One `mix.exs`, not six. In the umbrella this stanza copied every app's
+# manifest and then compiled the whole platform -- 117 dependencies, because the
+# credentials probe lived in the host application and the image had to build it.
+# Standalone there is exactly one dependency tree and it has one runtime entry in
+# it, so this layer is close to free and `deps.compile` finishes in seconds.
+COPY mix.exs mix.lock ./
+
+ENV MIX_ENV=test
+
+RUN mix local.hex --force && mix local.rebar --force && mix deps.get
+
+# ⚠️ Compile the dependencies BEFORE the source is copied. `deps.compile` depends
+# only on `mix.exs`/`mix.lock`, already copied above, so this layer survives every
+# source-only change. Folding it into the `mix compile` below would rebuild the
+# dependency graph on every edit because the copy invalidates the layer.
+#
+# ⚠️ Cannot be shortcut by copying `_build`/`deps` from the host: macOS-compiled
+# NIFs are Mach-O objects a Linux runtime cannot dlopen -- the image builds and
+# every test dies on load with "invalid ELF header". They must be compiled *in*
+# the image; the only question is whether that happens in a cached layer.
+RUN mix deps.compile
+
+COPY . .
+
+RUN mix compile
+
+# The unit that runs the suite. A systemd service rather than the container's
+# command, because the command would run as PID 1 and displace systemd -- taking
+# the cgroup delegation the probes depend on with it.
+#
+# ⚠️ Both files, and into the same directory. The runner sources the gate via
+# `dirname $0`, so a missing `census-gate.sh` makes the script fail at line one
+# with "No such file or directory" -- before any suite runs.
+COPY docker/run-isolation-tests.sh /usr/local/bin/run-isolation-tests
+COPY docker/census-gate.sh /usr/local/bin/census-gate.sh
+# The gate resolves this beside itself; without it every phase is ungated and a
+# guarantee could stop being demonstrated silently (T060e).
+COPY docker/census-baseline.txt /usr/local/bin/census-baseline.txt
+RUN chmod +x /usr/local/bin/run-isolation-tests /usr/local/bin/census-gate.sh
+
+COPY docker/isolation-tests.service /etc/systemd/system/isolation-tests.service
+RUN systemctl enable isolation-tests.service
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/lib/systemd/systemd"]

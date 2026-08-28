@@ -24,12 +24,18 @@ defmodule ExSandbox.BoundaryEnforcementTest do
   @moduletag :boundary
 
   # A reference to a module `ex_sandbox` neither defines nor depends on. Exactly
-  # the shape research R2 tested: `Axonn.Repo` lives in a sibling umbrella app
-  # that `ex_sandbox` must never depend on.
+  # the shape research R2 tested: a repo belonging to the HOST APPLICATION, which
+  # this library must never reach upward into.
+  #
+  # ⚠️ The name used to be `Axonn.Repo`, the real sibling this library was
+  # extracted out from under. It is generic now because the fixture has to read
+  # as an upward reference to someone who has never seen that umbrella -- the
+  # violation is the DIRECTION, not the particular application. Any name this
+  # project does not define and does not depend on reproduces it.
   @violation """
   defmodule ExSandbox.BoundaryFixture do
     @moduledoc false
-    def leak, do: Axonn.Repo.config()
+    def leak, do: HostApplication.Repo.config()
   end
   """
 
@@ -61,7 +67,7 @@ defmodule ExSandbox.BoundaryEnforcementTest do
   # A real throwaway Mix project, not a bare `elixirc` run. The distinction is
   # not incidental: `elixirc --warnings-as-errors` does *not* fail on an
   # undefined-module warning, while `mix compile --warnings-as-errors` does.
-  # Since the gate in CI and in both `precommit` aliases is the Mix one, the
+  # Since the gate in CI and in the `precommit` alias is the Mix one, the
   # test has to exercise the Mix one -- testing `elixirc` would have reported
   # the gate broken while the real gate worked fine.
   defp compile(dir, args) do
@@ -80,7 +86,7 @@ defmodule ExSandbox.BoundaryEnforcementTest do
     assert status == 0,
            "expected a plain compile to succeed despite the violation, got:\n#{output}"
 
-    assert output =~ "Axonn.Repo",
+    assert output =~ "HostApplication.Repo",
            "expected a warning naming the undefined module, got:\n#{output}"
   end
 
@@ -90,22 +96,24 @@ defmodule ExSandbox.BoundaryEnforcementTest do
     refute status == 0,
            "expected --warnings-as-errors to fail the compile, got:\n#{output}"
 
-    assert output =~ "Axonn.Repo"
+    assert output =~ "HostApplication.Repo"
   end
 
-  test "both library apps run the gate in their own precommit alias" do
-    # The gate only enforces anything if it is wired per-app: the umbrella root
-    # alias does not fail on a child app's warnings (T009).
-    for app <- ["ex_sandbox", "ash_sandbox"] do
-      mix_exs =
-        Path.join([__DIR__, "..", "..", app, "mix.exs"])
-        |> Path.expand()
-        |> File.read!()
+  test "this library runs the gate in its own precommit alias" do
+    # The gate enforces nothing unless it is actually wired into the command CI
+    # runs. Asserting on `mix.exs` rather than trusting the alias exists is the
+    # cheapest way to notice it being dropped in a refactor.
+    #
+    # ⚠️ This used to loop over `["ex_sandbox", "ash_sandbox"]` and read each
+    # sibling's `mix.exs` out of the umbrella. `ash_sandbox` is not in this
+    # repository, and asserting on its build configuration from here would be
+    # claiming something this project cannot see -- that half moved to
+    # `apps/ash_sandbox/test/` in Axonn, where the file it reads exists.
+    mix_exs = Path.join([__DIR__, "..", "mix.exs"]) |> Path.expand() |> File.read!()
 
-      assert mix_exs =~ "precommit:", "#{app} has no precommit alias"
+    assert mix_exs =~ "precommit:", "ex_sandbox has no precommit alias"
 
-      assert mix_exs =~ "compile --warnings-as-errors",
-             "#{app}'s precommit does not run the boundary gate"
-    end
+    assert mix_exs =~ "compile --warnings-as-errors",
+           "ex_sandbox's precommit does not run the boundary gate"
   end
 end

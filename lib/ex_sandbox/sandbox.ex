@@ -12,7 +12,8 @@ defmodule ExSandbox.Sandbox do
 
   `environment_id`, `data_store_ref`, `data_store_placement`, tenant
   attribution, `last_request_at`, `state_changed_at`. Each exists in `003`'s
-  data model and stays in `ash_sandbox` or the host application. A mechanism
+  data model and stays in the consumer's own data layer -- in the originating
+  application, a separate `ash_sandbox` package; anywhere else, the host. A mechanism
   that needed any of them would be reaching into host concepts, which is the
   dependency direction this library exists to prevent.
 

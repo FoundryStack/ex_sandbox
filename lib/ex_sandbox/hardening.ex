@@ -116,8 +116,9 @@ defmodule ExSandbox.Hardening do
   deliberate.** These two facts say the apparatus this host would police egress
   with is present; they do not say the sandbox being recorded was launched
   through it -- a sandbox with an empty allowlist takes the unpoliced branch.
-  Writing "enforced" here would be the over-claim
-  `ExSandbox.Hardening.Linux.probe_network_policy/0`'s own comment warns about,
+  Writing "enforced" here would be the over-claim that
+  ExSandbox.Hardening.Linux's private `probe_network_policy/0` warns about in its
+  own comment,
   where "we cannot do this" becomes "we demonstrated this".
   """
   @spec tier() :: String.t()

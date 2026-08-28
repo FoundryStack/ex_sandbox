@@ -23,7 +23,8 @@ defmodule ExSandbox.Mechanism.Beam.ConformanceTest do
   useless test run, so this is tagged `:isolation` and runs where the boundary
   actually exists:
 
-      docker compose -f docker/compose.isolation.yml run --rm --build isolation
+      docker compose -f docker/compose.isolation.yml up --build \
+        --abort-on-container-exit --exit-code-from isolation isolation
   """
   # ⚠️ The suite is included **only on a host that can run this mechanism**, and
   # the distinction from an exclusion matters.
@@ -68,7 +69,8 @@ defmodule ExSandbox.Mechanism.Beam.ConformanceTest do
       \e[33m005: the BEAM conformance suite did NOT run on this host.
       Missing: #{Enum.map_join(missing, ", ", &to_string(&1.name))}
       Run it with:
-        docker compose -f docker/compose.isolation.yml run --rm --build isolation\e[0m
+        docker compose -f docker/compose.isolation.yml up --build \\
+          --abort-on-container-exit --exit-code-from isolation isolation\e[0m
       """)
 
       assert missing != [],

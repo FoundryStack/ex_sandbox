@@ -28,7 +28,7 @@ defmodule ExSandbox.Capability do
   ## The coarse name and its decomposition (`014-FR-013a`, T004)
 
   `:resource_limits` remains the **coarse, Linux-facing name**, and it stays.
-  `ExSandbox.Mechanism.Beam.required_capabilities/0` names it, and its comment
+  ExSandbox.Mechanism.Beam's `required_capabilities/0` callback names it, and its comment
   records why one name suffices there: the memory and CPU caps "both come from
   the same cgroup scope, and a host with one has the other". On Linux that is
   true, and a single gate over a single mechanism is the honest shape.
@@ -824,7 +824,7 @@ defmodule ExSandbox.Capability do
   # the one a shared helper would make untestable.
   defp sandbox_storage_root do
     Application.get_env(:ex_sandbox, :beam, [])
-    |> Keyword.get(:storage_root, "/var/lib/axonn/sandboxes")
+    |> Keyword.get(:storage_root, "/var/lib/ex_sandbox/sandboxes")
   end
 
   defp quota_capable_filesystem?(path) do

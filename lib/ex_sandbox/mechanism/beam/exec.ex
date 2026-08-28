@@ -8,7 +8,7 @@ defmodule ExSandbox.Mechanism.Beam.Exec do
   It is evaluated on the sandbox node, which runs a bare `erl` with Elixir's
   stdlib on its code path and nothing of this project. A closure defined here
   belongs to `ExSandbox.Mechanism.Beam` and `check_funs_loadable/3` correctly
-  refuses it — the same trap `ExSandbox.Mechanism.Beam.probe_exprs/3` documents,
+  refuses it — the same trap ExSandbox.Mechanism.Beam's `probe_exprs/3` documents,
   which shipped wrong once already. So the command runner is Erlang source,
   parsed here and evaluated there through `:erl_eval.exprs/2`, using nothing but
   OTP.

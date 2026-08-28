@@ -1149,7 +1149,7 @@ defmodule ExSandbox.Hardening.Linux do
 
   defp sandbox_storage_root do
     Application.get_env(:ex_sandbox, :beam, [])
-    |> Keyword.get(:storage_root, "/var/lib/axonn/sandboxes")
+    |> Keyword.get(:storage_root, "/var/lib/ex_sandbox/sandboxes")
   end
 
   @doc """

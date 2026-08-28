@@ -1,0 +1,45 @@
+# ⚠️ `_build` and `deps` are the load-bearing entries here, and their absence is
+# not a slow build -- it is a broken one.
+#
+# `Dockerfile.isolation` compiles the dependency tree in its own cached layer
+# and only then runs `COPY . .`. Without these two lines that copy lands the
+# macOS-compiled artifacts on top of the Linux ones it just built, and a Mach-O
+# object dlopen'd by a Linux runtime fails with "invalid ELF header". The image
+# builds fine and the suite dies on load, which reads as a defect in the code
+# under test rather than in how it got there.
+_build/
+deps/
+
+.git/
+.github/
+
+# ex_doc output. 2.4 MB of generated HTML that is tarred into the daemon on
+# every build, before any layer cache is consulted, and that nothing in the
+# image reads.
+doc/
+
+# The built package tarball, for the same reason.
+ex_sandbox-*.tar
+
+*.log
+.DS_Store
+.elixir_ls/
+.lexical/
+cover/
+node_modules/
+.vscode/
+.claude/
+
+# CPython bytecode beside `priv/egress/nsacceptor.py`. The image runs the source
+# under its own interpreter; a cache compiled by a different CPython is at best
+# dead weight and at worst what gets loaded.
+__pycache__/
+*.pyc
+
+# NOTE: `docker/` is deliberately NOT ignored -- the Dockerfile COPYs the runner
+# script, the census gate, the baseline and the systemd unit out of it.
+#
+# ⚠️ `docker/results` is: it is a bind mount at run time, so copying a previous
+# run's census into the image is both pointless and a way for a stale artefact
+# to be read as this run's.
+docker/results/

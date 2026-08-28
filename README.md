@@ -7,6 +7,19 @@ isolation mechanism. Nothing here invents containment: cgroup v2, user and mount
 `setpriv` and `bwrap` do the confining. What this library adds is composing them correctly,
 refusing to run when it cannot, and **producing evidence** that the boundary is real.
 
+## Installation
+
+```elixir
+def deps do
+  [{:ex_sandbox, "~> 1.0"}]
+end
+```
+
+⚠️ **Linux is where this library does its job.** It installs, compiles and runs its unit suite on
+macOS, but `capabilities/0` reports every gating capability unavailable there and
+`ExSandbox.Mechanism.Beam` refuses to provision — deliberately, see *Refusal is the design* below.
+`ExSandbox.Mechanism.Docker` exists for exactly that host.
+
 ## Dependencies
 
 `:telemetry`, and nothing else. The
@@ -18,6 +31,18 @@ The direction matters more than it looks. Research R2 established that a wrong-d
 inside this library **compiles cleanly, exits 0, passes `mix deps.tree`, and fails only at runtime
 inside a third-party consumer's application**. `--warnings-as-errors` is the only build-time check
 that catches it, which is why the gate is load-bearing rather than stylistic.
+
+## About the `005-FR-011`-style identifiers, and the name `Axonn`
+
+The source cites requirement IDs heavily — `012-FR-014`, `005` R9, `029 T015`. They are citations
+into the specifications this library was built against, not dead references. [What they
+mean](docs/requirement-ids.md) explains the scheme; the short version is that the number is a
+specification, `FR` is a rule, `SC` an observable criterion, `T` a task and `R` a recorded
+measurement.
+
+The same page covers `Axonn`, which appears throughout these docs: it is the application this
+library was extracted from, named where a decision was measured against a real caller. Nothing
+here depends on it.
 
 ## The interface
 
@@ -45,7 +70,10 @@ consumer's own module.
 (`012-FR-014`). The `ExSandbox.Internal.*` prefix makes the common case obvious, but the list is
 what defines the boundary — lacking the prefix does not make a module public. There is no
 compatibility promise for private modules; calling one from a consuming application is the
-coupling `012-FR-004` forbids, and `Axonn.LibraryBoundaryTest` checks for it mechanically.
+coupling `012-FR-004` forbids. A consuming application can check for it mechanically:
+`docs/boundary.md` ships inside the package and resolves at runtime through
+`Application.app_dir(:ex_sandbox, "docs/boundary.md")`, so a consumer's own test can read the
+public-interface table from the installed dependency rather than restating it.
 
 The authoritative list lives in `ExSandbox`'s own `@moduledoc`. This README summarises it; if the
 two disagree, the moduledoc is right.
@@ -94,3 +122,17 @@ docker compose -f docker/compose.isolation.yml up --build \
 vacuously. The container is a real Linux host with systemd as PID 1 and all five capabilities
 genuinely constructed; it has found more than a dozen defects in code that passed everything
 locally, including a launch path that failed on _every_ Linux host.
+
+## Contributing
+
+⚠️ Read the isolation-harness warning above first. A pull request whose `mix test` is green on
+macOS has verified nothing about containment, and the container is not optional for any change
+touching `ExSandbox.Hardening.*`, `ExSandbox.Egress.*` or the mechanisms.
+
+`mix precommit` is the gate: `compile --warnings-as-errors --force`, `format --check-formatted`,
+`deps.unlock --check-unused`, `test`. The warnings flag is boundary enforcement rather than style —
+see *Dependencies* above.
+
+## License
+
+Apache-2.0. See [LICENSE](https://github.com/MaxSvargal/ex_sandbox/blob/main/LICENSE).
