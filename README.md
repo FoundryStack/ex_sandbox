@@ -135,4 +135,4 @@ see *Dependencies* above.
 
 ## License
 
-Apache-2.0. See [LICENSE](https://github.com/MaxSvargal/ex_sandbox/blob/main/LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/FoundryStack/ex_sandbox/blob/main/LICENSE).
