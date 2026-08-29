@@ -32,7 +32,7 @@ thread of its own and the descriptor adopted with `{:fd, Fd}`. Measured in the i
 The `econnrefused` is the load-bearing half: that port does not exist in the host namespace, so
 the socket demonstrably is not there.
 
-Because the acceptor is now a process on this node, `ExSandbox.Egress.Pool.decide/3` is an
+Because the acceptor is now a process on this node, `ExSandbox.Egress.Decision.decide/3` is an
 ordinary function call. Everything that existed only to bridge the process boundary is gone rather
 than simplified: the `AF_UNIX` verdict socket and its wire format, a second `AF_UNIX` socket and
 length-prefixed frame for DNS, the sandbox's identity passed on `argv`, a readiness line parsed

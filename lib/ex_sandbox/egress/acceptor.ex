@@ -5,7 +5,8 @@ defmodule ExSandbox.Egress.Acceptor do
 
   ## Why this exists, and what it replaced
 
-  `ExSandbox.Egress.Pool` bound `127.0.0.1` in the **host** namespace and was
+  Egress.Pool -- the module now called `ExSandbox.Egress.Decision`, back when it
+  still held a socket -- bound `127.0.0.1` in the **host** namespace and was
   designed as one pool for every sandbox — `013-FR-014c` argued for blast
   radius, not process count, and a process per sandbox is the heaviest way to
   get it.
@@ -66,7 +67,7 @@ defmodule ExSandbox.Egress.Acceptor do
 
   ## What is enforced here, and what is not
 
-  Nothing. The decision is `ExSandbox.Egress.Pool.decide/3`'s, unchanged and
+  Nothing. The decision is `ExSandbox.Egress.Decision.decide/3`'s, unchanged and
   shared, so there is exactly one implementation of "may this sandbox reach
   this destination" and moving the listener did not fork it.
 
@@ -382,7 +383,7 @@ defmodule ExSandbox.Egress.Acceptor do
   @doc """
   What the shared decision says about a connection from this sandbox.
 
-  Delegates to `ExSandbox.Egress.Pool.decide/3` with the `source_key` this
+  Delegates to `ExSandbox.Egress.Decision.decide/3` with the `source_key` this
   acceptor was started for — see the moduledoc on why the key is supplied
   rather than read from the peer.
 
@@ -393,9 +394,9 @@ defmodule ExSandbox.Egress.Acceptor do
   there is one implementation and the two cannot drift.
   """
   @spec verdict(spec(), {String.t(), :inet.port_number()}, GenServer.server()) ::
-          ExSandbox.Egress.Pool.decision()
+          ExSandbox.Egress.Decision.decision()
   def verdict(%{source_key: source_key}, destination, registry) do
-    ExSandbox.Egress.Pool.decide(sandbox_address(source_key), destination, registry)
+    ExSandbox.Egress.Decision.decide(sandbox_address(source_key), destination, registry)
   end
 
   @doc """

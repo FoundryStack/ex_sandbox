@@ -1,11 +1,18 @@
-defmodule ExSandbox.Egress.Pool do
+defmodule ExSandbox.Egress.Decision do
   @moduledoc """
   The single implementation of "may this sandbox reach this destination"
   (005 T060a1/T060a3, `contracts/egress.md`).
 
-  ## ⚠️ There is no pool here any more (2026-08-29)
+  ## ⚠️ This was `ExSandbox.Egress.Pool`, and there is no pool here any more (2026-08-29)
 
-  There was. This module supervised a listener on `127.0.0.1` in the **host**
+  The old name is worth knowing because it is what the git history, the older
+  commit messages, and the historical notes in `ExSandbox.Egress.Acceptor` and
+  `ExSandbox.Egress.Relay` all say. It is not a synonym: everything those notes
+  attribute to Egress.Pool -- the host listener, the accept loop, the relay
+  call, the supervised child -- is gone, and what carried the name forward is
+  the one function that never had anything to do with a pool.
+
+  There was one. This module supervised a listener on `127.0.0.1` in the **host**
   namespace, one for every sandbox, and `013-FR-014c`'s blast-radius argument is
   what justified sharing it — a process per sandbox is the heaviest way to get
   blast radius, and this pool held no platform credential.

@@ -8,7 +8,7 @@ defmodule ExSandbox.Egress.NetnsSocket do
   sees it*, so it can only ever land on a socket in that namespace. The BEAM runs
   in the host namespace and no option to `:gen_tcp.listen/2` changes a socket's
   namespace. That is the whole reason this project ran a separate helper process
-  entered via `nsenter`, and the reason `ExSandbox.Egress.Pool`'s own listener
+  entered via `nsenter`, and the reason Egress.Pool's own listener
   was dead code: it bound the host namespace, and nothing redirected there.
 
   `setns(2)` with `CLONE_NEWNET` affects only the calling *thread*. So the
@@ -20,7 +20,7 @@ defmodule ExSandbox.Egress.NetnsSocket do
   ## What this is not
 
   It is not an enforcement point and it holds no policy. It returns descriptors.
-  `ExSandbox.Egress.Pool.decide/3` remains the single implementation of "may
+  `ExSandbox.Egress.Decision.decide/3` remains the single implementation of "may
   this sandbox reach this destination".
 
   ## ⚠️ Absence is refusal, not a fallback

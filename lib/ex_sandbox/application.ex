@@ -28,7 +28,8 @@ defmodule ExSandbox.Application do
       # keep running. Reconstructing them is T060a6's reclamation work.
       ExSandbox.Egress.Allocator,
 
-      # ⚠️ `ExSandbox.Egress.Pool` was a child here until 2026-08-29, and its
+      # ⚠️ `ExSandbox.Egress.Decision` was a child here until 2026-08-29, under its
+      # then-name Egress.Pool, and its
       # removal is the *reverse* of the defect this list once documented.
       #
       # The comment that stood here warned that the pool's absence was

@@ -11,7 +11,7 @@ defmodule ExSandbox.Egress.AcceptorTransportTest do
 
   ## ⚠️ This file used to drive a listener nothing could reach
 
-  It was `pool_transport_test.exs`, and it started an `Egress.Pool`, which binds
+  It was `pool_transport_test.exs`, and it started an Egress.Pool, which bound
   `127.0.0.1` in the **host** namespace. An `nft` `redirect` is DNAT to the local
   machine as the *sandbox's* namespace sees it, so no tenant connection ever
   arrived there — measured, with the pool listening and the redirect installed,

@@ -5,7 +5,8 @@ defmodule ExSandbox.Egress.SupervisionTest do
   ## Why this needs a test rather than being obvious
 
   `ExSandbox.Egress.Registry` and `ExSandbox.Egress.Allocator` were supervised;
-  `ExSandbox.Egress.Pool` was not. It was referenced by its own two test files
+  Egress.Pool -- as `ExSandbox.Egress.Decision` was then called, when it still
+  held a listener -- was not. It was referenced by its own two test files
   and by nothing else in the system.
 
   ⚠️ Nothing failed, and nothing could have. The pool was the component every
@@ -23,7 +24,7 @@ defmodule ExSandbox.Egress.SupervisionTest do
 
   ## ⚠️ Three tests here asserted on the pool, and are gone with it (2026-08-29)
 
-  They asserted that `Egress.Pool` was a supervised child, that it started after
+  They asserted that Egress.Pool was a supervised child, that it started after
   the registry, and that it reported a real listening port rather than 0. All
   three were true and none of them meant anything by the end: an `nft` `redirect`
   is DNAT to the local machine as the *sandbox's* namespace sees it, so the
@@ -81,7 +82,7 @@ defmodule ExSandbox.Egress.SupervisionTest do
 
     on_exit(fn -> ExSandbox.Egress.Registry.release({10, 0, 0, 0}) end)
 
-    assert ExSandbox.Egress.Pool.decide(source, {"example.com", 443}) == :permitted,
+    assert ExSandbox.Egress.Decision.decide(source, {"example.com", 443}) == :permitted,
            "the shared decision's default registry is not the one policies are assigned to"
   end
 end

@@ -18,7 +18,7 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
   and the relay call is unreachable code. A correct relay and no relay at all are
   indistinguishable to the whole host suite.
 
-  That is the same defect species as the unsupervised `Egress.Pool` (`3a4f5eb`)
+  That is the same defect species as the unsupervised Egress.Pool (`3a4f5eb`)
   and the unreferenced `Egress.Binding` (`8af4e76`): a component that is correct
   in isolation and wired to nothing. All three were found by sabotage, and none
   by reading.
