@@ -70,13 +70,13 @@ jobs:
       #
       # `passt` supplies `pasta`, which `probe_network_policy/0` requires
       # alongside `--unshare-net`. `util-linux` supplies `setpriv` for
-      # `probe_setpriv/0`. `python3` is what `priv/egress/nsacceptor.py` runs
+      # `probe_setpriv/0`. A C compiler is what `Mix.Tasks.Compile.NetnsNif` runs
       # under.
       - name: Install sandbox capabilities
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap passt util-linux python3
+          sudo apt-get install -y -qq bubblewrap passt util-linux gcc
 
           # Ubuntu 24.04 restricts unprivileged user namespaces through
           # AppArmor, so bwrap installs cleanly and every mount namespace it
@@ -123,9 +123,10 @@ jobs:
       # The package is what consumers actually receive, and `files:` globs the
       # working directory rather than the git index -- so a build artefact
       # nothing tracks can ship. MEASURED: the first `mix hex.build` included a
-      # `__pycache__` bytecode file for exactly that reason.
+      # `__pycache__` bytecode file for exactly that reason; the same globbing
+      # now threatens the built `priv/netns_nif.so`.
       #
-      # Named rather than globbed. `priv/egress/nsacceptor.py` in particular is
+      # Named rather than globbed. `c_src/netns_nif.c` in particular is
       # the one whose absence would pass every unit test in a consumer's tree and
       # fail only at policed-launch time.
       #
@@ -141,11 +142,11 @@ jobs:
           mix hex.build
           tar xOf ex_sandbox-*.tar contents.tar.gz | tar tzf - | sort > /tmp/contents.txt
           for f in LICENSE README.md CHANGELOG.md mix.exs \
-                   priv/egress/nsacceptor.py priv/boundary.md docs/requirement-ids.md; do
+                   c_src/netns_nif.c priv/boundary.md docs/requirement-ids.md; do
             grep -qx "$f" /tmp/contents.txt || { echo "::error::$f missing from the package tarball"; exit 1; }
           done
-          if grep -q '__pycache__\|\.pyc$' /tmp/contents.txt; then
-            echo "::error::the package tarball contains Python bytecode"
+          if grep -q '\.so$' /tmp/contents.txt; then
+            echo "::error::the package tarball contains a built shared object"
             exit 1
           fi
 

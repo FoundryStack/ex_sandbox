@@ -120,9 +120,11 @@ services:
       # another uid after `setpriv`. Without this the launch succeeds and
       # verification fails, which the mechanism correctly treats as a refusal.
       - SYS_PTRACE
-      # `nsacceptor.py` joins the sandbox netns via `nsenter`, i.e. `setns(2)`
-      # into another process's namespace. Without this every network check fails
-      # while the sandbox itself launches fine.
+      # `ExSandbox.Egress.NetnsSocket` joins the sandbox netns with `setns(2)`
+      # to create the acceptor's listening socket there. Still required after
+      # the in-namespace helper process was deleted: the syscall is the same
+      # one, made from a thread of this BEAM rather than from `nsenter`. Without
+      # this every network check fails while the sandbox itself launches fine.
       - SYS_ADMIN
 
     cgroup: host

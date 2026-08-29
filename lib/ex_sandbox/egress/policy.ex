@@ -98,7 +98,8 @@ defmodule ExSandbox.Egress.Policy do
   # An entry that *is* an address matches by equality, as it always has. An
   # entry that is a **name** cannot: the acceptor reports `SO_ORIGINAL_DST`,
   # which is a dotted quad the kernel recovered from the redirect, post-DNS
-  # (`nsacceptor.py:60`). Before `029` the two were compared directly, so
+  # (`ExSandbox.Egress.OriginalDst.read/1`). Before `029` the two were compared
+  # directly, so
   # `"api.anthropic.com:443"` parsed cleanly, provisioned cleanly, and could
   # never match a connection -- a granted permission that silently denied.
   #
@@ -128,7 +129,7 @@ defmodule ExSandbox.Egress.Policy do
   # ⚠️ **Two ways for a name entry to match, and both are exact.**
   #
   # A destination presented as the *same name* matches by equality. In
-  # production this branch is unreachable -- `nsacceptor.py` recovers
+  # production this branch is unreachable -- the acceptor recovers
   # `SO_ORIGINAL_DST` and reports a dotted quad, always -- but the decision
   # function is also called with named destinations by callers that have a name
   # in hand, and refusing there would be refusing an entry against itself.

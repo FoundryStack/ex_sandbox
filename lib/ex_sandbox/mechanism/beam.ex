@@ -259,7 +259,7 @@ defmodule ExSandbox.Mechanism.Beam do
         #
         # Idempotent like `Binding.release/2` (`003-FR-013`): killing a pid that
         # is already gone is not an error, and a second destroy must be safe.
-        if launched[:acceptor_os_pid], do: NodeLauncher.stop_acceptor(launched.acceptor_os_pid)
+        if launched[:acceptor_pid], do: NodeLauncher.stop_acceptor(launched.acceptor_pid)
         # The key the row was found under -- see `stop/1`. Forgetting
         # `sandbox.id` for a ref-resolved struct would terminate the node and
         # leave its row behind, which reconciliation would then see as an orphan
@@ -612,8 +612,9 @@ defmodule ExSandbox.Mechanism.Beam do
   #
   # Without it `attempt_udp_egress/2` probes `127.0.0.1:53` and reads an answer
   # as "the datagram left the namespace unpoliced". Since T015 that address is
-  # the sandbox's own resolver, served from *inside* its namespace by
-  # `nsacceptor.py`, so the answer means the opposite of what the check says --
+  # the sandbox's own resolver, served on a socket bound *inside* its namespace
+  # by `ExSandbox.Egress.Acceptor`, so the answer means the opposite of what the
+  # check says --
   # measured: the leg failed on a sandbox whose egress policy was working.
   #
   # Gated on `binding` for the same reason `put_gateway/2` is: a sandbox with
@@ -666,35 +667,38 @@ defmodule ExSandbox.Mechanism.Beam do
   # `policed/2` installed a real allowlist. Without it the key is absent and the
   # census keeps reporting the third outcome, which is the true state.
   #
-  # ⚠️ The handle names the **verdict socket**, not a config file, because that
-  # is where the allowlist is actually enforced: `nsacceptor.py` holds no policy
-  # and asks `Egress.Verdict` over it for every connection. A tenant that could
-  # write there could answer its own questions. Measured in the isolation
-  # container against the real bind set (`/usr`, `/lib`, `/bin`, `/sbin`, plus
-  # the sandbox's own storage): the path reports ABSENT inside, and WIDENED when
-  # deliberately bound in -- so the check discriminates rather than passing
-  # because every write fails on an unprivileged host.
-  defp put_policy_handle(context, %Sandbox{} = sandbox) do
-    with {:ok, launched} <- lookup(sandbox.id),
-         true <- not is_nil(launched[:binding]),
-         {:ok, path} <- verdict_path() do
-      Map.put(context, :policy_handle, path)
-    else
-      _ -> Map.delete(context, :policy_handle)
-    end
-  end
-
-  # ⚠️ Asks the **running** server rather than reading config, for the same
-  # reason `af82afa` changed the acceptor: config records what the server was
-  # asked to bind, and a handle naming a path nothing listens on is a handle
-  # that is absent inside the sandbox for the wrong reason. `Verdict.path/1` is
-  # a `GenServer.call`, so it is guarded -- `context_for/1` runs on macOS too,
-  # where the egress supervision tree may not be up, and a crash there would
-  # fail the provision rather than omit a key.
-  defp verdict_path do
-    {:ok, ExSandbox.Egress.Verdict.path()}
-  catch
-    :exit, _ -> :error
+  # ⚠️ THIS MECHANISM NO LONGER DECLARES A POLICY HANDLE, AND THAT IS A LOSS
+  # OF COVERAGE RATHER THAN A CLEANUP (2026-08-29).
+  #
+  # The handle used to name the **verdict socket**: the acceptor held no policy
+  # and asked `Egress.Verdict` over that socket for every connection, so a
+  # tenant that could write there could answer its own questions. The check
+  # discriminated -- measured in the isolation container against the real bind
+  # set (`/usr`, `/lib`, `/bin`, `/sbin`, plus the sandbox's own storage), the
+  # path reported ABSENT inside and WIDENED when deliberately bound in, so it
+  # was not passing merely because every write fails on an unprivileged host.
+  #
+  # The acceptor is now a process on this node and `Pool.decide/3` is an
+  # ordinary function call, so there is no socket, no file, and no filesystem
+  # artefact of any kind that carries the allowlist. It lives in
+  # `Egress.Registry`, in this BEAM's memory, which a tenant has no route to.
+  #
+  # The guarantee is therefore STRONGER and the evidence for it WEAKER. Nothing
+  # remains to attempt a write against, so `FR-011b` reports the third outcome
+  # instead of passing, and `docker/census-baseline.txt` was raised from 8 to 9
+  # to record exactly that. ⚠️ Do not read the raised ceiling as routine drift:
+  # it is one fewer guarantee demonstrated by attempt, traded for one that holds
+  # by construction.
+  #
+  # Publishing a handle anyway -- some path that does not exist, so the write
+  # fails and the check passes -- is the trap this comment exists to close. That
+  # is the `--unshare-net` false pass in its purest form, and two earlier
+  # versions of `attempt_widen_allowlist/2` fell into it: the absence of a
+  # mechanism scoring as the presence of a boundary. If a future design gives
+  # the policy a handle a tenant could plausibly reach, publish THAT and lower
+  # the ceiling again.
+  defp put_policy_handle(context, %Sandbox{} = _sandbox) do
+    Map.delete(context, :policy_handle)
   end
 
   # ⚠️ `:permitted` is published **only when the tenant's allowlist names a

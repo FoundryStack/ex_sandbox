@@ -49,18 +49,6 @@ defmodule ExSandbox.Application do
       # Answers "may this sandbox reach this destination?" for the per-namespace
       # acceptors (005 T060a1).
       #
-      # ⚠️ Started **after** the registry for the same reason the pool is: it
-      # answers from `Pool.decide/3`, which reads the registry. A verdict server
-      # that outlived its registry would deny everything -- correct, but for the
-      # wrong reason and silently, because blanket denial passes every denial
-      # check in the conformance suite.
-      #
-      # ⚠️ The acceptors treat any unobtainable verdict as DENY. So this being
-      # absent does not fail loudly: it converts every sandbox's egress into
-      # blanket denial while the suite stays green. That is the `--unshare-net`
-      # state wearing the appearance of an enforced allowlist, which is the
-      # precise thing T060 exists to end.
-      ExSandbox.Egress.Verdict,
 
       # Answers DNS for sandboxes, and files what each one resolved (029 T015).
       #
@@ -72,12 +60,11 @@ defmodule ExSandbox.Application do
       # failure `FR-012` exists to end, arriving through a restart instead of
       # through a type mismatch.
       #
-      # ⚠️ Its absence is **not** silent in the same way the verdict server's
-      # is, and that is deliberate: with nothing bound to the resolver socket,
-      # the in-namespace listener's relay fails and the datagram is dropped, so
-      # names do not resolve at all rather than resolving into an unenforced
-      # allowlist. A sandbox that cannot resolve is visibly broken; a sandbox
-      # that resolves into nothing recorded is invisibly denied.
+      # ⚠️ Its absence is loud rather than silent, and that is deliberate: the
+      # acceptor's DNS leg calls this server, so with it down a query gets no
+      # answer and names do not resolve at all. A sandbox that cannot resolve is
+      # visibly broken; a sandbox that resolves into nothing recorded would be
+      # invisibly denied.
       ExSandbox.Egress.Resolver
     ]
 
