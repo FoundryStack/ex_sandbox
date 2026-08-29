@@ -390,24 +390,6 @@ defmodule ExSandbox.Egress.NetnsTest do
     defp drop_rule(commands), do: Enum.find(commands, &("drop" in &1))
   end
 
-  describe "default_route?/1" do
-    test "recognises the route pasta installs" do
-      # Measured output from the isolation container. Without a default route
-      # the kernel rejects an outbound connect with `enetunreach` *before* the
-      # nat hook runs, so a missing route prints exactly like a refused
-      # redirect -- the defect that cost the first spike a cycle.
-      assert Netns.default_route?("default via 172.19.0.1 dev eth0\n172.19.0.0/16 dev eth0")
-    end
-
-    test "an isolated namespace is not mistaken for a policed one" do
-      # ⚠️ The failure this guards. A namespace with addresses but no default
-      # route reaches nothing, which passes every denial check while enforcing
-      # no policy at all -- the `--unshare-net` shape.
-      refute Netns.default_route?("172.19.0.0/16 dev eth0 proto kernel scope link")
-      refute Netns.default_route?("")
-    end
-  end
-
   describe "pasta_command/2" do
     test "uses --config-net, the flag measured to need no host capability" do
       command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])

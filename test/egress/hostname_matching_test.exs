@@ -87,7 +87,7 @@ defmodule ExSandbox.Egress.HostnameMatchingTest do
 
     test "one sandbox's resolutions do not decide another sandbox's verdict" do
       # Expressed here as "an empty map for this sandbox refuses what a
-      # populated map for another would permit". `Pool.decide/3` fetches the map
+      # populated map for another would permit". `Decision.decide/3` fetches the map
       # per source key; this pins what that buys.
       refute Policy.permits?(@allowed, {@github, 443}, %{})
       assert Policy.permits?(@allowed, {@github, 443}, @resolved)

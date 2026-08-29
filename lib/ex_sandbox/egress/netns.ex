@@ -488,22 +488,18 @@ defmodule ExSandbox.Egress.Netns do
   @spec acceptor_mark() :: pos_integer()
   def acceptor_mark, do: @acceptor_mark
 
-  @doc """
-  The command that reads a namespace's routing table.
-
-  Used to verify `pasta` installed a default route before the tenant is
-  allowed to matter. See the moduledoc: without one, every connect fails
-  `enetunreach` before the redirect is consulted, and the sandbox is isolated
-  rather than policed — a state that passes every denial check.
-  """
-  @spec route_command(pos_integer()) :: [String.t()]
-  def route_command(holder_pid), do: nsenter(holder_pid, ["ip", "-4", "route", "show"])
-
-  @doc """
-  Whether `ip route show` output carries a default route.
-  """
-  @spec default_route?(String.t()) :: boolean()
-  def default_route?(output) when is_binary(output), do: String.contains?(output, "default via")
+  # ⚠️ `route_command/1` and `default_route?/1` stood here until 2026-08-29, and
+  # what they were for is worth a line so the hazard is not read as deleted with
+  # them. They existed to verify `pasta` had installed a default route before
+  # the tenant mattered -- without one, every connect fails `enetunreach` before
+  # the nat hook runs, and the sandbox is isolated rather than policed, which
+  # passes every denial check.
+  #
+  # That hazard is real and is stated in this module's own moduledoc, where it
+  # belongs. The two functions were not: nothing ever called either of them, and
+  # a verification helper that no launch path invokes is not a check, it is a
+  # comment with a `@spec`. The three tests that kept `default_route?/1` alive
+  # asserted `String.contains?/2` against strings the tests themselves wrote.
 
   @doc """
   The `pasta` invocation that creates a namespace and starts the tenant in it.

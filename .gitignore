@@ -22,7 +22,11 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 ex_sandbox-*.tar
 
-# CPython writes these beside priv/egress/nsacceptor.py on first import.
+# The Python that made these is gone -- `priv/egress/nsacceptor.py` was an
+# imported module, and it is what wrote a `__pycache__` into `priv/`, which
+# `mix.exs`'s `files:` then globbed into a release tarball. The probes under
+# `docker/` are run as scripts and cache nothing, so these match nothing today.
+# They stay because the cost of the next imported module is a shipped .pyc.
 __pycache__/
 *.pyc
 
@@ -30,3 +34,6 @@ __pycache__/
 # the census and suite log survive the container; every file in it is one run's
 # artefact, and the runner clears them at start.
 docker/results/
+
+# Built by Mix.Tasks.Compile.NetnsNif from c_src/. Architecture-specific.
+/priv/netns_nif.so

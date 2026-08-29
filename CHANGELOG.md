@@ -1,5 +1,180 @@
 # Changelog
 
+## 1.1.0 — 2026-08-29
+
+### ⚠️ On Linux, egress now needs a C compiler at build time instead of `python3` at runtime
+
+`Mix.Tasks.Compile.NetnsNif` builds `c_src/netns_nif.c` into `priv/netns_nif.so` in the
+consumer's own tree. It is skipped off Linux, and a missing compiler is a **warning, not a build
+failure** — but on a Linux host without one, `ExSandbox.Egress.NetnsSocket.available?/0` is false,
+the `network_restriction` capability is not constructed, and `ExSandbox.Mechanism.Beam` refuses to
+launch any sandbox that requires it. The refusal names itself; it does not fail open.
+
+CI installs `gcc` where it used to install `python3`. A deployment that pinned the runtime image's
+package list should make the same swap.
+
+### The in-namespace acceptor is no longer a separate process
+
+The enforcement point for egress has to be a socket inside the sandbox's network namespace: an
+`nft` `redirect` is DNAT to the local machine *as that namespace sees it*, so it can only reach a
+socket there. The BEAM runs in the host namespace and no option to `:gen_tcp.listen/2` changes a
+socket's namespace, so the listener was a Python helper entered with `nsenter`.
+
+The third premise is true and irrelevant, which is what was missed. `setns(2)` with `CLONE_NEWNET`
+affects only the calling **thread**, so the socket can be created in the sandbox's namespace on a
+thread of its own and the descriptor adopted with `{:fd, Fd}`. Measured in the isolation image:
+
+    listener adopted from the namespace fd   {:ok, {{0, 0, 0, 0}, 9200}}
+    connect from the HOST namespace          {:error, :econnrefused}
+    connect from INSIDE the namespace        received its bytes
+    SO_ORIGINAL_DST on the accepted socket   readable
+
+The `econnrefused` is the load-bearing half: that port does not exist in the host namespace, so
+the socket demonstrably is not there.
+
+Because the acceptor is now a process on this node, `ExSandbox.Egress.Decision.decide/3` is an
+ordinary function call. Everything that existed only to bridge the process boundary is gone rather
+than simplified: the `AF_UNIX` verdict socket and its wire format, a second `AF_UNIX` socket and
+length-prefixed frame for DNS, the sandbox's identity passed on `argv`, a readiness line parsed
+off stdout, and the `chmod` widening whose absence silently dropped every datagram. Net −713 lines.
+
+All private modules — none appeared in `priv/boundary.md`, so the package contract is unchanged.
+
+### `ExSandbox.Egress.Pool` is now `ExSandbox.Egress.Decision`, and holds no socket
+
+The pool supervised a listener on `127.0.0.1` in the **host** namespace, which the paragraph above
+explains can never receive a redirected connection. Its own moduledoc said so, and named the
+condition for removing it: *"If this comment outlives the tests that justify it, the listener
+should go."*
+
+⚠️ It did, in the way that matters most. The two test files justifying the listener were driving
+**that** copy of the accept-decide-relay path, while `ExSandbox.Egress.Acceptor` — the copy every
+tenant connection actually reaches — had two tests. Correct tests over unreachable code: the same
+defect species as the unsupervised pool and the unreferenced `Binding`, with the polarity
+reversed. Both files now stand over the acceptor, which is a coverage increase rather than a move.
+
+Deleted: the listener, the accept loop, `port/1`, `handle_connection/3`, `relay/2`, and the entry
+in the application supervision tree. `decide/3` remains, and is still the single implementation of
+the allowlist question. The module was renamed because a module with one function and no socket
+should not be called a pool. All private — nothing here appears in `priv/boundary.md`.
+
+⚠️ Three supervision tests went with the listener: that it was a supervised child, that it started
+after the registry, and that it bound a real port. All three were true and none meant anything —
+they described a socket nothing could reach. What they were really asking is now answered at
+launch rather than at boot, and a new test pins that an acceptor which cannot enter its namespace
+binds **nothing** rather than falling back to the host.
+
+### A socket-ownership race in the acceptor, found by moving those tests
+
+`accept_loop/1` started the per-connection handler and *then* transferred socket ownership to it.
+`:gen_tcp.recv/3` on a passive socket is refused for any process that is not the controlling one,
+so a handler that won the race tore the connection down before a byte moved. From inside the
+sandbox that is a **permitted** destination behaving exactly like a denied one, leaving a single
+`:einval` deep in the relay as its only trace.
+
+The handler now waits to be told it owns the socket. The pool never hit this because it
+transferred ownership to the relay task rather than to the handler; the bug arrived with the
+acceptor and would not have been visible without repointing the tests onto it.
+
+### `SO_MARK` on the relay's upstream socket was failing open
+
+The acceptor's own upstream connect is caught by the redirect it exists to serve, so it needs
+`meta mark 42 return` to exempt itself. `ExSandbox.Egress.Relay` set that mark with
+`raw: {1, 36, _}` on `:gen_tcp.connect/4`. Measured with `CAP_NET_ADMIN` and `CAP_NET_RAW` dropped:
+the connect returns `:ok`, `:inet.setopts/2` returns `:ok`, and reading the option back yields
+`<<0, 0, 0, 0>>`. `:inet` swallows the kernel's `EPERM`. The Python helper failed closed only
+because CPython raised `OSError` on the same call.
+
+⚠️ The symptom of a lost mark is a **permitted** destination timing out, which reads as an
+unreachable network rather than as a broken enforcement point — and every denial check still
+passes, because denial is unaffected.
+
+The mark is now written, read back, and compared inside the NIF before any descriptor is returned:
+`{:error, :setsockopt_mark, 1}` under the same capability drop, and no fd. An unmarked upstream is
+unrepresentable rather than merely unlikely. The test that guarded this previously asserted the
+*presence of the option that was the bug*, so it passed in exactly the configuration where the
+mark was silently dropped.
+
+### The citations in this library's comments now resolve, and a test keeps them resolving
+
+This codebase's convention is that a claim about behaviour names the thing that measured it, so
+comments cite probe scripts and contract documents by filename. The extraction from the Axonn
+umbrella brought the code and not that tree, which left 78 backticked names pointing at nothing --
+including `contracts/egress.md`, cited in the opening line of most `ExSandbox.Egress` moduledocs
+and therefore on the published page for each of them.
+
+[docs/provenance.md](docs/provenance.md) now says where each family of names went and, for the
+umbrella ones, states plainly that nothing here reads them at build or run time. It ships in the
+package and is linked from the docs.
+
+`test/documentation_pointers_test.exs` enforces it: a backticked filename must resolve in the tree
+or be declared absent, and a declared absence must be explained in that document. Written because
+renaming `ExSandbox.Egress.Pool` left three stale pointers that compile warnings and
+`mix docs --warnings-as-errors` both passed over -- one of them a present-tense claim that a
+renamed-away test file covers the decision.
+
+### A renamed module leaves the same wreckage, and ExDoc does not catch it
+
+Renaming `ExSandbox.Egress.Pool` also left six present-tense claims that live code calls the
+pool's decide function, in two library modules, the census baseline and three test files. ExDoc
+autolinks a **fully qualified** module in backticks and fails the build when it cannot resolve one,
+which is why the rename's qualified references were caught at the time. An unqualified alias is not
+autolinked, so every one of these passed `mix docs --warnings-as-errors`.
+
+All six corrected. `test/documentation_pointers_test.exs` now also bans the unqualified form. A
+removed module is written with the qualifier it had, so `Egress.Pool.relay/2` reads as history and
+an unqualified mention is always a pointer at something gone. This paragraph is subject to the same
+rule, which is how the rule was found to apply to prose about the rule.
+
+### `ExSandbox.Capability.satisfied?/1` documented a role it does not have
+
+Its docstring said "this is what an entry point calls before starting a sandbox". This library's
+entry points do not call it. `ExSandbox.provision/2` and `ExSandbox.start/2` gate on a private
+`ensure_capable/2` built on `missing/1`, because a refusal has to name which capability was absent.
+The function is unchanged and still public; only the docstring was wrong, and a reader following it
+looked for the gate in the wrong place.
+
+Also removed: `ExSandbox.Conformance.Execution.long_line_bytes/0`, a `@doc false` accessor for a
+module attribute that nothing read.
+
+### Two conformance checks credited a refusal that distinguished nothing
+
+`reaching another sandbox over the network is refused` passed against any mechanism whose published
+address had nothing listening on it. A refusal at a dead port is what a mechanism with **no**
+boundary produces, so the green tick reported an enforcement point that had never refused anything.
+`test/conformance_network_meta_test.exs` required that pass, which is a test pinning the defect the
+check exists to catch (`029` T034d).
+
+Both checks now probe the address from the platform before crediting a refusal, and report the
+third outcome when nothing answers there.
+
+⚠️ **The control runs after the attempt, not before it, and the order is the whole of it.** Gating
+first was measured here and is a real weakening. `OpenNetworkMechanism` declares an address and a
+`connect` that reports success for every destination, and probing liveness first short-circuits
+before `connect` is ever called, so a mechanism that declared a boundary and let everything through
+is filed as `unavailable` instead of as the breach it is.
+
+The same latent fault was measured in `every published handle of another sandbox is refused from
+inside`, which had gated first since it was written. A mechanism crossing a dead handle reported the
+third outcome rather than a violation. Reordered, and a new meta-test pins it: a crossing is a
+breach at a live handle and a dead one alike, and only a refusal has to prove it distinguished
+something.
+
+⚠️ Neither change moves the census. `ExSandbox.Mechanism.Beam` publishes `"peer:" <> id` rather than
+a dialable tuple, so both checks already reported the third outcome against it and still do.
+
+### One guarantee is now demonstrated less well, and the census records it
+
+`ExSandbox.Mechanism.Beam` published the verdict socket's path as `context.policy_handle`, and
+`FR-011b` demonstrated "a tenant cannot widen its own allowlist" by attempting to write it from
+inside a sandbox. There is no socket any more, and no filesystem artefact of any kind carries the
+allowlist — it lives in `ExSandbox.Egress.Registry`, in this BEAM's memory, which a tenant has no
+route to.
+
+The guarantee is stronger and the evidence for it weaker. `docker/census-baseline.txt` was raised
+from 8 to 9 with the reason recorded there, because a ceiling that moves without one is how a
+suite reports fewer guarantees every release and stays green the whole way.
+
 ## 1.0.1 — 2026-08-28
 
 ### `boundary.md` moved to `priv/`, so the documented lookup resolves

@@ -338,11 +338,11 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
              """
     end
 
-    test "the other four checks still pass" do
+    test "the other checks still pass" do
       # ⚠️ Guards the opposite failure, and it is the half that keeps the
       # fixture honest. A widening check that failed everything would satisfy
       # the assertion above while telling a conformant mechanism it had leaked.
-      # Requiring the other four to pass pins this fixture to failing exactly
+      # Requiring the others to pass pins this fixture to failing exactly
       # one guarantee -- so the test above is attributable to `FR-011b` and not
       # to a mechanism that is broken in some unrelated way.
       results = network_results(ExSandbox.EditablePolicyMechanism)
@@ -352,7 +352,18 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
       # a property of the internet rather than of this fixture. Including it
       # would make this guard fail for a reason having nothing to do with the
       # editable policy it exists to attribute.
-      expected = [@permitted_check | @unconditional_denial_checks]
+      #
+      # ⚠️ Excludes @peer_check because this test REQUIRED A FALSE PASS until
+      # 2026-08-29 (029 T034d). This fixture publishes a distinct port per
+      # sandbox and `editable_policy_mechanism.ex` says in its own comment that
+      # nothing listens on it, so the refusal it produced was the refusal any
+      # dead port produces -- from a mechanism with a boundary or without one
+      # alike. `attempt_reach_sandbox/3` now asks whether the platform can
+      # reach that address before crediting the refusal, and the honest verdict
+      # here is the third outcome. The test below pins that, so this fixture is
+      # still held to a definite verdict rather than to "anything but a
+      # failure".
+      expected = [@permitted_check | @unconditional_denial_checks -- [@peer_check]]
       passed = Enum.flat_map(expected, &matching(results.passed, &1))
 
       not_passed =
@@ -374,6 +385,24 @@ defmodule ExSandbox.ConformanceNetworkMetaTest do
 
       assert length(passed) == length(expected),
              "expected all #{length(expected)} non-widening checks to pass, got #{length(passed)}"
+
+      # ⚠️ The third outcome, asserted positively rather than left as "not a
+      # failure". Excluding the peer check from the list above would otherwise
+      # let it drift back to passing, which is the exact state 029 T034d was
+      # opened to end.
+      assert matching(results.unavailable, @peer_check) != [],
+             """
+             The peer-crossing check did not report the third outcome against a
+             mechanism that publishes an address with nothing listening on it.
+
+             Passed:   #{inspect(matching(results.passed, @peer_check))}
+             Failures: #{inspect(matching(results.failures, @peer_check))}
+
+             A refusal at a dead port is what a mechanism with no boundary
+             produces. Crediting it as a pass is `029-FR-015`'s control that
+             reads as the guarantee it is not, and this fixture is the one that
+             makes it visible.
+             """
 
       # ⚠️ The host-gated check must not FAIL here. It may pass or report the
       # third outcome, and which one is a fact about this host's egress.
