@@ -40,6 +40,42 @@ off stdout, and the `chmod` widening whose absence silently dropped every datagr
 
 All private modules — none appeared in `priv/boundary.md`, so the package contract is unchanged.
 
+### `ExSandbox.Egress.Pool` is now `ExSandbox.Egress.Decision`, and holds no socket
+
+The pool supervised a listener on `127.0.0.1` in the **host** namespace, which the paragraph above
+explains can never receive a redirected connection. Its own moduledoc said so, and named the
+condition for removing it: *"If this comment outlives the tests that justify it, the listener
+should go."*
+
+⚠️ It did, in the way that matters most. The two test files justifying the listener were driving
+**that** copy of the accept-decide-relay path, while `ExSandbox.Egress.Acceptor` — the copy every
+tenant connection actually reaches — had two tests. Correct tests over unreachable code: the same
+defect species as the unsupervised pool and the unreferenced `Binding`, with the polarity
+reversed. Both files now stand over the acceptor, which is a coverage increase rather than a move.
+
+Deleted: the listener, the accept loop, `port/1`, `handle_connection/3`, `relay/2`, and the entry
+in the application supervision tree. `decide/3` remains, and is still the single implementation of
+the allowlist question. The module was renamed because a module with one function and no socket
+should not be called a pool. All private — nothing here appears in `priv/boundary.md`.
+
+⚠️ Three supervision tests went with the listener: that it was a supervised child, that it started
+after the registry, and that it bound a real port. All three were true and none meant anything —
+they described a socket nothing could reach. What they were really asking is now answered at
+launch rather than at boot, and a new test pins that an acceptor which cannot enter its namespace
+binds **nothing** rather than falling back to the host.
+
+### A socket-ownership race in the acceptor, found by moving those tests
+
+`accept_loop/1` started the per-connection handler and *then* transferred socket ownership to it.
+`:gen_tcp.recv/3` on a passive socket is refused for any process that is not the controlling one,
+so a handler that won the race tore the connection down before a byte moved. From inside the
+sandbox that is a **permitted** destination behaving exactly like a denied one, leaving a single
+`:einval` deep in the relay as its only trace.
+
+The handler now waits to be told it owns the socket. The pool never hit this because it
+transferred ownership to the relay task rather than to the handler; the bug arrived with the
+acceptor and would not have been visible without repointing the tests onto it.
+
 ### `SO_MARK` on the relay's upstream socket was failing open
 
 The acceptor's own upstream connect is caught by the redirect it exists to serve, so it needs
