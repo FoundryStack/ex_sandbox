@@ -111,7 +111,7 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
       # ⚠️ The address is no longer configured by us -- `pasta --config-net`
       # assigns it, copying the host's default-route interface. What must still
       # hold is that the acceptor decides using the key this plan was built for.
-      # `Acceptor.permits?/3` reconstructs the sandbox address from the key, so
+      # `Acceptor.verdict/3` reconstructs the sandbox address from the key, so
       # the two cannot drift apart the way a separately-configured address could.
       %{sandbox: sandbox} = ExSandbox.Egress.Netns.addresses(source_key)
       {:ok, parsed} = :inet.parse_address(String.to_charlist(sandbox))

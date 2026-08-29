@@ -51,10 +51,10 @@ defmodule ExSandbox.Egress.SupervisionTest do
     # reader does not go looking for coverage that was quietly dropped.
     #
     # The verdict server existed because the acceptor was a separate OS process
-    # that could not call `Pool.decide/3`. It is now a process on this node and
+    # that could not call `Egress.Pool.decide/3`. It is now a process on this node and
     # calls it directly, so there is no socket, no wire, and no framing -- the
     # reply-framing bug those tests were written against is not expressible.
-    # `pool_decide_test.exs` covers the decision itself, which is what the wire
+    # `decision_test.exs` covers the decision itself, which is what the wire
     # was carrying.
     #
     # The resolver is the one that still has to be up: the acceptor's DNS leg
