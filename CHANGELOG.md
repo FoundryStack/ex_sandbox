@@ -16,6 +16,10 @@ had to rescue in order to render a stopped sandbox would eventually render somet
 `ExSandbox.Mechanism.Beam` returns `nil`. It has a `"peer:<id>"` handle and that handle is not an
 address; returning it would put a broken frame in front of a person instead of a clear absence.
 
+`ExSandbox.address/2` is the wrapper hosts call. A mechanism that does not implement the optional
+callback answers `{:ok, nil}` through it, the same shape as one that implements it and has nothing
+to report — so a host asking "where is this" never has to check first whether asking is possible.
+
 ### `ExSandbox.Sandbox` gains `service_port`, and it decides the container's network posture
 
 `service_port` is the port an application inside the sandbox listens on. It is **not** opaque: a

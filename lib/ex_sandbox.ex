@@ -133,6 +133,28 @@ defmodule ExSandbox do
   def status(mechanism, %Sandbox{} = sandbox), do: mechanism.status(sandbox)
 
   @doc """
+  Where an application inside the sandbox can be reached from this host, or
+  `nil`.
+
+  `{:ok, nil}` for a mechanism that does not implement the optional `address/1`
+  callback at all, which is the same answer one that implements it gives for a
+  sandbox with nothing to reach. A caller asking "where is this" gets one shape
+  back either way: making the mechanism's *choice to implement* visible here
+  would push a capability check into every call site, and each would have to
+  decide again what a missing callback means.
+  """
+  @spec address(mechanism(), Sandbox.t()) :: {:ok, String.t() | nil} | {:error, term()}
+  def address(mechanism, %Sandbox{} = sandbox) do
+    Code.ensure_loaded(mechanism)
+
+    if function_exported?(mechanism, :address, 1) do
+      mechanism.address(sandbox)
+    else
+      {:ok, nil}
+    end
+  end
+
+  @doc """
   Every sandbox the mechanism currently believes is running.
 
   Nothing in the happy path calls this; it exists so a host can reconcile
