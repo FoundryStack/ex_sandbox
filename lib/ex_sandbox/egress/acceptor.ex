@@ -390,21 +390,20 @@ defmodule ExSandbox.Egress.Acceptor do
   ⚠️ Returns the tagged verdict rather than a boolean because
   `handle_connection/2` has to log *why* it refused, and `false` cannot say
   whether the allowlist denied the destination or the sandbox has no registered
-  policy at all. `permits?/3` below is this function with the tag discarded, so
-  there is one implementation and the two cannot drift.
+  policy at all.
+
+  ⚠️ A boolean `permits?/3` stood beside this until 2026-08-29, justified in its
+  own docstring as "one implementation, so the two cannot drift". Nothing called
+  it. A wrapper with no caller cannot drift from anything, and the justification
+  described a risk that only existed if it were used -- the same shape as the
+  pool listener this module replaced, kept for a reason that had stopped being
+  true.
   """
   @spec verdict(spec(), {String.t(), :inet.port_number()}, GenServer.server()) ::
           ExSandbox.Egress.Decision.decision()
   def verdict(%{source_key: source_key}, destination, registry) do
     ExSandbox.Egress.Decision.decide(sandbox_address(source_key), destination, registry)
   end
-
-  @doc """
-  Whether a connection from this acceptor's sandbox may reach `destination`.
-  """
-  @spec permits?(spec(), {String.t(), :inet.port_number()}, GenServer.server()) :: boolean()
-  def permits?(state, destination, registry),
-    do: verdict(state, destination, registry) == :permitted
 
   @doc """
   The acceptor's own /30, expressed as an address `Policy.source_key/1` masks
