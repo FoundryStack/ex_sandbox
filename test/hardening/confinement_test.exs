@@ -244,7 +244,7 @@ defmodule ExSandbox.Hardening.ConfinementTest do
     # ⚠️ THE CASE THAT HAD NO TEST, and the whole reason D14a was opened.
     #
     # The four tests above read and refuse paths; none of them EXECUTES
-    # anything, and `delegated_launch_test.exs` asserts argv shape rather than
+    # anything, and the umbrella's `delegated_launch_test.exs` asserted argv shape rather than
     # execution. So the property the delegated CLI actually depends on -- that
     # a binary living under a path this profile DENIES can still be run -- was
     # asserted nowhere. The 24/24 passing launches offered as evidence for it

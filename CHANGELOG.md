@@ -95,6 +95,35 @@ unrepresentable rather than merely unlikely. The test that guarded this previous
 *presence of the option that was the bug*, so it passed in exactly the configuration where the
 mark was silently dropped.
 
+### The citations in this library's comments now resolve, and a test keeps them resolving
+
+This codebase's convention is that a claim about behaviour names the thing that measured it, so
+comments cite probe scripts and contract documents by filename. The extraction from the Axonn
+umbrella brought the code and not that tree, which left 78 backticked names pointing at nothing --
+including `contracts/egress.md`, cited in the opening line of most `ExSandbox.Egress` moduledocs
+and therefore on the published page for each of them.
+
+[docs/provenance.md](docs/provenance.md) now says where each family of names went and, for the
+umbrella ones, states plainly that nothing here reads them at build or run time. It ships in the
+package and is linked from the docs.
+
+`test/documentation_pointers_test.exs` enforces it: a backticked filename must resolve in the tree
+or be declared absent, and a declared absence must be explained in that document. Written because
+renaming `ExSandbox.Egress.Pool` left three stale pointers that compile warnings and
+`mix docs --warnings-as-errors` both passed over -- one of them a present-tense claim that a
+renamed-away test file covers the decision.
+
+### `ExSandbox.Capability.satisfied?/1` documented a role it does not have
+
+Its docstring said "this is what an entry point calls before starting a sandbox". This library's
+entry points do not call it. `ExSandbox.provision/2` and `ExSandbox.start/2` gate on a private
+`ensure_capable/2` built on `missing/1`, because a refusal has to name which capability was absent.
+The function is unchanged and still public; only the docstring was wrong, and a reader following it
+looked for the gate in the wrong place.
+
+Also removed: `ExSandbox.Conformance.Execution.long_line_bytes/0`, a `@doc false` accessor for a
+module attribute that nothing read.
+
 ### One guarantee is now demonstrated less well, and the census records it
 
 `ExSandbox.Mechanism.Beam` published the verdict socket's path as `context.policy_handle`, and
