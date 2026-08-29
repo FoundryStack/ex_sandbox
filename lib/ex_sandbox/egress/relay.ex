@@ -3,19 +3,19 @@ defmodule ExSandbox.Egress.Relay do
   Forwards a **permitted** connection to its destination (005 T060a9,
   `contracts/egress.md`).
 
-  ## Why this is a module and not three lines in the pool
+  ## Why this is a module and not three lines in the accept loop
 
-  ExSandbox.Egress.Pool's `relay/2` -- since removed -- was a placeholder that
-  logged and closed. That
-  was the honest shape while the netns did not exist — it denies something the
-  policy allows, which fails *closed* and is visible as the "permitted
-  destination is reachable" check not passing. It was never a false pass.
+  `ExSandbox.Egress.Pool`'s `relay/2` — since removed with the rest of that
+  module's socket handling — was a placeholder that logged and closed. That was
+  the honest shape while the netns did not exist: it denies something the policy
+  allows, which fails *closed* and is visible as the "permitted destination is
+  reachable" check not passing. It was never a false pass.
 
   But it made two conformance checks unclosable, and separating the forwarding
   from the socket accept loop is what makes the forwarding testable. Off-Linux
-  every connection to the pool dies at `OriginalDst.read/1`, so a test driving
-  the listener never reaches this code at all — the same vacuity
-  `pool_transport_test.exs` documents for the allowlist. `splice/3` takes two
+  every connection to the acceptor dies at `OriginalDst.read/1`, so a test
+  driving the listener never reaches this code at all — the same vacuity
+  `acceptor_transport_test.exs` documents for the allowlist. `splice/3` takes two
   ordinary sockets, so its behaviour is reachable on any host.
 
   ## ⚠️ The bug direction that matters here
@@ -39,7 +39,7 @@ defmodule ExSandbox.Egress.Relay do
   inside the sandbox reads as a slow destination rather than a broken proxy —
   and passes every denial check. Both directions are carried, and either side
   closing tears down both, because a socket left open to a destination that is
-  gone is a descriptor leak whose only symptom is the pool failing to accept
+  gone is a descriptor leak whose only symptom is the acceptor failing to accept
   long after and nowhere near the cause.
   """
 
@@ -135,6 +135,13 @@ defmodule ExSandbox.Egress.Relay do
   used here is the one the redirect exempts. Asserting on a duplicate literal in
   the test would pass while the socket carried something else, which is
   precisely the defect being guarded against.
+
+  ⚠️ `upstream_connect/4` below calls **this function**, not `acceptor_mark/0`
+  directly, and the indirection is the whole point rather than a style. It was
+  briefly inlined, and the test kept passing while proving nothing: it compared
+  `Netns.acceptor_mark()` to `Netns.acceptor_mark()` and would have stayed green
+  with the relay setting any value at all, or none. A seam nothing reads is a
+  seam that has stopped seaming.
   """
   @spec upstream_mark() :: non_neg_integer()
   def upstream_mark, do: Netns.acceptor_mark()
@@ -154,7 +161,7 @@ defmodule ExSandbox.Egress.Relay do
   # unmarked socket, so an unmarked upstream is unrepresentable rather than
   # merely unlikely.
   defp upstream_connect(address, port, netns, timeout) when is_binary(netns) do
-    case NetnsSocket.socket(netns, Netns.acceptor_mark()) do
+    case NetnsSocket.socket(netns, upstream_mark()) do
       {:ok, fd} ->
         :gen_tcp.connect(address, port, [:binary, {:active, false}, {:fd, fd}], timeout)
 
@@ -184,9 +191,9 @@ defmodule ExSandbox.Egress.Relay do
   # in a way that is easy to miss: with both sockets active, a fast destination
   # and a slow sandbox fill this process's mailbox without bound -- the sandbox
   # controls neither end's rate, but it does control when it reads, so it can
-  # make the pool buffer indefinitely on its behalf. Blocking `recv` gives
-  # back-pressure by construction, which is the same reason the pool's own
-  # listener does not use `active: true`.
+  # make this node buffer indefinitely on its behalf. Blocking `recv` gives
+  # back-pressure by construction, which is the same reason the acceptor's
+  # listener is adopted `active: false`.
   defp pump(sandbox_socket, destination_socket, idle_timeout) do
     parent = self()
 

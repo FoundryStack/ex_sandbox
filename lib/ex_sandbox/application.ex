@@ -28,27 +28,28 @@ defmodule ExSandbox.Application do
       # keep running. Reconstructing them is T060a6's reclamation work.
       ExSandbox.Egress.Allocator,
 
-      # The acceptor pool every sandbox's traffic is redirected to (005 T060a1).
+      # ⚠️ `ExSandbox.Egress.Pool` was a child here until 2026-08-29, and its
+      # removal is the *reverse* of the defect this list once documented.
       #
-      # ⚠️ Started **after** the registry, and the order is not cosmetic: the
-      # pool consults the registry on its first connection, and `:one_for_one`
-      # starts children in the order listed. A pool that outlived its registry
-      # would default-deny -- correct, but for the wrong reason and silently.
+      # The comment that stood here warned that the pool's absence was
+      # undetectable: `LaunchPlan` installed a redirect to its port, and with
+      # nothing listening there a sandbox could not tell a dead port from a
+      # denied destination, so every conformance denial check would pass while
+      # no allowlist was enforced by anything.
       #
-      # ⚠️ This was missing until T060a3b, and its absence was undetectable.
-      # `LaunchPlan` installs a redirect to this pool's port; with nothing
-      # listening there, the redirect points at a dead port, and from inside the
-      # sandbox that is indistinguishable from a destination denied by policy.
-      # Every denial check in the conformance suite would pass while no
-      # allowlist was enforced by anything at all. The only outward symptom
-      # would be permitted destinations failing too, which reads as a boundary
-      # that is slightly too strict rather than as an enforcement point that
-      # does not exist -- the `--unshare-net` shape, one layer further out.
-      ExSandbox.Egress.Pool,
-
-      # Answers "may this sandbox reach this destination?" for the per-namespace
-      # acceptors (005 T060a1).
+      # That warning was correct when written and had stopped being true. An
+      # `nft` `redirect` is DNAT to the local machine as the *sandbox's*
+      # namespace sees it, so a host listener could never receive one -- and the
+      # launcher stopped naming this port when the acceptor moved into the
+      # namespace (see `node_launcher.ex`, `@acceptor_port`). What remained was a
+      # supervised process holding a socket nothing could reach, which reads as
+      # an enforcement point and is not one. `Pool` is now a plain module with a
+      # single function, called by every acceptor.
       #
+      # ⚠️ The enforcement point it is not replaced by is not supervised here on
+      # purpose: there is one acceptor per sandbox, started and stopped by
+      # `ExSandbox.Mechanism.Beam.NodeLauncher` with the sandbox it serves. Its
+      # start is what refuses the launch when a namespace cannot be entered.
 
       # Answers DNS for sandboxes, and files what each one resolved (029 T015).
       #
