@@ -37,6 +37,27 @@ defmodule ExSandbox.Mechanism.Docker do
   mechanism exists to serve -- and a mechanism that refuses everywhere is not a
   safer mechanism, it is no mechanism.
 
+  ## A sandbox that names a port trades the deny-all posture for reachability
+
+  A sandbox with `service_port: nil` joins **no** network: `--network none`,
+  which is what every sandbox this mechanism created before the field existed
+  got, and still gets.
+
+  A sandbox that names a `service_port` joins the default bridge and has that
+  port published to the host's loopback interface. What this gives up, stated
+  rather than implied: the container has **outbound** access, so the
+  deny-by-default posture does not hold for it -- code inside can install
+  dependencies at runtime and can reach the internet. `ExSandbox.Egress`'s
+  allowlist does not apply here; narrowing outbound traffic to an allowlist over
+  this bridge is a separate change with its own evidence.
+
+  What still constrains it, and is unchanged: the filesystem the container sees
+  is the image plus the one bind-mounted workspace, its process tree is its own,
+  and the memory and CPU caps are still applied at create time. Inbound is
+  narrower than the deny-all posture suggests, not wider: exactly one port,
+  bound to `127.0.0.1`, so the application answers the platform on the same host
+  and answers no other machine at all.
+
   ## The image comes from `template_ref`
 
   `t:ExSandbox.Sandbox.t/0` names `owner_ref`, `mechanism_ref` and `context` as
@@ -242,6 +263,47 @@ defmodule ExSandbox.Mechanism.Docker do
           absent?(message) -> {:ok, :absent}
           unreachable?(message) -> {:ok, :unknown}
           true -> {:error, {:docker_error, message}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
+  def address(%Sandbox{mechanism_ref: nil}), do: {:ok, nil}
+
+  def address(%Sandbox{service_port: nil}), do: {:ok, nil}
+
+  def address(%Sandbox{mechanism_ref: ref, service_port: port}) do
+    # ⚠️ Asked of the daemon rather than remembered from `create`.
+    #
+    # The host port is the daemon's to choose, and a container that was
+    # recreated -- by a reconciliation sweep, or by a person -- has a different
+    # one. A cached answer would keep pointing at a port that now belongs to
+    # something else, and the caller would render a frame of somebody else's
+    # application rather than a broken one.
+    case docker(["port", ref, "#{port}/tcp"]) do
+      {:ok, output} ->
+        {:ok, first_binding(output)}
+
+      {:error, {:docker_error, _status, message}} ->
+        # A container that is not running has no published binding, and that is
+        # an ordinary state rather than a failure -- see the callback docs.
+        #
+        # ⚠️ `No public port` is the message a **created but not started**
+        # container gives, and a stopped one gives it too: the daemon realises
+        # the binding at start and drops it at stop, so the port a create was
+        # asked for is not a port anything answers on. MEASURED against Docker
+        # 27.4: `docker port <id> 8080/tcp` exits 1 with that message in both
+        # states. Treating it as an error would make a stopped sandbox raise
+        # where a running one returns, for a difference the caller cannot act
+        # on.
+        if absent?(message) or unreachable?(message) or message =~ "is not running" or
+             message =~ "No public port" do
+          {:ok, nil}
+        else
+          {:error, {:docker_error, message}}
         end
 
       {:error, reason} ->
@@ -483,6 +545,20 @@ defmodule ExSandbox.Mechanism.Docker do
     end
   end
 
+  # `docker port` prints one binding per line, and a stopped container prints
+  # nothing at all -- so an empty output is `nil` rather than an error.
+  #
+  # Only the first line is taken. A container published on both IPv4 and IPv6
+  # prints two, and the two are the same application: a caller needs one address
+  # to fetch, not a set to choose between.
+  defp first_binding(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> List.first()
+  end
+
   defp client_error?(stderr) do
     absent?(stderr) or unreachable?(stderr) or stderr =~ "is not running" or
       stderr =~ "is paused and must be unpaused"
@@ -509,7 +585,12 @@ defmodule ExSandbox.Mechanism.Docker do
 
   ## Command construction
 
-  defp create_args(%Sandbox{} = sandbox) do
+  # Public, and `@doc false`, so the arguments can be asserted on a host with no
+  # Docker daemon. The network posture is decided here and observable nowhere
+  # else until a container is already running -- which is too late to be a test
+  # that runs everywhere.
+  @doc false
+  def create_args(%Sandbox{} = sandbox) do
     [
       "--label",
       @mechanism_label,
@@ -517,7 +598,7 @@ defmodule ExSandbox.Mechanism.Docker do
       "#{@id_label}=#{sandbox.id}"
     ] ++
       limit_args(sandbox) ++
-      network_args() ++
+      network_args(sandbox) ++
       workspace_args(sandbox.workspace_path) ++
       [image(sandbox) | @keepalive]
   end
@@ -547,7 +628,28 @@ defmodule ExSandbox.Mechanism.Docker do
   # allowlist over an internal bridge is the follow-up change -- starting there
   # would put a partial allowlist in the tree, which is the failure mode
   # `ExSandbox.Egress` exists to prevent.
-  defp network_args, do: ["--network", "none"]
+  #
+  # A sandbox that names a `service_port` is asking to be reachable, and gets
+  # the second posture instead. See the moduledoc for what that gives up.
+  defp network_args(%Sandbox{service_port: nil}), do: ["--network", "none"]
+
+  defp network_args(%Sandbox{service_port: port}) when is_integer(port) and port > 0 do
+    # ⚠️ `127.0.0.1::<port>` -- and the host address is the load-bearing half.
+    #
+    # `-p <port>` and `-p 0.0.0.0::<port>` both work, both make the preview
+    # answer, and both publish the tenant's application on every interface the
+    # host has. The difference is invisible from the browser that reads it and
+    # total from the network the host sits on, which is exactly the shape of
+    # defect that ships: nothing about the working case distinguishes them.
+    #
+    # The **host** port is left empty so the daemon allocates a free one. A port
+    # this library chose would have to be checked for availability first, and
+    # the gap between that check and the bind is a race two concurrent
+    # provisions lose to each other. `address/1` reads back what was allocated.
+    ["--network", "bridge", "-p", "127.0.0.1::#{port}"]
+  end
+
+  defp network_args(%Sandbox{}), do: ["--network", "none"]
 
   # ⚠️ A bind mount, so host and container see ONE filesystem rather than two
   # copies. A copy-in/copy-out would be the safer-looking choice and it is the

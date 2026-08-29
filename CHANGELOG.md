@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.2.0 — 2026-08-29
+
+### A mechanism can report where a sandbox is reachable
+
+`ExSandbox.Mechanism` gains `address/1`, an **optional** callback returning
+`{:ok, String.t() | nil}`. Every existing mechanism keeps compiling, and a consumer that derives
+the required callback set from `behaviour_info(:callbacks) -- behaviour_info(:optional_callbacks)`
+sees no change.
+
+`{:ok, nil}` is the ordinary answer for a sandbox that is not reachable — it names no port, it is
+not running, or the mechanism cannot publish one. It is deliberately not an error: a caller that
+had to rescue in order to render a stopped sandbox would eventually render something else.
+
+`ExSandbox.Mechanism.Beam` returns `nil`. It has a `"peer:<id>"` handle and that handle is not an
+address; returning it would put a broken frame in front of a person instead of a clear absence.
+
+### `ExSandbox.Sandbox` gains `service_port`, and it decides the container's network posture
+
+`service_port` is the port an application inside the sandbox listens on. It is **not** opaque: a
+mechanism reads it and acts on it.
+
+* `service_port: nil` — `ExSandbox.Mechanism.Docker` passes `--network none`, exactly as before.
+  A host that never sets the field keeps the posture it has today.
+* `service_port: <port>` — the container joins the default bridge and that port is published to
+  `127.0.0.1` on an **ephemeral** host port the daemon allocates. `address/1` reads back what was
+  allocated, so two concurrent provisions cannot be handed the same host port.
+
+⚠️ **What the second posture gives up, stated rather than implied.** A bridge network means
+outbound access, so the deny-by-default posture does not hold for a sandbox that names a port:
+code inside can install dependencies at runtime and can reach the internet, and
+`ExSandbox.Egress`'s allowlist does not apply to it. What still constrains it is unchanged —
+filesystem and process confinement, and the memory and CPU caps applied at create time. Inbound
+is narrower than deny-all suggests rather than wider: one port, bound to loopback, reachable from
+the host running the platform and from no other machine.
+
 ## 1.1.0 — 2026-08-29
 
 ### ⚠️ On Linux, egress now needs a C compiler at build time instead of `python3` at runtime

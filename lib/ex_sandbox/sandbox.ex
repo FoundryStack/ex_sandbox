@@ -34,6 +34,7 @@ defmodule ExSandbox.Sandbox do
           disk_quota_mb: non_neg_integer() | nil,
           mechanism_ref: String.t() | nil,
           workspace_path: String.t() | nil,
+          service_port: :inet.port_number() | nil,
           context: term()
         }
 
@@ -60,6 +61,22 @@ defmodule ExSandbox.Sandbox do
     # `nil` means the sandbox has no workspace, which a mechanism must treat as
     # "mount nothing" rather than as "mount somewhere sensible".
     :workspace_path,
+    # The port an application inside the sandbox listens on, or `nil`.
+    #
+    # ⚠️ NOT opaque either, and it is the field that decides a sandbox's network
+    # posture rather than merely describing it. A sandbox that names a port is
+    # asking to be reachable from the host, and a mechanism that can offer that
+    # must publish the port on the loopback interface and report the resulting
+    # address through `c:ExSandbox.Mechanism.address/1`. A sandbox that names
+    # none must be given no network at all -- which is the default, so a host
+    # that never sets this field keeps the posture it has today.
+    #
+    # It is the port **inside** the sandbox. The host-side port is not stored
+    # here because the host does not choose it: the mechanism publishes on an
+    # ephemeral port and `address/1` reports what it got, so two sandboxes
+    # cannot be handed the same host port by two callers who each checked it
+    # was free.
+    :service_port,
     context: nil
   ]
 end

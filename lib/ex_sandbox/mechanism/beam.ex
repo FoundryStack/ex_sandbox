@@ -1305,6 +1305,20 @@ defmodule ExSandbox.Mechanism.Beam do
 
   defp emit_output(result, _sink), do: result
 
+  # ⚠️ `nil`, and this mechanism has a handle it could have returned instead.
+  #
+  # `context.address` above is `"peer:<id>"`, which names the sandbox to the
+  # conformance suite and to nothing else: it is not a host, it is not a port,
+  # and it is reachable from no socket. Returning it here would give a caller a
+  # string where it asked for an address, and the failure would surface as a
+  # broken frame in somebody's browser rather than as the honest absence that
+  # `c:ExSandbox.Mechanism.address/1` documents.
+  #
+  # A `:peer` node has no published port to offer, so `nil` is not a gap
+  # awaiting work -- it is the whole answer this mechanism has.
+  @impl true
+  def address(%Sandbox{}), do: {:ok, nil}
+
   @impl true
   def usage(%Sandbox{} = sandbox) do
     case lookup_sandbox(sandbox) do

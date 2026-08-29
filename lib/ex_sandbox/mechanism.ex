@@ -252,5 +252,31 @@ defmodule ExSandbox.Mechanism do
   """
   @callback constructed_capabilities() :: [ExSandbox.Capability.name()]
 
-  @optional_callbacks required_capabilities: 0, constructed_capabilities: 0
+  @doc """
+  Where an application inside this sandbox can be reached from the host, or
+  `nil`.
+
+  Optional. A mechanism that omits it offers no reachability, which is what
+  every mechanism offered before this callback existed.
+
+  The address is a `host:port` string reachable **from the machine running the
+  platform** and from nowhere else. A mechanism that publishes on an interface
+  another machine can reach has not implemented this callback, it has exposed
+  the tenant's application: the two are indistinguishable to the caller, which
+  is why the constraint is stated here rather than left to each mechanism.
+
+  `{:ok, nil}` is the answer whenever there is no address to give -- the sandbox
+  names no `service_port`, it is not running, or this mechanism has no way to
+  publish one. It is deliberately not an error: "not reachable" is an ordinary
+  state of a sandbox, and a caller that has to rescue an error to render a
+  stopped sandbox will eventually render something else instead.
+
+  ⚠️ A mechanism must not answer with a handle that merely identifies the
+  sandbox. `ExSandbox.Mechanism.Beam` returns `nil` for exactly this reason: it
+  has a `"peer:<id>"` reference, and a caller that put that in an `iframe` would
+  get a broken frame rather than a clear absence.
+  """
+  @callback address(Sandbox.t()) :: {:ok, String.t() | nil} | {:error, term()}
+
+  @optional_callbacks required_capabilities: 0, constructed_capabilities: 0, address: 1
 end
