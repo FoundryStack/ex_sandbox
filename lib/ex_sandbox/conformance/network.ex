@@ -482,7 +482,52 @@ defmodule ExSandbox.Conformance.Network do
   def attempt_reach_sandbox(mechanism, sandbox, other) do
     case sandbox_address(mechanism, other) do
       {:ok, {host, port}} ->
-        probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}")
+        # ⚠️ The liveness control this check went without (029 T034d), and
+        # the ORDER is the whole of it.
+        #
+        # A refusal at an address nothing answers on is what a mechanism with
+        # **no** boundary produces, so scoring it as a pass reports an
+        # enforcement point that has never refused anything. MEASURED, by the
+        # fixture's own admission: `EditablePolicyMechanism` publishes a
+        # distinct port per sandbox and its source says *"Nothing listens
+        # there, so the attempt is refused"*, and this check passed against it
+        # while `conformance_network_meta_test.exs` REQUIRED that pass.
+        #
+        # ⚠️ The control runs **after** the attempt and only on a refusal, and
+        # gating before the attempt instead is a real weakening that was
+        # measured here rather than reasoned about. `OpenNetworkMechanism`
+        # declares an address and a `connect` that reports success for every
+        # destination; probing liveness first short-circuits before `connect`
+        # is ever called, and a mechanism that declared a boundary and let
+        # everything through gets filed as `unavailable` instead of as the
+        # breach it is. A crossing is a violation whatever the address's
+        # liveness says. Only a REFUSAL needs to prove it distinguished
+        # something.
+        #
+        # Probed from the **platform**, which is the vantage `FR-011c`
+        # entitles: the host may reach a sandbox, a sibling must not.
+        case probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}") do
+          {:refused, _evidence} = refusal ->
+            if platform_reaches?(host, port) do
+              refusal
+            else
+              ExSandbox.Conformance.Helpers.capability_unavailable(
+                :network_restriction,
+                "the connection was refused, and the platform itself cannot " <>
+                  "open one to #{host}:#{port} within #{@control_timeout_ms}ms " <>
+                  "either -- so nothing is listening on the address this " <>
+                  "mechanism published for the other sandbox.\n\n" <>
+                  "This is not a pass. A refusal distinguishes nothing when " <>
+                  "the address is refused for everyone, and `003-FR-002` " <>
+                  "would read as demonstrated against a boundary that was " <>
+                  "never exercised. Publish `context.address` only once " <>
+                  "something answers on it (`FR-011e`, `029-FR-033`)."
+              )
+            end
+
+          crossed_or_inconclusive ->
+            crossed_or_inconclusive
+        end
 
       :unknown ->
         # ⚠️ The third outcome, NOT a contract violation -- and the container run
@@ -634,23 +679,37 @@ defmodule ExSandbox.Conformance.Network do
 
   defp peer_handle_verdict(mechanism, sandbox, other, {host, port} = handle)
        when is_binary(host) and is_integer(port) and port > 0 do
-    if platform_reaches?(host, port) do
-      case probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}") do
-        {:succeeded, evidence} ->
-          {:crossed, handle, evidence}
+    # ⚠️ The liveness control runs AFTER the attempt and only on a refusal.
+    #
+    # MEASURED 2026-08-29, and it is why this reads differently from the way
+    # T034a first wrote it. Gating before the attempt, a mechanism whose
+    # `connect` reports success for every destination -- a real crossing, a
+    # real breach -- was filed as the THIRD OUTCOME when the handle happened to
+    # be dead, because `probe_connect/5` was never reached. Probe, dead handle,
+    # `connect` returning `:connected`: reported `capability_unavailable`
+    # rather than a violation.
+    #
+    # A crossing is a breach whatever the handle's liveness says. Only a
+    # REFUSAL has to prove it distinguished something, because a dead handle is
+    # refused for everyone. `attempt_reach_sandbox/3` carries the same ordering
+    # for the same reason (029 T034d).
+    case probe_connect(mechanism, sandbox, host, port, "sandbox #{other.id}") do
+      {:succeeded, evidence} ->
+        {:crossed, handle, evidence}
 
-        {:refused, evidence} ->
+      {:refused, evidence} ->
+        if platform_reaches?(host, port) do
           {:refused, handle, evidence}
-
-        other_result ->
+        else
           {:not_exercised, handle,
-           "the attempt neither crossed nor was refused: #{inspect(other_result)}"}
-      end
-    else
-      {:not_exercised, handle,
-       "the platform itself could not open a connection to #{host}:#{port} within " <>
-         "#{@control_timeout_ms}ms, so a refusal from inside a sandbox distinguishes " <>
-         "nothing -- a dead handle is refused for everyone"}
+           "the platform itself could not open a connection to #{host}:#{port} within " <>
+             "#{@control_timeout_ms}ms, so a refusal from inside a sandbox distinguishes " <>
+             "nothing -- a dead handle is refused for everyone"}
+        end
+
+      other_result ->
+        {:not_exercised, handle,
+         "the attempt neither crossed nor was refused: #{inspect(other_result)}"}
     end
   end
 

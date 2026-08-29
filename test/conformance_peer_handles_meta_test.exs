@@ -131,6 +131,47 @@ defmodule ExSandbox.ConformancePeerHandlesMetaTest do
       refute message =~ "NOT DEMONSTRATED",
              "a crossing was reported as the third outcome, which files a breach as a gap"
     end
+
+    test "against a mechanism that crosses a handle nothing is listening on" do
+      # ⚠️ MEASURED 2026-08-29, and this test exists because the answer was
+      # wrong. The liveness control used to run BEFORE the attempt, so a
+      # mechanism whose `connect` reports success for every destination -- an
+      # actual crossing -- was filed as the third outcome whenever the handle
+      # happened to be dead. `probe_connect/5` was never reached, and a breach
+      # was reported as an unfinished mechanism.
+      #
+      # Nothing has listened on this port in this VM, which is the whole point:
+      # the handle is dead AND the mechanism crosses it. Only one of those two
+      # facts is about the boundary.
+      dead_port = 24_411
+
+      dialler = sandbox(%{connect: fn _host, _port -> :connected end})
+      target = sandbox(%{peer_handles: [{"127.0.0.1", dead_port}]})
+
+      error =
+        assert_raise ExUnit.AssertionError, fn ->
+          Network.require_every_peer_handle_refused(ExSandbox.EchoMechanism, dialler, target)
+        end
+
+      message = Exception.message(error)
+
+      refute message =~ "NOT DEMONSTRATED",
+             """
+             A mechanism that crossed a published handle was reported as the third
+             outcome because nothing was listening on it.
+
+             Liveness answers one question -- whether a REFUSAL distinguished
+             anything -- and it cannot answer the other. A connection that
+             succeeded is a breach at a live handle and at a dead one alike, and
+             filing it as a gap puts a real leak under the same label as a
+             mechanism that has not built the boundary yet.
+
+             Got: #{message}
+             """
+
+      assert message =~ "029-FR-017",
+             "the failure did not cite the rule it enforces\n\nGot: #{message}"
+    end
   end
 
   describe "it can PASS" do

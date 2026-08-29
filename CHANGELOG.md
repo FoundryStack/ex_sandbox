@@ -137,6 +137,32 @@ looked for the gate in the wrong place.
 Also removed: `ExSandbox.Conformance.Execution.long_line_bytes/0`, a `@doc false` accessor for a
 module attribute that nothing read.
 
+### Two conformance checks credited a refusal that distinguished nothing
+
+`reaching another sandbox over the network is refused` passed against any mechanism whose published
+address had nothing listening on it. A refusal at a dead port is what a mechanism with **no**
+boundary produces, so the green tick reported an enforcement point that had never refused anything.
+`test/conformance_network_meta_test.exs` required that pass, which is a test pinning the defect the
+check exists to catch (`029` T034d).
+
+Both checks now probe the address from the platform before crediting a refusal, and report the
+third outcome when nothing answers there.
+
+⚠️ **The control runs after the attempt, not before it, and the order is the whole of it.** Gating
+first was measured here and is a real weakening. `OpenNetworkMechanism` declares an address and a
+`connect` that reports success for every destination, and probing liveness first short-circuits
+before `connect` is ever called, so a mechanism that declared a boundary and let everything through
+is filed as `unavailable` instead of as the breach it is.
+
+The same latent fault was measured in `every published handle of another sandbox is refused from
+inside`, which had gated first since it was written. A mechanism crossing a dead handle reported the
+third outcome rather than a violation. Reordered, and a new meta-test pins it: a crossing is a
+breach at a live handle and a dead one alike, and only a refusal has to prove it distinguished
+something.
+
+⚠️ Neither change moves the census. `ExSandbox.Mechanism.Beam` publishes `"peer:" <> id` rather than
+a dialable tuple, so both checks already reported the third outcome against it and still do.
+
 ### One guarantee is now demonstrated less well, and the census records it
 
 `ExSandbox.Mechanism.Beam` published the verdict socket's path as `context.policy_handle`, and
