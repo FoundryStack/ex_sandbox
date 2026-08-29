@@ -167,9 +167,6 @@ defmodule ExSandbox.Conformance.Execution do
 
   alias ExSandbox.Conformance.Helpers
 
-  @doc false
-  def long_line_bytes, do: @long_line_bytes
-
   @doc """
   Runs a trivial command and requires the mechanism to report the command's own
   exit status.

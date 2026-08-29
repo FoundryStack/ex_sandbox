@@ -202,9 +202,20 @@ defmodule ExSandbox.Capability do
   @doc """
   True when every capability in `required` is available.
 
-  This is what an entry point calls before starting a sandbox: a mechanism whose
+  For a **host** deciding whether to offer a mechanism at all. A mechanism whose
   required capability is missing must refuse rather than start unconfined
-  (spec Edge Cases; `005` R9's macOS rule).
+  (spec Edge Cases; `005` R9's macOS rule), and this answers that in one call.
+
+  ⚠️ This library's own gate is not this function. `ExSandbox.provision/2` and
+  `ExSandbox.start/2` go through a private `ensure_capable/2` built on
+  `missing/1`, because a refusal has to name *which* capability was absent and a
+  boolean cannot. This docstring said otherwise until 2026-08-29, which made a
+  reader looking for the gate look in the wrong place.
+
+  Not expressed as `missing(required) == []`, and the difference is measurable
+  rather than stylistic: `check/1` shells out for several names, and `Enum.all?`
+  stops at the first absent one where `missing/1` deliberately probes them all
+  so it can list them.
   """
   @spec satisfied?([name()]) :: boolean()
   def satisfied?(required) do

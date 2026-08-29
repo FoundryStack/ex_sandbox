@@ -194,9 +194,10 @@ defmodule ExSandbox.MixProject do
       # is the row declaring it PRIVATE -- naming it is the whole point. ExDoc
       # autolinks any module in backticks and warns when the target is hidden,
       # so `mix docs --warnings-as-errors` fails on a document that is correct.
-      # The strict parser in `library_boundary_test.exs` (here and in the
-      # originating umbrella) requires those backticks: a row without them is a
-      # malformed table and it raises rather than skipping.
+      # The strict parser -- `shipped_boundary_document_test.exs` here,
+      # `library_boundary_test.exs` in the originating umbrella -- requires those
+      # backticks: a row without them is a malformed table and it raises rather
+      # than skipping.
       #
       # MEASURED, and in that order: the backticks were lost during extraction,
       # which made `mix docs` pass and the parser refuse the whole table.
@@ -209,6 +210,7 @@ defmodule ExSandbox.MixProject do
         "README.md",
         "CHANGELOG.md",
         "docs/requirement-ids.md",
+        "docs/provenance.md",
         "priv/boundary.md"
       ],
       groups_for_modules: [
