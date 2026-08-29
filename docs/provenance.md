@@ -57,3 +57,14 @@ Absent from a clean checkout by design.
 consumer's own tree, and is excluded from the package so a maintainer's architecture never ships.
 `docker/results/census.txt` and `docker/results/suite.log` are one isolation run's output.
 `secret.txt` is a fixture a hardening test writes and then proves is unreadable.
+
+## 4. In the repository, not in the isolation image
+
+`docker/Dockerfile.isolation` copies the working tree, and `.dockerignore` holds back `.git/` and
+`.github/` because a runtime image has no use for either. `.github/workflows/ci.yml` is therefore
+cited by `test/test_helper.exs` and present on every developer machine and every CI checkout, and
+absent from the one place the suite also runs.
+
+The check resolves a name against the filesystem before it consults its allowlist, so on a full
+checkout `ci.yml` resolves normally and this category is never reached. It exists so the suite
+passes inside the container without the check having to be weakened everywhere else.

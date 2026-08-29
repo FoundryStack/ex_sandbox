@@ -105,7 +105,7 @@
 # sandbox. It discriminated: measured against the real bind set, the path
 # reported ABSENT inside and WIDENED when deliberately bound in.
 #
-# The acceptor is now a process on this node and `Pool.decide/3` is an ordinary
+# The acceptor is now a process on this node and `Decision.decide/3` is an ordinary
 # function call. There is no socket, no file, and no filesystem artefact of any
 # kind carrying the allowlist -- it lives in `Egress.Registry`, in this BEAM's
 # memory, which a tenant has no route to. The guarantee is STRONGER and the

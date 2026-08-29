@@ -205,7 +205,21 @@ defmodule ExSandbox.MixProject do
       # locally, because `precommit` did not run `mix docs` until this commit.
       # Dropping the backticks again would trade a build failure for a silent
       # contract failure, which is the worse of the two.
-      skip_code_autolink_to: ["ExSandbox.Application"],
+      # ⚠️ The second entry is a CHANGELOG problem, not a code one, and it is
+      # the same trap as the first. An entry announcing a DELETION names the
+      # thing it deleted, ExDoc autolinks the name, and the build fails on the
+      # release that removed it. MEASURED here: `mix precommit` was green, the
+      # changelog paragraph was written after it, and the docs step -- which
+      # this alias does run -- was never re-run before the commit.
+      #
+      # De-linking the name in the prose was the alternative and it is worse.
+      # The changelog is where a consumer looks up what went away, so the entry
+      # has to spell the full name; skipping the autolink keeps the name exact
+      # and costs a line here.
+      skip_code_autolink_to: [
+        "ExSandbox.Application",
+        "ExSandbox.Conformance.Execution.long_line_bytes/0"
+      ],
       extras: [
         "README.md",
         "CHANGELOG.md",

@@ -113,6 +113,19 @@ renaming `ExSandbox.Egress.Pool` left three stale pointers that compile warnings
 `mix docs --warnings-as-errors` both passed over -- one of them a present-tense claim that a
 renamed-away test file covers the decision.
 
+### A renamed module leaves the same wreckage, and ExDoc does not catch it
+
+Renaming `ExSandbox.Egress.Pool` also left six present-tense claims that live code calls the
+pool's decide function, in two library modules, the census baseline and three test files. ExDoc
+autolinks a **fully qualified** module in backticks and fails the build when it cannot resolve one,
+which is why the rename's qualified references were caught at the time. An unqualified alias is not
+autolinked, so every one of these passed `mix docs --warnings-as-errors`.
+
+All six corrected. `test/documentation_pointers_test.exs` now also bans the unqualified form. A
+removed module is written with the qualifier it had, so `Egress.Pool.relay/2` reads as history and
+an unqualified mention is always a pointer at something gone. This paragraph is subject to the same
+rule, which is how the rule was found to apply to prose about the rule.
+
 ### `ExSandbox.Capability.satisfied?/1` documented a role it does not have
 
 Its docstring said "this is what an entry point calls before starting a sandbox". This library's

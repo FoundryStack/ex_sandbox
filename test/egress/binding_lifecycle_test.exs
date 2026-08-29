@@ -23,7 +23,7 @@ defmodule ExSandbox.Egress.BindingLifecycleTest do
   against whichever tenant happened to be next, with nothing connecting it to
   the destroys that never gave their addresses back.
 
-  Worse, a stale policy is a *live* policy. `Pool.decide/3` keys on the /30, so
+  Worse, a stale policy is a *live* policy. `Decision.decide/3` keys on the /30, so
   a reissued address would inherit the previous tenant's allowlist -- the exact
   crossing `T060a6`'s reuse adversary was written to prevent, arriving through
   the one path that adversary cannot see, because it tests `release/2` being

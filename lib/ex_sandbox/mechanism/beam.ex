@@ -678,7 +678,7 @@ defmodule ExSandbox.Mechanism.Beam do
   # path reported ABSENT inside and WIDENED when deliberately bound in, so it
   # was not passing merely because every write fails on an unprivileged host.
   #
-  # The acceptor is now a process on this node and `Pool.decide/3` is an
+  # The acceptor is now a process on this node and `Decision.decide/3` is an
   # ordinary function call, so there is no socket, no file, and no filesystem
   # artefact of any kind that carries the allowlist. It lives in
   # `Egress.Registry`, in this BEAM's memory, which a tenant has no route to.

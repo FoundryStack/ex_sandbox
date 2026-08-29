@@ -7,7 +7,7 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
 
   `relay_test.exs` establishes that `Relay.splice/3` carries bytes. That is a
   statement about the relay, not about the acceptor, and the two were
-  disconnected for the entire time `Pool.relay/2` was a placeholder that logged
+  disconnected for the entire time `Egress.Pool.relay/2` was a placeholder that logged
   and closed.
 
   ⚠️ **Measured, and the reason this file exists:** replacing the permit branch's
@@ -25,7 +25,7 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
 
   ## ⚠️ This file used to test the wrong copy of this code
 
-  It was `pool_relay_wiring_test.exs`, and it drove `Pool.handle_connection/3`.
+  It was `pool_relay_wiring_test.exs`, and it drove `Egress.Pool.handle_connection/3`.
   That function was reachable only from `Pool`'s own listener, which binds
   `127.0.0.1` in the **host** namespace -- and an `nft` `redirect` is DNAT to the
   local machine as the *sandbox's* namespace sees it, so nothing was ever
@@ -45,7 +45,7 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
       fallback for one that could not be entered.
 
   Everything downstream is the real code: the real `verdict/3`, the real
-  registry, the real `Pool.decide/3`, the real relay.
+  registry, the real `Decision.decide/3`, the real relay.
 
   ⚠️ Neither field is settable through `start_link/1`, and that is deliberate
   rather than incidental. A host able to substitute the destination reader could

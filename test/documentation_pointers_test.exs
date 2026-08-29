@@ -19,7 +19,21 @@ defmodule ExSandbox.DocumentationPointersTest do
   warnings do not read comments, `mix docs --warnings-as-errors` checks module
   autolinks rather than filenames, and the rename passed both.
 
-  ## The three ways a name is allowed to be absent
+  ## Renamed modules leave the same wreckage, and ExDoc does not catch it
+
+  ⚠️ MEASURED, second round. The same rename left six live present-tense claims
+  that code "calls `Pool.decide/3`", in `beam.ex`, `node_launcher.ex`,
+  `census-baseline.txt` and three test files. ExDoc autolinks a **fully
+  qualified** module in backticks and fails the build when it cannot resolve
+  one, which is why the rename's fully-qualified references were caught at the
+  time. A bare alias is not autolinked, so every one of these passed
+  `mix docs --warnings-as-errors`.
+
+  The rule below closes that: a removed module is written with the qualifier it
+  had (`Egress.Pool.relay/2`), never bare. A bare `Pool.` is then always a
+  pointer at something gone, which is a thing a regex can find.
+
+  ## The four ways a name is allowed to be absent
 
   `docs/provenance.md` describes them and lists every name. The check here is
   that the two agree: a name in `@absent` that the document does not mention
@@ -63,10 +77,22 @@ defmodule ExSandbox.DocumentationPointersTest do
 
   @generated ~w(priv/netns_nif.so census.txt secret.txt)
 
+  # ⚠️ Present in the repository and absent from the isolation image, which
+  # `.dockerignore` builds without `.git/` and `.github/` on purpose. MEASURED:
+  # this test passed on the host and FAILED inside the container on `ci.yml`,
+  # cited by `test_helper.exs` and by this file.
+  #
+  # `File.exists?/1` is consulted before this map, so on a full checkout the
+  # reference resolves the ordinary way and this entry is never reached. It only
+  # answers where the file genuinely is not, which keeps a real deletion of the
+  # workflow catchable everywhere the workflow is supposed to be.
+  @partial_copy ~w(ci.yml)
+
   @absent Map.new(
             Enum.map(@umbrella, &{&1, :umbrella}) ++
               Enum.map(@deleted, &{&1, :deleted}) ++
-              Enum.map(@generated, &{&1, :generated})
+              Enum.map(@generated, &{&1, :generated}) ++
+              Enum.map(@partial_copy, &{&1, :partial_copy})
           )
 
   test "every backticked filename resolves in this tree or is declared absent" do
@@ -101,6 +127,35 @@ defmodule ExSandbox.DocumentationPointersTest do
            where it went; the allowlist alone only silences the check.
 
            #{Enum.join(Enum.sort(undocumented), "\n")}
+           """
+  end
+
+  # Removed modules whose bare alias must never appear in backticks again.
+  # `ExSandbox.Egress.Pool` became `ExSandbox.Egress.Decision` and
+  # `ExSandbox.Egress.Verdict` was deleted with the AF_UNIX verdict socket, both
+  # in 1.1.0. Their history is still worth citing, which is why the fix is a
+  # naming convention rather than a ban on mentioning them.
+  @removed ~r/`(Pool|Verdict)\./
+
+  test "a removed module is never cited by its bare alias" do
+    # This file states the rule, so it has to spell the banned form to do it.
+    # It stays in the filename scan above; only this one check skips it.
+    bare =
+      for source <- @sources,
+          source != __ENV__.file |> Path.relative_to_cwd(),
+          File.exists?(source),
+          {line, number} <- Enum.with_index(File.stream!(source), 1),
+          Regex.match?(@removed, line),
+          do: "#{source}:#{number}  #{String.trim(line)}"
+
+    assert bare == [],
+           """
+           These name a module that no longer exists, by an alias short enough that
+           ExDoc does not try to resolve it. If the sentence is about today's code,
+           it means `Decision`; if it is about history, qualify it as `Egress.Pool`
+           or `Egress.Verdict` so the reader can tell which.
+
+           #{Enum.join(bare, "\n")}
            """
   end
 

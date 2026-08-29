@@ -372,7 +372,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # the tenant's connect returned OK and the pool never saw the connection.
   #
   # The blast-radius argument survives in substance: the acceptor holds no
-  # platform credential and **no policy**. It calls `Pool.decide/3`, which
+  # platform credential and **no policy**. It calls `Decision.decide/3`, which
   # remains the single implementation of the rule. That used to be a request
   # over an `AF_UNIX` socket the tenant could not see, because the acceptor was
   # a separate OS process; it is now a function call, and the socket and its
