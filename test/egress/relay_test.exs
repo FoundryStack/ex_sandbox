@@ -4,7 +4,7 @@ defmodule ExSandbox.Egress.RelayTest do
 
   ## Why these tests do not go through the pool's listener
 
-  `pool_transport_test.exs` documents the trap in detail: off-Linux every
+  `acceptor_transport_test.exs` documents the trap in detail: off-Linux every
   connection dies at `OriginalDst.read/1` with `:unavailable`, so the policy is
   never consulted and the relay is never reached. A relay test written against
   the pool's listener would be **vacuous on macOS** — green whether or not a

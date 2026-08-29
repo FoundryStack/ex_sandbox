@@ -5,7 +5,8 @@ defmodule ExSandbox.Egress.Acceptor do
 
   ## Why this exists, and what it replaced
 
-  `ExSandbox.Egress.Pool` binds `127.0.0.1` in the **host** namespace and was
+  Egress.Pool -- the module now called `ExSandbox.Egress.Decision`, back when it
+  still held a socket -- bound `127.0.0.1` in the **host** namespace and was
   designed as one pool for every sandbox — `013-FR-014c` argued for blast
   radius, not process count, and a process per sandbox is the heaviest way to
   get it.
@@ -66,7 +67,7 @@ defmodule ExSandbox.Egress.Acceptor do
 
   ## What is enforced here, and what is not
 
-  Nothing. The decision is `ExSandbox.Egress.Pool.decide/3`'s, unchanged and
+  Nothing. The decision is `ExSandbox.Egress.Decision.decide/3`'s, unchanged and
   shared, so there is exactly one implementation of "may this sandbox reach
   this destination" and moving the listener did not fork it.
 
@@ -116,7 +117,22 @@ defmodule ExSandbox.Egress.Acceptor do
       netns: netns_path(holder_pid),
       listener: nil,
       resolver: Keyword.get(opts, :resolver),
-      registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry)
+      registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry),
+
+      # ⚠️ Fixed here, and deliberately **not** read from `opts`. A host able to
+      # substitute the destination reader could name any destination it liked
+      # and have the policy checked against that instead of against the kernel's
+      # record, which is exactly the forgeable claim `OriginalDst` exists to
+      # prevent. `start_link/1` cannot carry one.
+      #
+      # It is a field rather than a hardcoded call because the tests that drive
+      # `handle_connection/2` and `accept_loop/1` overwrite it on the state map
+      # they were handed -- see `acceptor_relay_wiring_test.exs`. That is a
+      # rewrite of a local map inside the test process, not an interface, and it
+      # is the only way this path is reachable off Linux: on macOS
+      # `OriginalDst.read/1` returns `{:error, :unavailable}` for every
+      # connection, so the permit branch below never executes.
+      destination_reader: &OriginalDst.read/1
     }
 
     # ⚠️ `listen: false` exists for the tests that assert on this module's
@@ -173,8 +189,7 @@ defmodule ExSandbox.Egress.Acceptor do
 
   @impl true
   def handle_continue(:accept, state) do
-    parent = self()
-    Task.start_link(fn -> accept_loop(state, parent) end)
+    Task.start_link(fn -> accept_loop(state) end)
     start_resolver_leg(state)
     {:noreply, state}
   end
@@ -240,22 +255,63 @@ defmodule ExSandbox.Egress.Acceptor do
     end
   end
 
-  defp accept_loop(state, parent) do
+  @doc false
+  # Public only so `acceptor_transport_test.exs` can drive the loop over an
+  # ordinary loopback listener it put into the state map. There is no consumer:
+  # `handle_continue/2` above is its production caller, and the state it is
+  # handed there came from `init/1`.
+  #
+  # ⚠️ The property this exposure exists to keep testable is the third clause: a
+  # refusal must not end the loop. An acceptor that died on its first refusal
+  # would deny everything afterwards -- a boundary that holds by being broken,
+  # which passes every denial check in the conformance suite while making the
+  # sandbox useless.
+  @spec accept_loop(map()) :: :ok
+  def accept_loop(state) do
     case :gen_tcp.accept(state.listener) do
       {:ok, socket} ->
         # One process per connection, unlinked from the accept loop: a
         # connection that dies must not take the listener with it, and the
         # listener must be back in `accept/1` before the relay finishes.
-        {:ok, pid} = Task.start(fn -> handle_connection(socket, state) end)
+        #
+        # ⚠️ The handler WAITS to be told it owns the socket, and the handshake
+        # is load-bearing rather than ceremony. `:gen_tcp.recv/3` on a passive
+        # socket is refused for any process that is not the controlling one, so
+        # without the wait `handle_connection/2` races
+        # `controlling_process/2`: it reads the destination, decides, connects
+        # upstream, and only then reads -- usually losing the race, and
+        # occasionally winning it. Winning looks like a permitted destination
+        # that closed immediately, which is indistinguishable from a denial from
+        # inside the sandbox and leaves no trace beyond one `:einval` deep in
+        # the relay.
+        #
+        # MEASURED: the same ownership mistake in `acceptor_relay_wiring_test`
+        # produced exactly that -- the relay tore the pair down before a byte
+        # moved, and the permitted destination read as refused. `Pool` never hit
+        # it because it transferred ownership to the relay task rather than to
+        # the handler.
+        {:ok, pid} =
+          Task.start(fn ->
+            receive do
+              :owned -> handle_connection(socket, state)
+            after
+              # The accept loop is two calls away from sending this. A handler
+              # still waiting after five seconds means the loop died between the
+              # two, and a socket nobody owns must be closed rather than leaked.
+              5_000 -> :gen_tcp.close(socket)
+            end
+          end)
+
         :ok = :gen_tcp.controlling_process(socket, pid)
-        accept_loop(state, parent)
+        send(pid, :owned)
+        accept_loop(state)
 
       {:error, :closed} ->
         :ok
 
       {:error, reason} ->
         Logger.warning("egress acceptor accept failed: #{inspect(reason)}")
-        accept_loop(state, parent)
+        accept_loop(state)
     end
   end
 
@@ -278,16 +334,43 @@ defmodule ExSandbox.Egress.Acceptor do
   """
   @spec handle_connection(:gen_tcp.socket(), map()) :: :ok
   def handle_connection(socket, state) do
-    with {:ok, destination} <- OriginalDst.read(socket),
-         true <- permits?(state, destination, state.registry) do
+    with {:ok, destination} <- state.destination_reader.(socket),
+         :permitted <- verdict(state, destination, state.registry) do
       Relay.splice(socket, destination, netns: state.netns)
       :ok
     else
       other ->
-        Logger.warning("egress acceptor refused a connection (#{inspect(other)})")
+        log_refusal(other)
         :gen_tcp.close(socket)
     end
   end
+
+  # ⚠️ `warning`, not `debug`, and the level is load-bearing rather than a
+  # matter of taste. A policy denial is this subsystem's central security event
+  # -- the moment a tenant was stopped from reaching somewhere. At `debug` it is
+  # filtered out by every configuration this project ships, so the record of an
+  # enforcement decision would exist only on a developer machine with a lowered
+  # threshold. `info` is no better: `config/test.exs` sets `level: :warning`, so
+  # `Logger.info` is dropped before any handler sees it -- measured,
+  # `capture_log` returned `""`.
+  #
+  # ⚠️ The two clauses are the only thing separating "the allowlist said no"
+  # from "this host cannot enforce at all". Both close the socket identically,
+  # deliberately, so a fault cannot let traffic through; the distinction is lost
+  # in the *outcome* and must therefore survive in the *logs*, which is what
+  # T060a5 requires reach the census.
+  defp log_refusal({:refused, reason}),
+    do: Logger.warning("egress: refused (#{inspect(reason)})")
+
+  # ⚠️ No catch-all clause, deliberately. `handle_connection/2`'s `else` is
+  # reachable only by `{:refused, _}` from `verdict/3` or `{:error, _}` from the
+  # destination read -- the compiler proves it, and rejected a defensive third
+  # clause as unreachable. Leaving one in would tell a later reader that some
+  # other outcome is possible here, and the next person to add an outcome would
+  # trust it to catch them rather than being forced, by a compile error, to
+  # decide what the new outcome means.
+  defp log_refusal({:error, reason}),
+    do: Logger.warning("egress: could not establish a destination (#{inspect(reason)})")
 
   @impl true
   def terminate(_reason, %{listener: listener}) when not is_nil(listener) do
@@ -298,17 +381,30 @@ defmodule ExSandbox.Egress.Acceptor do
   def terminate(_reason, _state), do: :ok
 
   @doc """
-  Whether a connection from this acceptor's sandbox may reach `destination`.
+  What the shared decision says about a connection from this sandbox.
 
-  Delegates to `ExSandbox.Egress.Pool.decide/3` with the `source_key` this
+  Delegates to `ExSandbox.Egress.Decision.decide/3` with the `source_key` this
   acceptor was started for — see the moduledoc on why the key is supplied
   rather than read from the peer.
+
+  ⚠️ Returns the tagged verdict rather than a boolean because
+  `handle_connection/2` has to log *why* it refused, and `false` cannot say
+  whether the allowlist denied the destination or the sandbox has no registered
+  policy at all. `permits?/3` below is this function with the tag discarded, so
+  there is one implementation and the two cannot drift.
+  """
+  @spec verdict(spec(), {String.t(), :inet.port_number()}, GenServer.server()) ::
+          ExSandbox.Egress.Decision.decision()
+  def verdict(%{source_key: source_key}, destination, registry) do
+    ExSandbox.Egress.Decision.decide(sandbox_address(source_key), destination, registry)
+  end
+
+  @doc """
+  Whether a connection from this acceptor's sandbox may reach `destination`.
   """
   @spec permits?(spec(), {String.t(), :inet.port_number()}, GenServer.server()) :: boolean()
-  def permits?(%{source_key: source_key}, destination, registry) do
-    ExSandbox.Egress.Pool.decide(sandbox_address(source_key), destination, registry) ==
-      :permitted
-  end
+  def permits?(state, destination, registry),
+    do: verdict(state, destination, registry) == :permitted
 
   @doc """
   The acceptor's own /30, expressed as an address `Policy.source_key/1` masks

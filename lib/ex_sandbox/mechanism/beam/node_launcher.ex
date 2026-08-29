@@ -486,7 +486,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
   # The port this sandbox's acceptor will listen on, inside its own namespace.
   #
-  # ⚠️ This used to read `ExSandbox.Egress.Pool.port()`, a HOST socket, and that
+  # ⚠️ This used to read `Egress.Pool.port()` -- a HOST socket, on the module now
+  # called `ExSandbox.Egress.Decision`, which no longer listens at all -- and that
   # was wrong in a way no host-side test could see. An `nft` `redirect` is DNAT
   # to the local machine *as the namespace sees it*, so it can only ever reach a
   # socket in that namespace -- measured, the tenant's connect returned OK and
