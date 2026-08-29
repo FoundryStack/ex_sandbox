@@ -19,8 +19,10 @@ defmodule ExSandbox.Hardening.CensusPrivilegeGrantTest do
       the kernel refuses to let a new namespace mount over.
     * `CAP_SYS_PTRACE` — lets `verify_applied/1` READ `/proc/<pid>/ns/mnt` for
       a sandbox running as another uid after `setpriv`.
-    * `CAP_SYS_ADMIN` — lets `nsacceptor.py` JOIN the sandbox netns via
-      `nsenter`, which is `setns(2)` into another process's namespace.
+    * `CAP_SYS_ADMIN` — lets the acceptor JOIN the sandbox netns, i.e.
+      `setns(2)` into another process's namespace. Still needed after the
+      in-namespace helper process was deleted: the syscall is the same one,
+      made from a thread of this BEAM rather than from `nsenter`.
 
   ## Why this is a test and not just a comment
 

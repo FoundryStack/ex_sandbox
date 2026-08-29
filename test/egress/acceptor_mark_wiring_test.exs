@@ -30,6 +30,7 @@ defmodule ExSandbox.Egress.AcceptorMarkWiringTest do
   use ExUnit.Case, async: true
 
   alias ExSandbox.Egress.Netns
+  alias ExSandbox.Egress.NetnsSocket
   alias ExSandbox.Egress.Relay
 
   describe "the exemption and the socket agree" do
@@ -46,8 +47,7 @@ defmodule ExSandbox.Egress.AcceptorMarkWiringTest do
       assert exemption, "the redirect must carry a return rule for the acceptor"
       assert "#{mark}" in exemption
 
-      raw = Relay.upstream_connect_opts() |> Keyword.fetch!(:raw)
-      assert {1, 36, <<value::native-32>>} = raw
+      value = Relay.upstream_mark()
 
       assert value == mark,
              """
@@ -69,15 +69,52 @@ defmodule ExSandbox.Egress.AcceptorMarkWiringTest do
              "a return rule after the redirect never runs"
     end
 
-    test "the relay's connect options are the ones actually used" do
-      # ⚠️ The seam that makes the first test mean something. If `splice/3`
-      # built its options inline, this test could assert on a value no socket
-      # ever received -- which is the shape of the defect it is checking for.
-      opts = Relay.upstream_connect_opts()
+    test "a namespace whose mark cannot be set yields no upstream connection" do
+      # ⚠️ This replaced an assertion that `splice/3`'s options carried
+      # `raw: {1, 36, _}`. That option was the defect, not the guarantee:
+      # `:inet.setopts/2` reports `:ok` when the kernel refuses `SO_MARK` for
+      # want of `CAP_NET_ADMIN`, and the option then reads back as zero --
+      # measured. The old test passed in exactly the configuration where the
+      # mark was silently dropped and the acceptor talked to itself.
+      #
+      # The mark now comes from `NetnsSocket.socket/2`, which verifies it in C
+      # and returns no descriptor if it did not stick. So the property worth
+      # asserting is the one that option could never give: when a marked socket
+      # is unobtainable, NOTHING is connected and the sandbox's socket is closed.
+      # ⚠️ The destination is a port nothing listens on, deliberately. An earlier
+      # version pointed at a live listener, and on a host where the NIF loads
+      # `splice/3` genuinely connected -- then blocked in `pump/3` waiting for
+      # either side to close, and the test timed out at 60s. The property here
+      # is about what happens when NO upstream is established, so the upstream
+      # must not be establishable.
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, {:active, false}, {:ip, {127, 0, 0, 1}}])
+      {:ok, port} = :inet.port(listener)
+      {:ok, sandbox_side} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
+      {:ok, _accepted} = :gen_tcp.accept(listener, 1_000)
 
-      assert :binary in opts
-      assert Keyword.get(opts, :active) == false
-      assert Keyword.has_key?(opts, :raw)
+      # Port 1: reserved, and nothing in this suite binds it.
+      result =
+        Relay.splice(sandbox_side, {{127, 0, 0, 1}, 1},
+          netns: "/proc/self/ns/net",
+          connect_timeout_ms: 500
+        )
+
+      assert {:error, reason} = result
+
+      unless NetnsSocket.available?() do
+        # On a host with no NIF the refusal happens BEFORE any connect is
+        # attempted, and naming it is the point: `:netns_sockets_unavailable`
+        # says the mark could not be guaranteed, which is a different fact from
+        # a destination that was tried and refused.
+        assert reason == :netns_sockets_unavailable
+      end
+
+      # Closed on every path out, refusal included: a socket left open turns a
+      # refusal into an indefinite hang, which the conformance probe scores as a
+      # timeout rather than as a refusal.
+      assert {:error, :closed} = :gen_tcp.recv(sandbox_side, 0, 200)
+
+      :gen_tcp.close(listener)
     end
   end
 end

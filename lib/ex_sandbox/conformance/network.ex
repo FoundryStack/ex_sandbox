@@ -1298,8 +1298,9 @@ defmodule ExSandbox.Conformance.Network do
   #
   # `@udp_loopback` was written when nothing served `127.0.0.1:53` inside a
   # namespace, so an answer there could only mean the datagram escaped to the
-  # host's resolver. Since `FR-013` that address is served from inside the
-  # namespace by `nsacceptor.py`, and an answer means the exemption works.
+  # host's resolver. Since `FR-013` that address is served on a socket bound
+  # inside the namespace by `ExSandbox.Egress.Acceptor`, and an answer means the
+  # exemption works.
   # Measured in the isolation image: this leg reported "it left the namespace
   # unpoliced" against a sandbox whose UDP drop was installed and enforcing.
   #

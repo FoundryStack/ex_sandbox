@@ -30,3 +30,6 @@ __pycache__/
 # the census and suite log survive the container; every file in it is one run's
 # artefact, and the runner clears them at start.
 docker/results/
+
+# Built by Mix.Tasks.Compile.NetnsNif from c_src/. Architecture-specific.
+/priv/netns_nif.so

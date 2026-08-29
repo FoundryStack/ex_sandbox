@@ -41,8 +41,11 @@ defmodule ExSandbox.Egress.Pool do
   ## ⚠️ The listener here is no longer in the egress path (2026-08-18)
 
   `decide/3` is still the single implementation of "may this sandbox reach this
-  destination", and it is what `ExSandbox.Egress.Verdict` answers from. That
-  part is load-bearing and shared.
+  destination", and it is what `ExSandbox.Egress.Acceptor` calls for every
+  connection it accepts. That part is load-bearing and shared. It used to be
+  reached over an `AF_UNIX` socket via `ExSandbox.Egress.Verdict`, because the
+  acceptor was a separate OS process; both are gone (2026-08-29) and the call is
+  ordinary.
 
   The **listener** is not. It binds `127.0.0.1` in the *host* namespace, and an
   `nft` `redirect` is DNAT to the local machine as the namespace sees it — so it

@@ -35,15 +35,17 @@ defmodule ExSandbox.Egress.Resolver do
 
   What that costs is a transport, and the transport is the same one the verdict
   socket already uses and for the same reason: a network namespace isolates the
-  network stack, not the filesystem, so an `AF_UNIX` socket on a host path is
-  reachable from inside a sandbox's netns while being invisible to the tenant,
-  which `bwrap` never binds into its mount view. See `ExSandbox.Egress.Verdict`
-  for the measurement.
+  network stack. The socket a sandbox sends its queries to is bound **inside**
+  that sandbox's own network namespace by `ExSandbox.Egress.Acceptor`, using
+  `ExSandbox.Egress.NetnsSocket`, so it is reachable from the tenant's namespace
+  and belongs to no other.
 
-  ⚠️ The listener that *carries* datagrams to this socket runs inside the
-  namespace (`nsacceptor.py`), for the identical reason the TCP acceptor does:
-  a socket's network namespace is fixed by the namespace of the calling
-  process, and the BEAM never enters the sandbox's.
+  ⚠️ The datagrams used to reach this module over a second `AF_UNIX` socket on a
+  host path, carrying a length-prefixed `"<source-key>\n" <> query` frame,
+  because the in-namespace listener was a separate OS process that could not
+  call `answer/3`. That listener is now a process on this node and calls
+  `answer_via/4` directly, so the socket, its framing, its parser, and the
+  `chmod` that made it reachable by the listener's uid are all gone.
 
   ## Every answer passes the same structural filter as every entry
 
@@ -113,8 +115,6 @@ defmodule ExSandbox.Egress.Resolver do
   Record.defrecordp(:dns_query, Record.extract(:dns_query, from_lib: "kernel/src/inet_dns.hrl"))
   Record.defrecordp(:dns_rr, Record.extract(:dns_rr, from_lib: "kernel/src/inet_dns.hrl"))
 
-  @default_path "/var/run/axonn-egress-resolver.sock"
-
   # ⚠️ The address a sandbox finds its resolver at, **inside its own network
   # namespace**. It is loopback there, which is the namespace's loopback and
   # not the host's -- reaching it reaches the in-namespace listener, never a
@@ -159,38 +159,6 @@ defmodule ExSandbox.Egress.Resolver do
     |> Keyword.get(:resolver_address, @default_resolver)
   end
 
-  @doc """
-  Where the resolver socket lives.
-
-  ⚠️ Deliberately not under a sandbox's storage or any path `Hardening.Linux`
-  binds into a tenant's mount view — the same rule, and the same reason, as
-  `ExSandbox.Egress.Verdict.default_path/0`.
-
-  ⚠️ **Defaults to the verdict socket's own directory rather than to a second
-  configured constant**, and that is the point rather than a shortcut. The two
-  sockets have identical requirements — bindable by the platform, invisible to
-  the tenant — so a deployment that had to state the directory twice would have
-  two chances to state it differently. The failure mode of a divergence is not
-  symmetric: `/var/run` is writable on a deployment host and not on a developer
-  machine, and a resolver that cannot bind refuses to start the whole node.
-  """
-  @spec default_path() :: String.t()
-  def default_path do
-    egress = Application.get_env(:ex_sandbox, :egress, [])
-
-    case Keyword.get(egress, :resolver_socket_path) do
-      nil -> beside_verdict_socket(egress)
-      configured -> configured
-    end
-  end
-
-  defp beside_verdict_socket(egress) do
-    case Keyword.get(egress, :verdict_socket_path) do
-      nil -> @default_path
-      verdict -> Path.join(Path.dirname(verdict), Path.basename(@default_path))
-    end
-  end
-
   @doc false
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -219,11 +187,36 @@ defmodule ExSandbox.Egress.Resolver do
     end
   end
 
+  @doc """
+  Answers `query` for `source_key` using the **running** resolver's state.
+
+  ⚠️ Not `answer/3`. That function takes its registry, host aliases and upstream
+  resolver as options and defaults all three, so calling it directly answers
+  with `host_aliases: []` -- and the alias list is what stops a sandbox
+  resolving a name to one of the host's own addresses. The defaults are correct
+  for a unit test and silently wrong for a tenant.
+
+  The aliases are detected once at `init/1` (see the note there on why), so the
+  server is the only thing that holds them. This exists so a caller in this node
+  can reach that state without reconstructing it.
+  """
+  @spec answer_via(binary(), Policy.source_key(), GenServer.server(), timeout()) ::
+          {:ok, binary()} | {:error, term()}
+  def answer_via(query, source_key, server \\ __MODULE__, timeout \\ 10_000)
+      when is_binary(query) do
+    GenServer.call(server, {:answer, query, source_key}, timeout)
+  catch
+    # ⚠️ An unreachable resolver is silence, not an error reply. Same rule the
+    # frame protocol followed: a resolver that answers "denied" tells the tenant
+    # its query was seen, which is a channel. A dropped datagram is what an
+    # unreachable resolver looks like from inside.
+    :exit, reason -> {:error, {:resolver_unreachable, reason}}
+  end
+
   # -- Callbacks ------------------------------------------------------------
 
   @impl true
   def init(opts) do
-    path = Keyword.get(opts, :path, default_path())
     registry = Keyword.get(opts, :registry, EgressRegistry)
 
     # ⚠️ Read once, at start, and that is a stated limitation rather than an
@@ -235,91 +228,26 @@ defmodule ExSandbox.Egress.Resolver do
     # the same thing about the parse-time list.
     aliases = Keyword.get_lazy(opts, :host_aliases, &HostAliases.detect/0)
 
-    # A stale socket file from a previous run makes `bind` fail with
-    # `:eaddrinuse`, which reads as "another node is running" rather than "the
-    # last one died". Same rule as `Verdict`.
-    _ = File.rm(path)
-    _ = File.mkdir_p(Path.dirname(path))
-
-    case :gen_tcp.listen(0, [
-           {:ifaddr, {:local, path}},
-           :binary,
-           packet: 4,
-           active: false,
-           reuseaddr: true
-         ]) do
-      {:ok, listener} ->
-        :ok = permit_acceptor(path)
-
-        state = %{
-          listener: listener,
-          registry: registry,
-          host_aliases: aliases,
-          path: path,
-          # ⚠️ Carried in state so the socket path can be exercised against a
-          # KNOWN upstream. Without it a test at this level can only assert
-          # "bytes came back or the host could not resolve", and those two are
-          # indistinguishable from a framing bug -- a check that cannot fail.
-          # `answer/3` has always taken this; the server simply never passed it.
-          resolve: Keyword.get(opts, :resolve, &resolve_upstream/2)
-        }
-
-        {:ok, state, {:continue, :accept}}
-
-      {:error, reason} ->
-        # ⚠️ Refused loudly. A resolver that failed to bind but let the node
-        # boot produces sandboxes whose every name lookup times out, which
-        # reads as a slow network rather than as an absent platform service.
-        {:stop, {:resolver_listen_failed, path, reason}}
-    end
-  end
-
-  # ⚠️ Same widening, same reason, as `Verdict.permit_acceptor/1` -- and the
-  # same failure mode when it is missing. The BEAM binds this socket as root
-  # and a unix socket takes mode `0755` from the umask, which denies
-  # `connect(2)` to every other uid. The in-namespace listener runs under the
-  # holder's user namespace (`nsenter -n -U`), so it is not that uid.
-  #
-  # `ask_resolver/3` in `nsacceptor.py` treats any failure as silence, which is
-  # the right rule and is what makes this so quiet: every query is dropped,
-  # the client retries and times out, and the symptom is "hostnames do not
-  # resolve" rather than "the platform is unreachable". Measured inside the
-  # isolation image against a running sandbox (029 T015):
-  #
-  #     mode 0755  -> tenant /proc/net/snmp: Udp InDatagrams +3, OutDatagrams +3,
-  #                   NoPorts unchanged  (queries delivered to the listener,
-  #                   listener sent nothing back), `:inet_res` -> {:error, :timeout}
-  #     mode 0666  -> `:inet_res` -> answers
-  #
-  # The isolation is the path, not the mode: this lives beside the verdict
-  # socket, outside everything `bwrap` binds into the sandbox, so tenant code
-  # cannot see it at all. And reaching it grants nothing an allowlist would not
-  # already permit -- the answers it returns are filtered by FR-015 before they
-  # leave, and the binding it records is what the verdict later consults.
-  defp permit_acceptor(path) do
-    case File.chmod(path, 0o666) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        # Refused rather than tolerated, for the same reason the bind failure
-        # is: a resolver no acceptor can reach denies every name while the
-        # platform reports itself healthy.
-        raise "egress: could not make the resolver socket reachable by the " <>
-                "in-namespace listener at #{path}: #{inspect(reason)}"
-    end
-  end
-
-  @impl true
-  def handle_continue(:accept, state) do
-    parent = self()
-
-    # One acceptor process per node, handing each connection to a task. A
-    # blocked resolution must not stall the next sandbox's query.
-    _ =
-      spawn_link(fn -> accept_loop(parent, state) end)
-
-    {:noreply, state}
+    # ⚠️ There is no socket here any more, and the deletion is the point.
+    #
+    # This used to bind an `AF_UNIX` socket, remove a stale one first, `chmod`
+    # it `0666` so the in-namespace listener's uid could reach it, and refuse to
+    # start if any of that failed. All of it existed because the listener was a
+    # separate OS process that could not simply call this module. The listener
+    # is now `ExSandbox.Egress.Acceptor`, a process on this node, and it calls
+    # `answer_via/4`.
+    #
+    # What went with the socket: a length-prefixed frame carrying
+    # `"<source-key>\n" <> query`, its parser, the rule that any framing error
+    # is silence, a permissions widening whose absence dropped every datagram
+    # while the platform reported itself healthy, and a configured path that had
+    # to agree with a second configured path in another module.
+    {:ok,
+     %{
+       registry: registry,
+       host_aliases: aliases,
+       resolve: Keyword.get(opts, :resolve, &resolve_upstream/2)
+     }}
   end
 
   @impl true
@@ -332,68 +260,6 @@ defmodule ExSandbox.Egress.Resolver do
       )
 
     {:reply, result, state}
-  end
-
-  @impl true
-  def terminate(_reason, %{path: path}), do: File.rm(path)
-
-  # -- Transport ------------------------------------------------------------
-
-  defp accept_loop(parent, state) do
-    case :gen_tcp.accept(state.listener) do
-      {:ok, socket} ->
-        {:ok, pid} = Task.start(fn -> serve(socket, parent) end)
-        :ok = :gen_tcp.controlling_process(socket, pid)
-        accept_loop(parent, state)
-
-      {:error, :closed} ->
-        :ok
-
-      {:error, _reason} ->
-        accept_loop(parent, state)
-    end
-  end
-
-  # The frame is `"<source-key>\n" <> <query bytes>`, length-prefixed by
-  # `packet: 4` on both sides. The source key is the platform's own account of
-  # which sandbox this is -- supplied to the in-namespace listener at start,
-  # never read off the datagram. See `ExSandbox.Egress.Acceptor`.
-  defp serve(socket, parent) do
-    with {:ok, frame} <- :gen_tcp.recv(socket, 0, 5_000),
-         {:ok, source_key, query} <- split_frame(frame),
-         {:ok, response} <- GenServer.call(parent, {:answer, query, source_key}, 10_000) do
-      :gen_tcp.send(socket, response)
-    else
-      other ->
-        # ⚠️ Nothing is sent back. A malformed frame or a failed resolution
-        # yields silence, which the in-namespace listener drops -- and a dropped
-        # datagram is what a resolver that cannot answer looks like on the wire.
-        # Synthesising a response here would mean inventing an answer.
-        Logger.debug("egress resolver: no answer (#{inspect(other)})")
-        :ok
-    end
-
-    :gen_tcp.close(socket)
-  end
-
-  defp split_frame(frame) do
-    case :binary.split(frame, "\n") do
-      [key_text, query] ->
-        case parse_source_key(key_text) do
-          {:ok, key} -> {:ok, key, query}
-          :error -> {:error, {:bad_source_key, key_text}}
-        end
-
-      _ ->
-        {:error, :bad_frame}
-    end
-  end
-
-  defp parse_source_key(text) do
-    case :inet.parse_ipv4_address(String.to_charlist(text)) do
-      {:ok, {_, _, _, _} = address} -> {:ok, Policy.source_key(address)}
-      _ -> :error
-    end
   end
 
   # -- The service ----------------------------------------------------------

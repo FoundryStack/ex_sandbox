@@ -7,7 +7,7 @@ defmodule ExSandbox.Conformance.UdpResolverLegTest do
   a sandbox's namespace, so an answer from that address could only mean the
   datagram had left the namespace and reached the host's resolver. `FR-013`
   changes what that address is: it is now served from *inside* the namespace by
-  `nsacceptor.py`, and an answer from it is the exemption working.
+  the acceptor's DNS leg, and an answer from it is the exemption working.
 
   Measured in the isolation image before this change, against a sandbox whose
   UDP drop was installed and enforcing:

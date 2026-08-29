@@ -116,43 +116,68 @@ defmodule ExSandbox.Egress.ResolverWiringTest do
   end
 
   describe "the listener is bound where the rule permits" do
-    test "the acceptor command carries the plan's own resolver address" do
+    test "the acceptor is started with the plan's own resolver address" do
       # ⚠️ From the plan, not from configuration read a second time. If the two
-      # diverged the listener would sit where nothing may send: DNS silently
-      # dead, every denial check green.
+      # diverged the resolver socket would sit where nothing may send: DNS
+      # silently dead, every denial check green.
+      #
+      # This used to assert on `Acceptor.listener_command/7`'s argv, because the
+      # listener was an OS process and the address reached it as a string. It is
+      # now a process on this node started with options, so the same fact is
+      # asserted against the state it actually holds.
       {:ok, plan} = build!(resolver: {{10, 0, 0, 53}, 5353})
 
-      command =
-        ExSandbox.Egress.Acceptor.listener_command(
-          1234,
-          plan.pool_port,
-          "/helper.py",
-          "/verdict.sock",
-          plan.source_key,
-          "/resolver.sock",
-          plan.resolver
+      {:ok, state} =
+        ExSandbox.Egress.Acceptor.init(
+          source_key: plan.source_key,
+          holder_pid: 1234,
+          port: plan.pool_port,
+          resolver: plan.resolver,
+          listen: false
         )
 
-      assert "10.0.0.53" in command
-      assert "5353" in command
-      assert "/resolver.sock" in command
+      assert state.resolver == {{10, 0, 0, 53}, 5353}
     end
 
-    test "a plan with no resolver tells the helper to serve none" do
+    test "a plan with no resolver leaves the acceptor with no DNS leg" do
       {:ok, plan} = build!(resolver: nil)
 
-      command =
-        ExSandbox.Egress.Acceptor.listener_command(
-          1234,
-          plan.pool_port,
-          "/helper.py",
-          "/verdict.sock",
-          plan.source_key,
-          "/resolver.sock",
-          plan.resolver
+      {:ok, state} =
+        ExSandbox.Egress.Acceptor.init(
+          source_key: plan.source_key,
+          holder_pid: 1234,
+          port: plan.pool_port,
+          resolver: plan.resolver,
+          listen: false
         )
 
-      assert List.last(command) == "0"
+      assert state.resolver == nil
+    end
+
+    test "the launcher passes the plan's resolver, not a configured one" do
+      # ⚠️ Wiring, not behaviour. The two tests above are worth nothing if the
+      # launcher never passes the value -- the shape of four earlier defects in
+      # this feature, each correct code that nothing reached.
+      #
+      # Read from source because reaching `start_acceptor/3` needs a real
+      # namespace, which is Linux only. Verifying this only where the whole
+      # launch works is the arrangement that let those four survive.
+      source =
+        File.read!(
+          Path.join([
+            __DIR__,
+            "..",
+            "..",
+            "lib",
+            "ex_sandbox",
+            "mechanism",
+            "beam",
+            "node_launcher.ex"
+          ])
+        )
+
+      assert source =~ "resolver: plan.resolver",
+             "the acceptor is started without the plan's resolver, so DNS is dead"
     end
   end
 end

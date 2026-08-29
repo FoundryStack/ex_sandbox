@@ -46,6 +46,7 @@ defmodule ExSandbox.Egress.Relay do
   require Logger
 
   alias ExSandbox.Egress.Netns
+  alias ExSandbox.Egress.NetnsSocket
 
   @typedoc "Where a permitted connection is headed."
   @type destination :: {:inet.ip4_address(), :inet.port_number()}
@@ -72,8 +73,9 @@ defmodule ExSandbox.Egress.Relay do
   @spec splice(:gen_tcp.socket(), destination(), keyword()) :: :ok | {:error, term()}
   def splice(sandbox_socket, {address, port}, opts \\ []) do
     connect_timeout = Keyword.get(opts, :connect_timeout_ms, @connect_timeout_ms)
+    netns = Keyword.get(opts, :netns)
 
-    case :gen_tcp.connect(address, port, connect_opts(), connect_timeout) do
+    case upstream_connect(address, port, netns, connect_timeout) do
       {:ok, destination_socket} ->
         pump(
           sandbox_socket,
@@ -127,18 +129,52 @@ defmodule ExSandbox.Egress.Relay do
   # `:raw` because OTP exposes no named option for `SO_MARK`: level `SOL_SOCKET`
   # (1), option `SO_MARK` (36), a 32-bit native-endian integer.
   @doc """
-  The options `splice/3` passes to `:gen_tcp.connect/4`.
+  The `SO_MARK` value `splice/3` asks `NetnsSocket.socket/2` to set.
 
-  Public **only** so `acceptor_mark_wiring_test.exs` can assert that the
-  `SO_MARK` set here is the one the redirect exempts. Asserting on a duplicate
-  literal in the test would pass while the socket carried something else, which
-  is precisely the defect being guarded against.
+  Public **only** so `acceptor_mark_wiring_test.exs` can assert that the mark
+  used here is the one the redirect exempts. Asserting on a duplicate literal in
+  the test would pass while the socket carried something else, which is
+  precisely the defect being guarded against.
   """
-  @spec upstream_connect_opts() :: [:gen_tcp.connect_option()]
-  def upstream_connect_opts, do: connect_opts()
+  @spec upstream_mark() :: non_neg_integer()
+  def upstream_mark, do: Netns.acceptor_mark()
 
-  defp connect_opts do
-    [:binary, active: false, raw: {1, 36, <<Netns.acceptor_mark()::native-32>>}]
+  # ⚠️ The mark is NOT set here, and that is the whole point of routing this
+  # through `NetnsSocket`.
+  #
+  # This used to be `raw: {1, 36, <<mark::native-32>>}` on an ordinary
+  # `:gen_tcp.connect/4`, which FAILS OPEN. Measured with `CAP_NET_ADMIN` and
+  # `CAP_NET_RAW` dropped: the connect returns `:ok`, `:inet.setopts/2` returns
+  # `:ok`, and reading the option back yields `<<0, 0, 0, 0>>`. `:inet` swallows
+  # the kernel's EPERM. The helper this replaced was CPython, which raised
+  # `OSError` on the same call -- the only reason it failed closed.
+  #
+  # `NetnsSocket.socket/2` writes the mark, reads it back, and compares, in C,
+  # before any descriptor is returned. There is no path there that yields an
+  # unmarked socket, so an unmarked upstream is unrepresentable rather than
+  # merely unlikely.
+  defp upstream_connect(address, port, netns, timeout) when is_binary(netns) do
+    case NetnsSocket.socket(netns, Netns.acceptor_mark()) do
+      {:ok, fd} ->
+        :gen_tcp.connect(address, port, [:binary, {:active, false}, {:fd, fd}], timeout)
+
+      {:error, :unsupported} ->
+        {:error, :netns_sockets_unavailable}
+
+      {:error, stage, errno} ->
+        {:error, {stage, errno}}
+    end
+  end
+
+  # ⚠️ `nil` is not a fallback for a namespace that could not be entered -- it
+  # is "there is no namespace", which is only true on a host with no sandbox
+  # netns at all. No redirect exists there, so there is nothing for a mark to
+  # escape and setting one would be cargo. The production caller always supplies
+  # a namespace; a caller that could silently pass `nil` instead would turn a
+  # missing namespace into a host-namespace connection, which is the
+  # enforcement-point-that-enforces-nothing shape this subsystem keeps finding.
+  defp upstream_connect(address, port, nil, timeout) do
+    :gen_tcp.connect(address, port, [:binary, {:active, false}], timeout)
   end
 
   # Both directions are driven by two processes over blocking `recv`, rather

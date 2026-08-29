@@ -57,7 +57,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
           # process *and* keep one namespace alive, indefinitely.
           #
           # `nil` on a host with no egress path, as with `binding`.
-          acceptor_os_pid: integer() | nil
+          acceptor_pid: pid() | nil
         }
 
   @doc """
@@ -82,12 +82,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          # and unpoliced. The window cannot be closed by reordering -- the
          # namespace does not exist until `pasta` starts the tenant in it -- so
          # it is closed by failing toward termination instead. See `police/2`.
-         {:ok, acceptor_os_pid} <- police_or_terminate(plan, launched, binding),
+         {:ok, acceptor_pid} <- police_or_terminate(plan, launched, binding),
          :ok <- verify_or_terminate(launched, sandbox) do
       {:ok,
        launched
        |> Map.put(:binding, binding)
-       |> Map.put(:acceptor_os_pid, acceptor_os_pid)}
+       |> Map.put(:acceptor_pid, acceptor_pid)}
     end
   end
 
@@ -266,9 +266,9 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         # Measured directly while building `docker/acceptor-e2e.sh`: with the
         # acceptor bound in the wrong namespace the tenant got `ECONNREFUSED`,
         # which reads exactly like a working boundary.
-        with {:ok, acceptor_os_pid} <- starter.(plan, holder_pid, opts),
+        with {:ok, acceptor_pid} <- starter.(plan, holder_pid, opts),
              :ok <- runner.(ExSandbox.Egress.LaunchPlan.redirect_steps(plan, holder_pid)) do
-          {:ok, acceptor_os_pid}
+          {:ok, acceptor_pid}
         end
 
       {:error, reason} ->
@@ -300,8 +300,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
   defp police_or_terminate(plan, launched, binding) do
     case police(plan, pasta_pid: pasta_pid(plan)) do
-      {:ok, acceptor_os_pid} ->
-        {:ok, acceptor_os_pid}
+      {:ok, acceptor_pid} ->
+        {:ok, acceptor_pid}
 
       {:error, reason} ->
         # ⚠️ `launched.peer`, not `launched`. `terminate/2` takes the peer PID;
@@ -372,156 +372,52 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # the tenant's connect returned OK and the pool never saw the connection.
   #
   # The blast-radius argument survives in substance: the acceptor holds no
-  # platform credential and **no policy**. It asks `ExSandbox.Egress.Verdict`
-  # over a socket the tenant cannot see, so `Pool.decide/3` remains the single
-  # implementation of the rule.
+  # platform credential and **no policy**. It calls `Pool.decide/3`, which
+  # remains the single implementation of the rule. That used to be a request
+  # over an `AF_UNIX` socket the tenant could not see, because the acceptor was
+  # a separate OS process; it is now a function call, and the socket and its
+  # protocol are gone rather than simplified.
   defp start_acceptor(plan, holder_pid, opts) do
-    helper = Keyword.get(opts, :acceptor_helper, acceptor_helper_path())
-    # ⚠️ Read from the RUNNING server, not from configuration. A configured path
-    # names a socket that may not exist -- the same rule the pool's port already
-    # follows. If the two diverged the acceptor would be handed a path nothing
-    # is bound to, and since an unobtainable verdict is DENY, the sandbox would
-    # lose egress entirely while every denial check still passed.
-    verdict = Keyword.get_lazy(opts, :verdict_path, &running_verdict_path/0)
+    # ⚠️ There is nothing to await here, and that is the point.
+    #
+    # This used to spawn `nsacceptor.py` under `nsenter`, then block reading its
+    # stdout for a line saying `ACCEPTOR listening`. The wait was not ceremony:
+    # returning optimistically would install the redirect against a port that
+    # may never open, which fails closed but *silently* -- the sandbox loses
+    # egress entirely and every denial check still passes.
+    #
+    # `GenServer.start_link/3` does not return until `init/1` has, and
+    # `Acceptor.init/1` binds inside the namespace before it returns. So "it is
+    # listening" is carried by the return value itself rather than by a string
+    # parsed off a pipe, and the failure mode the wait existed to catch cannot
+    # occur: there is no state in which this returns `{:ok, _}` and nothing is
+    # bound.
+    ExSandbox.Egress.Acceptor.start_link(
+      source_key: plan.source_key,
+      holder_pid: holder_pid,
+      port: plan.pool_port,
+      # ⚠️ From the PLAN, not from configuration. The plan already validated this
+      # address and it is the same value the `nft` redirect was built from, so
+      # the resolver cannot end up bound somewhere the rule does not point.
+      # Reading the config key a second time here is exactly that drift.
+      resolver: plan.resolver,
+      registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry)
+    )
+    |> case do
+      {:ok, pid} ->
+        {:ok, pid}
 
-    resolver_socket =
-      Keyword.get_lazy(opts, :resolver_path, &ExSandbox.Egress.Resolver.default_path/0)
-
-    command =
-      ExSandbox.Egress.Acceptor.listener_command(
-        holder_pid,
-        plan.pool_port,
-        helper,
-        verdict,
-        plan.source_key,
-        resolver_socket,
-        # ⚠️ From the PLAN, not from configuration. The plan already validated
-        # this address and it is the same value the `nft` exemption was built
-        # from, so the listener cannot end up bound somewhere the rule does not
-        # permit. Reading the config key a second time here is exactly the drift
-        # `Acceptor.listener_command/7` warns about.
-        plan.resolver
-      )
-
-    [prog | args] = command
-
-    # Started detached: the acceptor outlives this call by design -- it serves
-    # the namespace for the sandbox's whole life. `System.cmd/3` would block
-    # until it exited, which is never.
-    port =
-      Port.open({:spawn_executable, System.find_executable(prog)}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        line: 256,
-        args: args
-      ])
-
-    await_acceptor(port, plan)
-  end
-
-  # Forwards the acceptor's own diagnostics into the platform's log.
-  #
-  # ⚠️ Deliberately a separate process that only reads. It must not be able to
-  # affect the launch: the acceptor is serving the sandbox by this point, and a
-  # crash in the code that *reads about* it must not take down the thing being
-  # read about.
-  defp drain_acceptor(port, plan) do
-    parent = self()
-
-    spawn(fn ->
-      Port.connect(port, self())
-      send(parent, :drain_ready)
-      drain_loop(port, plan)
-    end)
-
-    receive do
-      :drain_ready -> :ok
-    after
-      1_000 -> :ok
-    end
-  end
-
-  defp drain_loop(port, plan) do
-    receive do
-      {^port, {:data, {:eol, line}}} ->
-        Logger.warning("egress acceptor #{inspect(plan.source_key)}: #{line}")
-        drain_loop(port, plan)
-
-      {^port, {:exit_status, status}} ->
-        Logger.error("egress acceptor #{inspect(plan.source_key)} exited (status #{status})")
-    end
-  end
-
-  # ⚠️ Waits for the acceptor to say it is listening rather than assuming it.
-  # Returning `:ok` optimistically would install the redirect against a port
-  # that may never open, which fails closed but silently -- the sandbox loses
-  # egress entirely and every denial check still passes.
-  defp await_acceptor(port, plan) do
-    receive do
-      {^port, {:data, {:eol, line}}} ->
-        if String.starts_with?(line, "ACCEPTOR listening") do
-          # ⚠️ The OS pid, not the port. `destroy/1` must be able to kill this
-          # process, and a `Port` is a BEAM-side handle that dies with the
-          # calling process while the OS process it spawned does not. Measured:
-          # after the namespace holder was killed the acceptor was still alive
-          # and still holding the dead netns open, so a destroy that forgot it
-          # would leak both.
-          # ⚠️ The acceptor's output after this line used to be discarded --
-          # nothing read the port again, so a per-connection failure inside
-          # `nsacceptor.py` (an unobtainable verdict, an upstream connect that
-          # cannot be made) went to a mailbox no one drained. That is the one
-          # place a permitted destination failing would announce itself, and
-          # its silence cost several cycles of guessing at the layer below.
-          _ = drain_acceptor(port, plan)
-          {:ok, os_pid_of(port)}
-        else
-          await_acceptor(port, plan)
-        end
-
-      {^port, {:exit_status, status}} ->
+      {:error, reason} ->
         Logger.error("""
-        egress: the acceptor for #{inspect(plan.source_key)} exited before it \
-        began listening (status #{status}).
+        egress: the acceptor for #{inspect(plan.source_key)} could not bind \
+        inside the sandbox's namespace (#{inspect(reason)}).
 
-        The tenant is running but nothing is listening at the address its
-        redirect would name, so it would lose egress entirely while every
-        denial check in the conformance suite still passed.
+        The tenant would be running with nothing listening at the address its
+        redirect names, so it would lose egress entirely while every denial
+        check in the conformance suite still passed. Refusing the launch.
         """)
 
         {:error, :mechanism_error}
-    after
-      5_000 ->
-        _ = Port.close(port)
-
-        Logger.error("""
-        egress: the acceptor for #{inspect(plan.source_key)} did not begin \
-        listening within 5s.
-
-        Installing the redirect anyway would point it at a dead port, which from
-        inside the sandbox is indistinguishable from a correctly denied
-        destination.
-        """)
-
-        {:error, :mechanism_error}
-    end
-  end
-
-  # The verdict socket the running server is actually bound to, falling back to
-  # the configured default only when the server cannot be reached -- in which
-  # case the launch is about to fail anyway, and failing with a path in the log
-  # beats failing with none.
-  defp running_verdict_path do
-    ExSandbox.Egress.Verdict.path()
-  catch
-    :exit, _ -> ExSandbox.Egress.Verdict.default_path()
-  end
-
-  # The OS pid behind a port, or `nil` when the port has already closed.
-  defp os_pid_of(port) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, pid} -> pid
-      nil -> nil
     end
   end
 
@@ -542,30 +438,27 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   @spec stop_acceptor(integer() | nil) :: :ok
   def stop_acceptor(nil), do: :ok
 
-  def stop_acceptor(os_pid) when is_integer(os_pid) do
-    # `System.cmd/3` rather than `Port`: there is no BEAM-side handle to this
-    # process any more -- the port that spawned it belonged to the launching
-    # process, which is long gone by the time `destroy/1` runs.
-    _ = System.cmd("kill", ["-TERM", "#{os_pid}"], stderr_to_stdout: true)
+  def stop_acceptor(pid) when is_pid(pid) do
+    # ⚠️ This used to be `kill -TERM <os_pid>`, because the acceptor was an OS
+    # process with no BEAM-side handle: the port that spawned it belonged to the
+    # launching process, long gone by the time `destroy/1` ran. Measured then --
+    # after the namespace holder was killed the acceptor was still alive and
+    # still holding the dead netns open, so a destroy that forgot it leaked both.
+    #
+    # The acceptor is now a process on this node, so reclamation is
+    # `GenServer.stop/3` and the listening socket is closed by `terminate/2`.
+    # The leak that measurement found is no longer expressible: there is no OS
+    # process to outlive anything, and a descriptor held by a dead BEAM process
+    # is closed by the runtime.
+    if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     :ok
-  rescue
-    # A host without `kill` on PATH cannot reclaim, and saying so beats raising
-    # out of a destroy that has already released everything else.
-    error ->
-      Logger.warning("egress: could not stop acceptor #{os_pid} (#{inspect(error)})")
+  catch
+    # Already gone, or did not stop in time. Either way the descriptor is
+    # released by the runtime, and saying so beats raising out of a destroy that
+    # has released everything else.
+    :exit, reason ->
+      Logger.warning("egress: could not stop acceptor #{inspect(pid)} (#{inspect(reason)})")
       :ok
-  end
-
-  @doc """
-  Where the namespace acceptor helper lives.
-
-  Public because a release that ships without it produces a launch failure whose
-  cause is a missing file, and naming that file is the difference between a
-  one-line fix and a namespace investigation.
-  """
-  @spec acceptor_helper_path() :: String.t()
-  def acceptor_helper_path do
-    Application.app_dir(:ex_sandbox, ["priv", "egress", "nsacceptor.py"])
   end
 
   defp run_steps(steps) do

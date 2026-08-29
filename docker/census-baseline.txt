@@ -93,7 +93,32 @@
 # address lands on A's own listener -- is a fact about `context.address`. A
 # host-side tuple (T033) is not that address, and the liveness control this
 # check gates on is what would make its refusal attributable.
-isolation 8
+# ⚠️ RAISED 8 -> 9 on 2026-08-29, and unlike most raises this one is a real
+# loss of coverage rather than a host artefact. Recorded here because a ceiling
+# that moves without a reason is how a suite reports fewer guarantees every
+# release and stays green the whole way.
+#
+# The acceptor used to be a separate OS process that held no policy and asked
+# `ExSandbox.Egress.Verdict` over an `AF_UNIX` socket for every connection.
+# `Mechanism.Beam` published that socket's path as `context.policy_handle`, and
+# `FR-011b` demonstrated the guarantee by attempting to write it from inside a
+# sandbox. It discriminated: measured against the real bind set, the path
+# reported ABSENT inside and WIDENED when deliberately bound in.
+#
+# The acceptor is now a process on this node and `Pool.decide/3` is an ordinary
+# function call. There is no socket, no file, and no filesystem artefact of any
+# kind carrying the allowlist -- it lives in `Egress.Registry`, in this BEAM's
+# memory, which a tenant has no route to. The guarantee is STRONGER and the
+# evidence for it WEAKER: nothing remains to attempt a write against, so the
+# check reports the third outcome.
+#
+# ⚠️ The fix is NOT to publish a handle naming a path that does not exist. The
+# write would fail, the check would pass, and that is the `--unshare-net` false
+# pass in its purest form -- the absence of a mechanism scoring as the presence
+# of a boundary, which two earlier versions of `attempt_widen_allowlist/2` fell
+# into. Lower this again only when a design gives the policy a handle a tenant
+# could plausibly reach. See `put_policy_handle/2` in `mechanism/beam.ex`.
+isolation 9
 
 # ⚠️ Lowered 29 -> 10 on 2026-08-18, and the raise it reverses was WRONG.
 #

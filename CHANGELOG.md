@@ -1,5 +1,76 @@
 # Changelog
 
+## 1.1.0 — 2026-08-29
+
+### ⚠️ On Linux, egress now needs a C compiler at build time instead of `python3` at runtime
+
+`Mix.Tasks.Compile.NetnsNif` builds `c_src/netns_nif.c` into `priv/netns_nif.so` in the
+consumer's own tree. It is skipped off Linux, and a missing compiler is a **warning, not a build
+failure** — but on a Linux host without one, `ExSandbox.Egress.NetnsSocket.available?/0` is false,
+the `network_restriction` capability is not constructed, and `ExSandbox.Mechanism.Beam` refuses to
+launch any sandbox that requires it. The refusal names itself; it does not fail open.
+
+CI installs `gcc` where it used to install `python3`. A deployment that pinned the runtime image's
+package list should make the same swap.
+
+### The in-namespace acceptor is no longer a separate process
+
+The enforcement point for egress has to be a socket inside the sandbox's network namespace: an
+`nft` `redirect` is DNAT to the local machine *as that namespace sees it*, so it can only reach a
+socket there. The BEAM runs in the host namespace and no option to `:gen_tcp.listen/2` changes a
+socket's namespace, so the listener was a Python helper entered with `nsenter`.
+
+The third premise is true and irrelevant, which is what was missed. `setns(2)` with `CLONE_NEWNET`
+affects only the calling **thread**, so the socket can be created in the sandbox's namespace on a
+thread of its own and the descriptor adopted with `{:fd, Fd}`. Measured in the isolation image:
+
+    listener adopted from the namespace fd   {:ok, {{0, 0, 0, 0}, 9200}}
+    connect from the HOST namespace          {:error, :econnrefused}
+    connect from INSIDE the namespace        received its bytes
+    SO_ORIGINAL_DST on the accepted socket   readable
+
+The `econnrefused` is the load-bearing half: that port does not exist in the host namespace, so
+the socket demonstrably is not there.
+
+Because the acceptor is now a process on this node, `ExSandbox.Egress.Pool.decide/3` is an
+ordinary function call. Everything that existed only to bridge the process boundary is gone rather
+than simplified: the `AF_UNIX` verdict socket and its wire format, a second `AF_UNIX` socket and
+length-prefixed frame for DNS, the sandbox's identity passed on `argv`, a readiness line parsed
+off stdout, and the `chmod` widening whose absence silently dropped every datagram. Net −713 lines.
+
+All private modules — none appeared in `priv/boundary.md`, so the package contract is unchanged.
+
+### `SO_MARK` on the relay's upstream socket was failing open
+
+The acceptor's own upstream connect is caught by the redirect it exists to serve, so it needs
+`meta mark 42 return` to exempt itself. `ExSandbox.Egress.Relay` set that mark with
+`raw: {1, 36, _}` on `:gen_tcp.connect/4`. Measured with `CAP_NET_ADMIN` and `CAP_NET_RAW` dropped:
+the connect returns `:ok`, `:inet.setopts/2` returns `:ok`, and reading the option back yields
+`<<0, 0, 0, 0>>`. `:inet` swallows the kernel's `EPERM`. The Python helper failed closed only
+because CPython raised `OSError` on the same call.
+
+⚠️ The symptom of a lost mark is a **permitted** destination timing out, which reads as an
+unreachable network rather than as a broken enforcement point — and every denial check still
+passes, because denial is unaffected.
+
+The mark is now written, read back, and compared inside the NIF before any descriptor is returned:
+`{:error, :setsockopt_mark, 1}` under the same capability drop, and no fd. An unmarked upstream is
+unrepresentable rather than merely unlikely. The test that guarded this previously asserted the
+*presence of the option that was the bug*, so it passed in exactly the configuration where the
+mark was silently dropped.
+
+### One guarantee is now demonstrated less well, and the census records it
+
+`ExSandbox.Mechanism.Beam` published the verdict socket's path as `context.policy_handle`, and
+`FR-011b` demonstrated "a tenant cannot widen its own allowlist" by attempting to write it from
+inside a sandbox. There is no socket any more, and no filesystem artefact of any kind carries the
+allowlist — it lives in `ExSandbox.Egress.Registry`, in this BEAM's memory, which a tenant has no
+route to.
+
+The guarantee is stronger and the evidence for it weaker. `docker/census-baseline.txt` was raised
+from 8 to 9 with the reason recorded there, because a ceiling that moves without one is how a
+suite reports fewer guarantees every release and stays green the whole way.
+
 ## 1.0.1 — 2026-08-28
 
 ### `boundary.md` moved to `priv/`, so the documented lookup resolves

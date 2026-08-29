@@ -1,7 +1,93 @@
+defmodule Mix.Tasks.Compile.NetnsNif do
+  @moduledoc false
+  # Builds `c_src/netns_nif.c` into `priv/netns_nif.so`.
+  #
+  # Hand-rolled rather than `elixir_make` so the library keeps its single
+  # runtime dependency and its dependency tree stays assertable (see
+  # `test/dependency_tree_test.exs`). The whole build is two `cc` arguments;
+  # taking on a build dependency to express that is a poor trade.
+  #
+  # ⚠️ A failure here is a WARNING, never an error. Two reasons, and both are
+  # about where refusal belongs:
+  #
+  #   * Off Linux there is no `setns(2)` and nothing to build. macOS consumers
+  #     use `Mechanism.Docker`, which sets `--network none` and never reaches
+  #     the egress path at all. Failing their build for a file they cannot use
+  #     would be gratuitous.
+  #
+  #   * On Linux without a C compiler, the honest outcome is that namespace-local
+  #     sockets are unavailable -- which `ExSandbox.Egress.NetnsSocket.available?/0`
+  #     reports and the capability check turns into a refusal to launch. That is
+  #     this project's discipline: refuse at the point the capability is wanted,
+  #     with a reason, rather than at a point where the reason is lost.
+  use Mix.Task.Compiler
+
+  @source "c_src/netns_nif.c"
+  @target "priv/netns_nif.so"
+
+  @impl true
+  def run(_args) do
+    if :os.type() == {:unix, :linux}, do: build(), else: :noop
+  end
+
+  @impl true
+  def clean, do: File.rm(@target)
+
+  defp build do
+    cond do
+      not File.exists?(@source) -> :noop
+      fresh?() -> :noop
+      true -> compile()
+    end
+  end
+
+  # `mtime` rather than a content hash: the source is one file with no
+  # includes of our own, so there is nothing a hash would catch that a
+  # timestamp does not.
+  defp fresh? do
+    with {:ok, %{mtime: target}} <- File.stat(@target, time: :posix),
+         {:ok, %{mtime: source}} <- File.stat(@source, time: :posix) do
+      target >= source
+    else
+      _ -> false
+    end
+  end
+
+  defp compile do
+    case System.find_executable("cc") || System.find_executable("gcc") do
+      nil ->
+        warn("no C compiler (cc/gcc) on PATH")
+
+      cc ->
+        File.mkdir_p!("priv")
+        include = Path.join([to_string(:code.root_dir()), "usr", "include"])
+
+        args = ["-O2", "-fPIC", "-shared", "-o", @target, @source, "-I" <> include]
+
+        case System.cmd(cc, args, stderr_to_stdout: true) do
+          {_, 0} -> :ok
+          {output, _} -> warn("#{cc} failed:\n#{output}")
+        end
+    end
+  end
+
+  defp warn(reason) do
+    Mix.shell().info([
+      :yellow,
+      "ex_sandbox: netns_nif not built -- #{reason}.\n",
+      "  Namespace-local sockets are unavailable, so ExSandbox.Mechanism.Beam\n",
+      "  will refuse to launch sandboxes that require network restriction.",
+      :reset
+    ])
+
+    :noop
+  end
+end
+
 defmodule ExSandbox.MixProject do
   use Mix.Project
 
-  @version "1.0.1"
+  @version "1.1.0"
   @source_url "https://github.com/FoundryStack/ex_sandbox"
 
   def project do
@@ -14,6 +100,7 @@ defmodule ExSandbox.MixProject do
       # library was for (T003).
       elixir: "~> 1.14",
       elixirc_paths: elixirc_paths(Mix.env()),
+      compilers: [:netns_nif] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
@@ -41,13 +128,16 @@ defmodule ExSandbox.MixProject do
       "than confine partially."
   end
 
-  # ⚠️ `priv/` is not optional and is the easiest thing here to lose.
-  # `ExSandbox.Egress.Acceptor` launches `priv/egress/nsacceptor.py` by resolved
-  # path inside each sandbox's network namespace. A tarball without it builds,
-  # installs, compiles and passes every unit test in a consumer's tree -- and then
-  # every policed launch fails where the acceptor is spawned, which is the last
-  # place a reader looks for a packaging defect. T8.2 verifies the built tarball
-  # with `tar tzf` rather than trusting this list, for exactly that reason.
+  # ⚠️ `c_src/` is not optional and is the easiest thing here to lose.
+  # `Mix.Tasks.Compile.NetnsNif` builds `c_src/netns_nif.c` into
+  # `priv/netns_nif.so` in the CONSUMER's tree, and without it
+  # `ExSandbox.Egress.NetnsSocket.available?/0` is false on every host. A tarball
+  # missing it builds, installs, compiles and passes every unit test -- and then
+  # every policed launch refuses, which is the last place a reader looks for a
+  # packaging defect. The refusal at least names itself; the same omission under
+  # the Python helper this replaced produced a failure at spawn time instead.
+  # T8.2 verifies the built tarball with `tar tzf` rather than trusting this
+  # list, for exactly that reason.
   #
   # ⚠️ `boundary.md` lives under `priv/` and NOT under `docs/`, and that is a
   # correctness requirement rather than a filing preference. It is READ AT
@@ -72,15 +162,22 @@ defmodule ExSandbox.MixProject do
         "GitHub" => @source_url,
         "Changelog" => @source_url <> "/blob/main/CHANGELOG.md"
       },
-      files: ~w(lib priv docs mix.exs README.md CHANGELOG.md LICENSE),
-      # ⚠️ MEASURED, not precautionary. The first `mix hex.build` shipped
-      # `priv/egress/__pycache__/nsacceptor.cpython-313.pyc` -- a Python bytecode
-      # cache CPython writes beside the acceptor the first time it is imported. It
-      # is untracked by git, so nothing in the repository hinted at it; `files:`
-      # globs the working directory, not the index. A stale `.pyc` compiled by a
-      # different CPython is at best dead weight in the tarball and at worst what
-      # a consumer's interpreter loads instead of the source beside it.
-      exclude_patterns: ["priv/egress/__pycache__"]
+      files: ~w(lib c_src priv docs mix.exs README.md CHANGELOG.md LICENSE),
+      # ⚠️ MEASURED, not precautionary, and the lesson outlived the file that
+      # taught it. The first `mix hex.build` shipped
+      # `priv/egress/__pycache__/nsacceptor.cpython-313.pyc` -- a bytecode cache
+      # CPython wrote beside the acceptor the first time it was imported.
+      # Untracked by git, so nothing in the repository hinted at it: `files:`
+      # globs the working directory, not the index.
+      #
+      # The Python is gone, so that pattern would now exclude nothing. What
+      # replaced it is the same mistake one build later: `Mix.Tasks.Compile.NetnsNif`
+      # writes `priv/netns_nif.so`, which is equally untracked and equally
+      # globbed. Shipping it would put the maintainer's architecture in every
+      # consumer's tarball, and the compiler skips a target newer than its
+      # source, so the wrong binary would be preferred to building the right
+      # one. `c_src/` ships instead and the consumer builds it.
+      exclude_patterns: ["priv/netns_nif.so"]
     ]
   end
 
