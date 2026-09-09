@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0 — 2026-09-09
+
+### `ExSandbox.Sandbox` gains `user`, and it decides the uid a container writes as
+
+`user` is the uid -- or `"uid:gid"`, or a name -- the sandbox's processes run as. Like
+`workspace_path` and `service_port` it is **not** opaque: `ExSandbox.Mechanism.Docker` reads it and
+passes `--user`.
+
+* `user: nil` -- no flag, so the image decides. This is the posture every sandbox had before the
+  field existed, and a host that never sets it keeps it.
+* `user: "1000"` / `"1000:1000"` / `"app:staff"` -- passed to `docker create --user` verbatim.
+  Never parsed: `--user` accepts all three forms, and ruling here on which one a caller meant would
+  be this library deciding something about the host's own accounts. An unusable value is refused by
+  the daemon, with its own message.
+
+**Why it belongs here rather than in each host's image.** A `workspace_path` is one directory two
+processes write: the sandbox, and the host process that supplied the directory and afterwards has
+to read, copy, stage or delete what the sandbox left in it. When those run as different uids, every
+path the sandbox creates is one the host cannot touch. `check_workspace/1` already names this
+failure class in its own comment -- *a failure that surfaces later, in another process, as a
+permission error naming nothing* -- and stops where it does because whoever owns the directory owns
+creating it. The uid the container writes as belongs to that same owner.
+
+A host can bake the number into its own image with a `USER` instead, and that is the weaker answer:
+an image's `USER` is fixed at build time, while the uid that has to merge the sandbox's writes is a
+fact about the host. Two hosts with different uids cannot then share one image, and a host that
+does not build the image it runs has no answer at all.
+
+`ExSandbox.Mechanism.Beam` ignores the field; a peer node already runs as whoever started the VM.
+
 ## 1.2.0 — 2026-08-29
 
 ### A mechanism can report where a sandbox is reachable

@@ -35,6 +35,7 @@ defmodule ExSandbox.Sandbox do
           mechanism_ref: String.t() | nil,
           workspace_path: String.t() | nil,
           service_port: :inet.port_number() | nil,
+          user: String.t() | nil,
           context: term()
         }
 
@@ -77,6 +78,27 @@ defmodule ExSandbox.Sandbox do
     # cannot be handed the same host port by two callers who each checked it
     # was free.
     :service_port,
+    # The uid (or `"uid:gid"`) the sandbox's processes run as, or `nil`.
+    #
+    # ⚠️ NOT opaque either, and it exists for `workspace_path`. A bind mount is
+    # one directory two processes write: the sandbox, and the host process that
+    # supplied the directory and has to read, copy or delete what the sandbox
+    # left in it. When the two run as different uids, every path the sandbox
+    # creates is one the host cannot touch -- which is the failure
+    # `check_workspace/1` in the Docker mechanism already names in its own
+    # comment, *a failure that surfaces later, in another process, as a
+    # permission error naming nothing.* The host is what knows which uid has to
+    # merge the result; the mechanism is what knows how to ask for it.
+    #
+    # A host can bake the number into its own image instead, and that is the
+    # weaker answer: an image's `USER` is fixed at build time while the uid that
+    # has to merge the writes is a fact about the host, so two hosts with
+    # different uids cannot share one image, and a host that does not own the
+    # image it runs has no answer at all.
+    #
+    # `nil` means the image decides, which is the posture every sandbox had
+    # before this field existed.
+    :user,
     context: nil
   ]
 end

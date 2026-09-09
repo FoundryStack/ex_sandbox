@@ -600,6 +600,7 @@ defmodule ExSandbox.Mechanism.Docker do
       limit_args(sandbox) ++
       network_args(sandbox) ++
       workspace_args(sandbox.workspace_path) ++
+      user_args(sandbox.user) ++
       [image(sandbox) | @keepalive]
   end
 
@@ -671,6 +672,15 @@ defmodule ExSandbox.Mechanism.Docker do
       @workspace_mountpoint
     ]
   end
+
+  # ⚠️ Passed through, never parsed. `docker create --user` accepts a uid, a
+  # name, and either with a group after a colon; deciding here which of those a
+  # caller meant would be this library making a decision about the host's own
+  # accounts. An unusable value is refused by the daemon, with its own message,
+  # at `create`.
+  defp user_args(nil), do: []
+  defp user_args(user) when is_binary(user) and user != "", do: ["--user", user]
+  defp user_args(_other), do: []
 
   defp image(%Sandbox{template_ref: ref}) when is_binary(ref) and ref != "", do: ref
   defp image(_sandbox), do: @default_image
