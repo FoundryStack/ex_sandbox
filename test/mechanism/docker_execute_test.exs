@@ -82,6 +82,30 @@ defmodule ExSandbox.Mechanism.DockerExecuteTest do
       assert {:error, {:could_not_run, :not_provisioned}} =
                Docker.execute(sandbox(), {"echo", ["hi"]}, [])
     end
+
+    # ⚠️ The client reports this one on STDOUT. MEASURED 2026-09-10, engine
+    # 27.4.0: `docker exec <id> no-such-binary` exits 126 and writes "OCI
+    # runtime exec failed ... executable file not found" to its own stdout,
+    # leaving stderr empty -- so the `client_error?(stderr)` classification saw
+    # nothing and this arrived as `{:ok, %{exit_status: 126}}`, a command that
+    # never ran reported as a result. Found while writing the tutorial, not by
+    # a test: every existing case here reaches a binary that exists.
+    test "a binary that is not in the sandbox could not run, and is not an exit status" do
+      assert {:error, {:could_not_run, reason}} =
+               Docker.execute(running(), {"no-such-binary", []}, [])
+
+      assert is_binary(reason) and reason =~ "executable file not found",
+             "the refusal must carry the client's own reason: #{inspect(reason)}"
+    end
+
+    test "a tenant command that exits 126 on its own is still a result" do
+      # The guard against overcorrecting: 126 and 127 are statuses a shell hands
+      # out for its own reasons, and classifying on the status alone would turn
+      # every one of them into "did not run".
+      assert {:ok, completion} = Docker.execute(running(), {"sh", ["-c", "exit 126"]}, [])
+
+      assert completion.exit_status == 126
+    end
   end
 
   describe "output capture" do

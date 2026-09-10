@@ -222,10 +222,24 @@ defmodule ExSandbox.MixProject do
       ],
       extras: [
         "README.md",
-        "CHANGELOG.md",
+        "docs/getting-started.md",
+        "docs/how-to/implement-a-mechanism.md",
+        "docs/how-to/read-a-refusal.md",
+        "docs/explanation/refusal.md",
         "docs/requirement-ids.md",
         "docs/provenance.md",
-        "priv/boundary.md"
+        "priv/boundary.md",
+        "CHANGELOG.md"
+      ],
+      # Diátaxis, and the four names are the point rather than decoration: a
+      # page that cannot be filed under one of them is usually two pages. The
+      # README is deliberately in no group -- it is the router, and a router
+      # inside one of the four would claim to be that kind of page.
+      groups_for_extras: [
+        Tutorial: ["docs/getting-started.md"],
+        "How-to": [~r{docs/how-to/}],
+        Explanation: [~r{docs/explanation/}],
+        Reference: ["docs/requirement-ids.md", "docs/provenance.md", "priv/boundary.md"]
       ],
       groups_for_modules: [
         Interface: [ExSandbox, ExSandbox.Mechanism, ExSandbox.Sandbox, ExSandbox.Capability],

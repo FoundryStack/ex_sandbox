@@ -175,10 +175,16 @@ defmodule ExSandbox.Mechanism.DockerLifecycleTest do
 
       assert {:ok, running} = Docker.list_running()
 
-      assert Enum.any?(running, &String.starts_with?(started.mechanism_ref, &1)),
+      # ⚠️ Exact membership, not `String.starts_with?/2`. This assertion used to
+      # prefix-match, and that is what hid the defect: `docker ps` prints a
+      # 12-character id while `provision/1` stores the full 64-character one, so
+      # the list a host reconciles against contained none of the refs it
+      # recorded. A prefix match passes on a truncated list; a reconciliation
+      # sweep does not -- it concludes every live sandbox is gone.
+      assert started.mechanism_ref in running,
              "the sandbox's own ref is missing from #{inspect(running)}"
 
-      refute Enum.any?(running, &String.starts_with?(stranger, &1)),
+      refute stranger in running,
              "an unlabelled container was claimed by this mechanism"
     end
   end

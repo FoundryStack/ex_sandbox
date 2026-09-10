@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: `Docker.execute/3` reported "did not run" as an exit status
+
+MEASURED 2026-09-10, Docker Desktop engine 27.4.0: running a binary that is not in the container
+produces exit **126** with `OCI runtime exec failed: ... executable file not found in $PATH` on
+**stdout**, and an empty stderr. The classifier consulted stderr only, so the call returned
+`{:ok, %{exit_status: 126}}` -- collapsing "the command did not run" into "the command ran and
+failed", which `008-FR-016` and `008-FR-026` both forbid: a failed check consumes a refinement
+iteration that an *unperformed* check must not.
+
+It now returns `{:error, {:could_not_run, reason}}`, gated on the wording **and** a status in
+`[126, 127]`. ⚠️ The residual is stated rather than hidden: a tenant command that itself prints
+that wording and exits 126 is misclassified. A tenant that exits 126 on its own is still a result.
+
+### Fixed: `Docker.list_running/0` returned truncated ids, so reconciliation found nothing
+
+`docker ps --format '{{.ID}}'` prints 12 characters; `provision/1` stores the 64-character id in
+`mechanism_ref`. Every ref a host recorded was therefore absent from the list it reconciles
+against, and `003-FR-015`'s post-restart sweep would conclude that every live sandbox was gone.
+Fixed with `--no-trunc`.
+
+⚠️ The lifecycle test asserted with `String.starts_with?/2`, which passes on a truncated list. It
+now asserts exact membership -- prefix-matching in a *host* would be the host taking on this
+mechanism's id format (`FR-004`), and prefix-matching in a *test* is how the defect survived.
+Both defects were found by writing and executing `docs/getting-started.md`, not by review.
+
+### Documentation
+
+The docs are now Diátaxis-shaped, with `groups_for_extras` to match:
+
+* **Tutorial** -- `docs/getting-started.md`, executed end to end by `getting_started_doc_test.exs`
+  against a real daemon rather than trusted.
+* **How-to** -- `docs/how-to/implement-a-mechanism.md`, `docs/how-to/read-a-refusal.md`.
+* **Explanation** -- `docs/explanation/refusal.md`, which promotes the README's *Refusal is the
+  design* and records the four instances of reported-≠-built this repository has shipped.
+* **Reference** -- `docs/requirement-ids.md`, `docs/provenance.md`, `priv/boundary.md`, unchanged.
+
+`README.md` is now a router rather than a second copy of all of it.
+`documentation_pointers_test.exs` scans every `docs/**/*.md` page by wildcard, so a page added and
+forgotten is still checked.
+
 ## 1.3.0 — 2026-09-09
 
 ### `ExSandbox.Sandbox` gains `user`, and it decides the uid a container writes as

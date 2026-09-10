@@ -313,8 +313,25 @@ defmodule ExSandbox.Mechanism.Docker do
 
   @impl true
   def list_running do
+    # ⚠️ `--no-trunc`, and it is the whole point of this call. MEASURED
+    # 2026-09-10, engine 27.4.0: `docker ps --format '{{.ID}}'` prints the
+    # **12-character** id while `docker create` returns and `provision/1` stores
+    # the full 64-character one, so every `mechanism_ref` a host recorded was
+    # absent from this list.
+    #
+    # The callback promises "every `mechanism_ref` this mechanism currently
+    # believes is running", and the sole caller is the post-restart
+    # reconciliation `003-FR-015` describes: a host compares what it recorded
+    # against what this returns and acts on the difference. With truncated ids
+    # the difference is *everything*, so a sweep concludes every live sandbox is
+    # gone -- marking running tenants stopped, or destroying them.
+    #
+    # Prefix-matching in the host is not the fix. The host would be reimplementing
+    # a mechanism's id format, which is the coupling `FR-004` forbids, and a
+    # 12-character prefix is only unique until it is not.
     args = [
       "ps",
+      "--no-trunc",
       "--filter",
       "label=#{@mechanism_label}",
       "--filter",
@@ -529,6 +546,32 @@ defmodule ExSandbox.Mechanism.Docker do
       client_error?(stderr) ->
         {:error, {:could_not_run, String.trim(stderr)}}
 
+      # ⚠️ The same fact arriving on the WRONG STREAM. MEASURED 2026-09-10,
+      # Docker Desktop engine 27.4.0, `linux/arm64`:
+      #
+      #     sh -c "exec docker exec $cid no-such-binary >out 2>err"
+      #     → exit 126
+      #     → out: OCI runtime exec failed: ... executable file not found in $PATH
+      #     → err: (empty)
+      #
+      # The client writes its own launch failure to STDOUT, so the clause above
+      # sees nothing and a command that never started arrived as
+      # `{:ok, %{exit_status: 126}}` -- exactly the collapse `008-FR-016`
+      # forbids, and the one `c:ExSandbox.Mechanism.execute/3` names first among
+      # its three returns ("the binary was not there").
+      #
+      # Both halves are required, and neither is sufficient. The status alone
+      # would misclassify a script that genuinely exited 126 or 127, a status a
+      # shell hands out for its own reasons; the wording alone would misclassify
+      # any tenant command that printed it. Together they still misclassify a
+      # tenant that does BOTH -- measured, `sh -c 'echo OCI runtime exec failed;
+      # exit 127'` arrives as `:could_not_run` -- and that residual is accepted
+      # deliberately: the error it replaced is a command that never ran being
+      # reported as a result, which is the direction `008-FR-016` is written
+      # against.
+      exec_not_started?(stdout, status) ->
+        {:error, {:could_not_run, String.trim(stdout)}}
+
       oom_killed?(sandbox, status) ->
         {:error, {:limit_exceeded, :memory}}
 
@@ -563,6 +606,13 @@ defmodule ExSandbox.Mechanism.Docker do
     absent?(stderr) or unreachable?(stderr) or stderr =~ "is not running" or
       stderr =~ "is paused and must be unpaused"
   end
+
+  # See the `exec_not_started?` clause in `interpret/7` for the measurement.
+  defp exec_not_started?(stdout, status) when status in [126, 127] do
+    stdout =~ "OCI runtime exec failed" or stdout =~ "executable file not found"
+  end
+
+  defp exec_not_started?(_stdout, _status), do: false
 
   # ⚠️ Asked of the kernel, not inferred from the number. 137 is 128 + SIGKILL
   # and SIGKILL has many senders; reporting `:limit_exceeded` on the status

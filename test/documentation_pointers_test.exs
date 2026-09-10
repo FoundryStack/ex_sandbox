@@ -46,11 +46,19 @@ defmodule ExSandbox.DocumentationPointersTest do
 
   # `@provenance` itself lists these names in backticks, so scanning it would
   # report every declared absence as an unresolved reference.
+  # ⚠️ Every `docs/` page EXCEPT `@provenance`, by wildcard rather than
+  # by list. The prose pages are where a citation is most likely to
+  # be written and least likely to be recompiled, so a page added to
+  # `docs/` and forgotten here would be the one place this check is
+  # most needed and least applied. `docs/provenance.md` is excluded
+  # because it lists every declared absence in backticks, so scanning
+  # it would report each one as unresolved.
   @sources Path.wildcard("lib/**/*.ex") ++
              Path.wildcard("test/**/*.exs") ++
              Path.wildcard("docker/*.md") ++
              Path.wildcard("docker/*.txt") ++
-             ["mix.exs", "README.md", "CHANGELOG.md", "docs/requirement-ids.md"]
+             ["mix.exs", "README.md", "CHANGELOG.md"] ++
+             (Path.wildcard("docs/**/*.md") -- [@provenance])
 
   # A backticked token that looks like a file: at least one path segment and one
   # of the extensions this repository actually writes. Deliberately not every
