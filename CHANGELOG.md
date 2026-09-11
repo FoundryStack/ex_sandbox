@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-09-11
 
 ### Fixed: `Docker.execute/3` reported "did not run" as an exit status
 
@@ -43,6 +43,10 @@ The docs are now Diátaxis-shaped, with `groups_for_extras` to match:
 forgotten is still checked.
 
 ## 1.3.0 — 2026-09-09
+
+⚠️ Tagged `v1.3.0` but **never published to Hex** -- the last release there is 1.2.0. Everything
+below reached consumers in 1.4.0, not in a 1.3.0 package. The version is not reused: the tag
+already names a different tree.
 
 ### `ExSandbox.Sandbox` gains `user`, and it decides the uid a container writes as
 
