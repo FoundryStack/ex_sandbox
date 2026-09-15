@@ -239,13 +239,43 @@ defmodule ExSandbox.Capability do
   # an intervening exec (005 R9b). Its absence is not a degraded mode -- it means
   # a cap can be configured and silently not apply, so this reports false.
   defp do_check(:resource_limits, {:unix, :linux}) do
-    if File.exists?("/sys/fs/cgroup/cgroup.controllers") do
-      available(:resource_limits)
-    else
-      unavailable(
-        :resource_limits,
-        "cgroup v2 is not mounted at /sys/fs/cgroup; memory and CPU caps cannot be enforced"
-      )
+    # ⚠️ The mount is NECESSARY AND NOT SUFFICIENT, and probing only the mount
+    # is this repository's recurring defect: a check that passes on evidence
+    # which is not its subject. `/sys/fs/cgroup/cgroup.controllers` exists on
+    # every cgroup-v2 host, including every host where no transient scope can
+    # be created at all -- so this clause reported `available` while
+    # `ExSandbox.Hardening.Linux.build_command/2`'s very first argument was
+    # refused by systemd.
+    #
+    # MEASURED 2026-09-15, Ubuntu 24.04, uid 110: the file is present, and
+    # `systemd-run --scope -p MemoryMax=64M true` answers `Failed to start
+    # transient scope unit: Interactive authentication required.` The launch
+    # never reaches the mechanism, and the capability report said the host
+    # could enforce a memory cap.
+    #
+    # So the question is asked of the thing that answers it: can a scope be
+    # created. `scope_mode/0` attempts one, and the launcher emits whichever
+    # kind it found -- which is what keeps this clause and the launcher from
+    # answering differently about the same host.
+    cond do
+      not File.exists?("/sys/fs/cgroup/cgroup.controllers") ->
+        unavailable(
+          :resource_limits,
+          "cgroup v2 is not mounted at /sys/fs/cgroup; memory and CPU caps cannot be enforced"
+        )
+
+      ExSandbox.Hardening.Linux.scope_mode() == nil ->
+        unavailable(
+          :resource_limits,
+          "cgroup v2 is mounted but no transient systemd scope can be created -- " <>
+            "neither `systemd-run --scope` nor `systemd-run --user --scope` succeeds, " <>
+            "so a configured memory or CPU cap would be accepted and never enforced. " <>
+            "A non-root caller needs a running `user@<uid>.service` (loginctl " <>
+            "enable-linger) and XDG_RUNTIME_DIR pointing at its runtime directory"
+        )
+
+      true ->
+        available(:resource_limits)
     end
   end
 
@@ -652,6 +682,41 @@ defmodule ExSandbox.Capability do
       :disk_quota,
       "APFS has no per-directory quota equivalent that survives the sandbox launch"
     )
+  end
+
+  defp do_check(:privilege_separation, {:unix, :linux}) do
+    # ⚠️ ATTEMPTED, not inferred from `id -u`, and the two answer differently in
+    # both directions -- which is why this clause now reads from
+    # `ExSandbox.Hardening.Linux.can_drop_privilege?/0`, the function that
+    # already ran the real `setpriv --reuid`. That file's own comment block
+    # asks for exactly this ("must stay identical to"), and the copy here had
+    # drifted into asking a proxy question.
+    #
+    # MEASURED 2026-09-15 on Ubuntu 24.04, as an unprivileged account, inside a
+    # user namespace it created itself:
+    #
+    #     unshare --user --map-root-user -- id -u              -> 0
+    #     unshare --user --map-root-user -- setpriv --reuid=1000 ... id -u
+    #       -> setresuid failed: Invalid argument
+    #     unshare --user --map-auto --map-root-user -- setpriv --reuid=1000 ...
+    #       -> 1000
+    #
+    # `id -u` says 0 in all three. --map-root-user maps exactly ONE uid, so
+    # there is no second uid to drop to however root the process looks; adding
+    # a subordinate range makes the same drop succeed. A host would have been
+    # told it had privilege separation while it did not, and -- a real
+    # deployment shape, not a hypothetical -- told it had none while it had it.
+    if ExSandbox.Hardening.Linux.can_drop_privilege?() do
+      available(:privilege_separation)
+    else
+      unavailable(
+        :privilege_separation,
+        "`setpriv --reuid` cannot reach a second uid from this process, so a sandbox " <>
+          "cannot be dropped to its own. Either run as root, or enter a user namespace " <>
+          "that maps a subordinate range (`unshare --user --map-auto --map-root-user`, " <>
+          "with an /etc/subuid entry for this account)"
+      )
+    end
   end
 
   defp do_check(:privilege_separation, {:unix, _}) do

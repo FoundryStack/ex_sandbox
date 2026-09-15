@@ -262,27 +262,58 @@ defmodule ExSandbox.Hardening.Linux do
   end
 
   defp systemd_run_args(limits, sandbox) do
-    [
-      "--scope",
-      "--quiet",
-      # ⚠️ A **named** unit, so the scope can be queried after the sandbox dies
-      # (R7e). Without it systemd auto-names `run-<hash>.scope`, and the cause of
-      # death is unrecoverable: the cgroup directory is removed the instant the
-      # last process exits, so `memory.events` is gone before anything observes
-      # it. The unit object survives in `failed` state and reports
-      # `Result=oom-kill`, which is what distinguishes a tenant's cap breach
-      # (`:resource_cap`) from a platform fault (`:mechanism_error`).
-      "--unit=#{scope_unit_name(sandbox)}",
-      "-p",
-      "MemoryMax=#{limits.memory_mb}M",
-      "-p",
-      "CPUQuota=#{limits.cpu_percent}%",
-      # `MemorySwapMax=0`: without it a sandbox at its memory cap swaps instead
-      # of being killed, so the cap bounds RSS rather than consumption and one
-      # tenant can still exhaust the host's IO.
-      "-p",
-      "MemorySwapMax=0"
-    ]
+    # ⚠️ `--user` or nothing, decided by MEASUREMENT rather than by assumption,
+    # and this is the one place the two can disagree. `probe_cgroups/0` has
+    # always asked `writable_cgroup?/0`, which has always probed a **--user**
+    # scope -- while this function emitted a **system** scope. On a host where
+    # both work (root, or a polkit rule) the inconsistency is invisible. On a
+    # host where only the user scope works, the tier probe reported the
+    # facility present and every launch was then refused by systemd with
+    # `Failed to start transient scope unit: Interactive authentication
+    # required`, naming polkit rather than the mismatch.
+    #
+    # MEASURED 2026-09-15, Ubuntu 24.04, uid 110, no polkit rule, linger on:
+    #
+    #     systemd-run --scope -p MemoryMax=64M true
+    #       -> Failed to start transient scope unit: Interactive
+    #          authentication required.
+    #     systemd-run --user --scope -p MemoryMax=64M -- \
+    #       sh -c 'cat /sys/fs/cgroup$(cut -d: -f3 </proc/self/cgroup)/memory.max'
+    #       -> 67108864
+    #
+    # polkit reads the caller's uid off the bus, so no amount of namespace work
+    # changes the first line: a non-root caller on a headless host cannot
+    # create a system scope, full stop. The second line is a real bound, read
+    # back from inside the scope it applies to.
+    scope_kind_args() ++
+      [
+        "--scope",
+        "--quiet",
+        # ⚠️ A **named** unit, so the scope can be queried after the sandbox dies
+        # (R7e). Without it systemd auto-names `run-<hash>.scope`, and the cause of
+        # death is unrecoverable: the cgroup directory is removed the instant the
+        # last process exits, so `memory.events` is gone before anything observes
+        # it. The unit object survives in `failed` state and reports
+        # `Result=oom-kill`, which is what distinguishes a tenant's cap breach
+        # (`:resource_cap`) from a platform fault (`:mechanism_error`).
+        "--unit=#{scope_unit_name(sandbox)}",
+        "-p",
+        "MemoryMax=#{limits.memory_mb}M",
+        "-p",
+        "CPUQuota=#{limits.cpu_percent}%",
+        # `MemorySwapMax=0`: without it a sandbox at its memory cap swaps instead
+        # of being killed, so the cap bounds RSS rather than consumption and one
+        # tenant can still exhaust the host's IO.
+        "-p",
+        "MemorySwapMax=0"
+      ]
+  end
+
+  defp scope_kind_args do
+    case scope_mode() do
+      :user -> ["--user"]
+      _ -> []
+    end
   end
 
   @doc """
@@ -960,8 +991,62 @@ defmodule ExSandbox.Hardening.Linux do
 
   defp executable_present?(name), do: System.find_executable(name) != nil
 
-  defp writable_cgroup? do
-    case System.cmd("systemd-run", ["--scope", "--quiet", "--user", "true"],
+  defp writable_cgroup?, do: scope_mode() != nil
+
+  @doc """
+  Which kind of transient `systemd-run` scope this host can actually create:
+  `:system`, `:user`, or `nil` when neither.
+
+  Public because `ExSandbox.Capability`'s `:resource_limits` clause must read
+  this answer rather than compute its own. ⚠️ That clause used to ask only
+  `File.exists?("/sys/fs/cgroup/cgroup.controllers")`, which is true on every
+  cgroup-v2 host including the ones where no scope can be created at all -- so
+  it reported a bound that the launcher was then refused. Two probes of one
+  question are two things that must stay equal forever, and this file already
+  records that lesson twice.
+
+  ## Memoised, and why that is the right trade
+
+  Each answer costs two process spawns, and `compose/3` runs per launch. The
+  cost of memoising is that a host which gains or loses the facility mid-run
+  keeps the old answer until the node restarts -- and that is acceptable
+  precisely because the facility is a property of the host's polkit and systemd
+  configuration, which does not change under a running release without an
+  operator doing it.
+  """
+  @spec scope_mode() :: :system | :user | nil
+  def scope_mode do
+    case :persistent_term.get({__MODULE__, :scope_mode}, :unmeasured) do
+      :unmeasured ->
+        mode = measure_scope_mode()
+        :persistent_term.put({__MODULE__, :scope_mode}, mode)
+        mode
+
+      mode ->
+        mode
+    end
+  end
+
+  @doc false
+  # Exposed for tests, which must be able to re-measure a host whose facilities
+  # a fixture just changed.
+  def forget_scope_mode, do: :persistent_term.erase({__MODULE__, :scope_mode})
+
+  # ⚠️ System scope FIRST, and the order is not arbitrary. A root supervisor --
+  # the posture this library was written for -- gets a system scope, whose unit
+  # survives its sandbox's death and is what `provision_failure_reason/1` reads
+  # `Result=oom-kill` out of. A user scope's unit is owned by the per-user
+  # manager and is the fallback, not the preference.
+  defp measure_scope_mode do
+    cond do
+      scope_creatable?([]) -> :system
+      scope_creatable?(["--user"]) -> :user
+      true -> nil
+    end
+  end
+
+  defp scope_creatable?(kind) do
+    case System.cmd("systemd-run", ["--scope", "--quiet"] ++ kind ++ ["true"],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true
@@ -971,7 +1056,21 @@ defmodule ExSandbox.Hardening.Linux do
     _ -> false
   end
 
-  defp can_drop_privilege? do
+  @doc """
+  Whether this process can actually drop to another uid.
+
+  ⚠️ Public because `ExSandbox.Capability` must read this rather than ask
+  `id -u` and infer. `id -u` reporting 0 is not the question -- the question is
+  whether `setpriv --reuid` reaches a second uid, and the two answer
+  differently in both directions. Inside a user namespace created with
+  `--map-root-user` alone, `id -u` is 0 and the drop fails with `setresuid
+  failed: Invalid argument` because exactly one uid is mapped; add a
+  subordinate range with `--map-auto` and the same process can drop. That host
+  was being told it had no privilege separation while it had it, and would have
+  been told it had it while it did not.
+  """
+  @spec can_drop_privilege?() :: boolean()
+  def can_drop_privilege? do
     # Actually attempts the drop. `setpriv` exits non-zero when it cannot.
     case System.cmd("setpriv", ["--reuid=65534", "--regid=65534", "--clear-groups", "true"],
            stderr_to_stdout: true
