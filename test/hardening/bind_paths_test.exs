@@ -24,7 +24,7 @@ defmodule ExSandbox.Hardening.BindPathsTest do
   than asking for one. Both are checked here against the *running* host, so the
   assertion is about a real layout rather than an assumed one.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias ExSandbox.Hardening.Linux
 
@@ -108,6 +108,44 @@ defmodule ExSandbox.Hardening.BindPathsTest do
 
       refute "/etc" in (sources ++ bind_sources(args())),
              "the whole of /etc is in the mount view; only the trust store may be"
+    end
+  end
+
+  describe "extra_ro_binds" do
+    setup do
+      previous = Application.get_env(:ex_sandbox, :beam)
+      on_exit(fn -> Application.put_env(:ex_sandbox, :beam, previous || []) end)
+    end
+
+    test "binds each configured path read-only at the same path" do
+      Application.put_env(
+        :ex_sandbox,
+        :beam,
+        Keyword.put(Application.get_env(:ex_sandbox, :beam, []), :extra_ro_binds, [
+          "/run/pooler"
+        ])
+      )
+
+      args = args()
+
+      i =
+        Enum.find_index(
+          Enum.chunk_every(args, 3, 1),
+          &(&1 == ["--ro-bind", "/run/pooler", "/run/pooler"])
+        )
+
+      assert i, "no --ro-bind /run/pooler /run/pooler in #{inspect(args)}"
+      refute "/run/pooler" in bind_sources(args), "the configured path was bound read-write"
+    end
+
+    test "refuses a relative path rather than binding it" do
+      Application.put_env(
+        :ex_sandbox,
+        :beam,
+        Keyword.put(Application.get_env(:ex_sandbox, :beam, []), :extra_ro_binds, ["run/pooler"])
+      )
+
+      assert_raise ArgumentError, ~r/absolute paths/, fn -> args() end
     end
   end
 

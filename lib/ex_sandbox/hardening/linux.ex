@@ -356,6 +356,7 @@ defmodule ExSandbox.Hardening.Linux do
       runtime_ro_binds() ++
       resolv_conf_bind() ++
       trust_store_binds() ++
+      extra_ro_binds() ++
       [
         "--bind",
         storage,
@@ -444,6 +445,37 @@ defmodule ExSandbox.Hardening.Linux do
     ["/etc/ssl/certs", "/etc/pki/ca-trust/extracted", "/etc/pki/tls/certs"]
     |> Enum.filter(&File.dir?/1)
     |> Enum.flat_map(&["--ro-bind", &1, &1])
+  end
+
+  # The deployment's own read-only paths, each bound at the same path inside.
+  #
+  # The case this exists for is a database reached over a unix socket: the
+  # sandbox has a private network namespace, so a pooler on the host is only
+  # reachable through a socket directory in the mount view. An allowlist entry
+  # cannot stand in for it, because `ExSandbox.Egress.HostAliases` refuses every
+  # address of this host, and widening that check to admit one listener would
+  # admit all of them.
+  #
+  # ⚠️ Read-only, and resolved AFTER `setpriv`: the directory must be
+  # searchable by the sandbox uid, or `bwrap` refuses the launch. A connect to
+  # a socket on a read-only bind still succeeds, since the read-only flag
+  # governs files, directories and links rather than sockets.
+  #
+  # Not filtered by existence, unlike the runtime binds. A path the deployment
+  # named and the host lacks is a misconfiguration, and `bwrap` refusing it
+  # names the path; dropping it would launch a sandbox missing the one thing
+  # it was configured to reach.
+  defp extra_ro_binds do
+    Application.get_env(:ex_sandbox, :beam, [])
+    |> Keyword.get(:extra_ro_binds, [])
+    |> Enum.flat_map(fn path ->
+      unless is_binary(path) and Path.type(path) == :absolute do
+        raise ArgumentError,
+              "config :ex_sandbox, :beam, extra_ro_binds: expected absolute paths, got #{inspect(path)}"
+      end
+
+      ["--ro-bind", path, path]
+    end)
   end
 
   defp resolver_for_tenant do
