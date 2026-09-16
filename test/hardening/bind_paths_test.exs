@@ -91,6 +91,26 @@ defmodule ExSandbox.Hardening.BindPathsTest do
     end
   end
 
+  describe "trust store" do
+    # Without it an allowlisted HTTPS destination is permitted by egress and
+    # then refused by TLS: `curl: (77) error setting certificate file`.
+    test "is bound read-only when the host keeps one under /etc" do
+      expected =
+        Enum.filter(
+          ["/etc/ssl/certs", "/etc/pki/ca-trust/extracted", "/etc/pki/tls/certs"],
+          &File.dir?/1
+        )
+
+      sources = ro_bind_sources(args())
+
+      assert Enum.all?(expected, &(&1 in sources)),
+             "trust store directories #{inspect(expected)} not all in #{inspect(sources)}"
+
+      refute "/etc" in (sources ++ bind_sources(args())),
+             "the whole of /etc is in the mount view; only the trust store may be"
+    end
+  end
+
   defp bind_sources(args) do
     args
     |> Enum.with_index()

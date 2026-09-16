@@ -355,6 +355,7 @@ defmodule ExSandbox.Hardening.Linux do
     ] ++
       runtime_ro_binds() ++
       resolv_conf_bind() ++
+      trust_store_binds() ++
       [
         "--bind",
         storage,
@@ -417,6 +418,32 @@ defmodule ExSandbox.Hardening.Linux do
       nil -> []
       path -> ["--ro-bind", path, "/etc/resolv.conf"]
     end
+  end
+
+  # ⚠️ **Without this an allowlist entry on port 443 is dead**, the same way
+  # `resolv_conf_bind/0` keeps a hostname entry alive. MEASURED 2026-09-16 on
+  # an Ubuntu 26.04 production host, a sandbox allowlisted to `example.com:443`:
+  #
+  #     curl: (77) error setting certificate file: /etc/ssl/certs/ca-certificates.crt
+  #
+  # The egress decision permitted the connection and TLS could not start,
+  # because nothing under `/etc` is in the mount view. OpenSSL, `curl`, and
+  # OTP's `:public_key.cacerts_get/0` (what `mix deps.get` verifies hex.pm
+  # with) all look for the trust store under `/etc` by fixed path.
+  #
+  # Only the trust store, never `/etc`: `/etc` carries the host's account
+  # database and service configuration, which FR-010 keeps out of view. These
+  # are public certificates and nothing else. Debian's bundle is a regular file
+  # in `/etc/ssl/certs`, and its per-certificate symlinks point into
+  # `/usr/share/ca-certificates`, which the `/usr` bind already covers; the
+  # Fedora layout keeps the extracted bundle under `/etc/pki`.
+  #
+  # Filtered by existence for the reason `runtime_ro_binds/0` records: `bwrap`
+  # refuses a missing source outright.
+  defp trust_store_binds do
+    ["/etc/ssl/certs", "/etc/pki/ca-trust/extracted", "/etc/pki/tls/certs"]
+    |> Enum.filter(&File.dir?/1)
+    |> Enum.flat_map(&["--ro-bind", &1, &1])
   end
 
   defp resolver_for_tenant do
