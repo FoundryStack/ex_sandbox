@@ -58,9 +58,11 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
           #
           # `nil` on a host with no egress path, as with `binding`.
           acceptor_pid: pid() | nil,
-          # `{host_port, service_port}` published on host loopback by `pasta`,
-          # read by `Beam.address/1`. `nil` when the sandbox names no service
-          # port or the launch took no egress path.
+          # `{host_port, ns_port}` pairs published on host loopback by `pasta`,
+          # the `service_port` pair first, read by `Beam.address/1,2`. `nil`
+          # when the sandbox names no service port or the launch took no egress
+          # path. ⚠️ A row persisted by an older version carries one bare pair
+          # instead of a list; `Netns.forward_pairs/1` reads both.
           forward: ExSandbox.Egress.Netns.forward()
         }
 
@@ -132,16 +134,37 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  # The service port is published on a host loopback port picked here. The pick
+  @doc false
+  # Public so `ExSandbox.Mechanism.Beam.NodeLauncherForwardTest` can read the pairs on a host where the
+  # launch path cannot run.
+  #
+  # Each service port is published on a host loopback port picked here. The pick
   # races: another process could take the port between this close and `pasta`'s bind.
-  defp forward(%Sandbox{service_port: port}) when is_integer(port) and port > 0 do
-    {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
-    {:ok, host_port} = :inet.port(socket)
-    :ok = :gen_tcp.close(socket)
-    {host_port, port}
+  #
+  # ⚠️ Every listener is held open until all ports are picked. Closing each one
+  # before opening the next lets the kernel hand the same ephemeral port back,
+  # and two pairs on one host port make `pasta` fail to bind the second.
+  def forward(%Sandbox{service_port: port, extra_service_ports: extra})
+      when is_integer(port) and port > 0 do
+    ns_ports = Enum.uniq([port | Enum.filter(extra, &(is_integer(&1) and &1 > 0))])
+
+    sockets =
+      Enum.map(ns_ports, fn _ns_port ->
+        {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
+        socket
+      end)
+
+    host_ports =
+      Enum.map(sockets, fn socket ->
+        {:ok, host_port} = :inet.port(socket)
+        :ok = :gen_tcp.close(socket)
+        host_port
+      end)
+
+    Enum.zip(host_ports, ns_ports)
   end
 
-  defp forward(%Sandbox{}), do: nil
+  def forward(%Sandbox{}), do: nil
 
   @doc """
   Turns an allowlist into a policed command, or refuses the launch.

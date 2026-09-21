@@ -61,6 +61,32 @@ defmodule ExSandbox.AddressDispatchTest do
     def address(%Sandbox{service_port: port}), do: {:ok, "127.0.0.1:#{port}"}
   end
 
+  defmodule MultiPort do
+    @moduledoc false
+    @behaviour ExSandbox.Mechanism
+
+    @impl true
+    def provision(sandbox), do: {:ok, sandbox}
+    @impl true
+    def start(sandbox), do: {:ok, sandbox}
+    @impl true
+    def stop(sandbox), do: {:ok, sandbox}
+    @impl true
+    def destroy(_sandbox), do: :ok
+    @impl true
+    def status(_sandbox), do: {:ok, :running}
+    @impl true
+    def list_running, do: {:ok, []}
+    @impl true
+    def usage(_sandbox), do: {:ok, %{}}
+    @impl true
+    def execute(_sandbox, {_cmd, _args}, _opts \\ []), do: {:error, :not_supported}
+    @impl true
+    def address(sandbox), do: address(sandbox, sandbox.service_port)
+    @impl true
+    def address(_sandbox, port), do: {:ok, "127.0.0.1:#{port + 50_000}"}
+  end
+
   defp sandbox(overrides \\ []) do
     struct!(
       %Sandbox{
@@ -79,5 +105,24 @@ defmodule ExSandbox.AddressDispatchTest do
 
   test "a mechanism that does not implement it reports no address rather than raising" do
     assert {:ok, nil} = ExSandbox.address(Silent, sandbox(service_port: 4000))
+  end
+
+  describe "address/3" do
+    test "asks a mechanism that implements address/2 for the port" do
+      assert {:ok, "127.0.0.1:54001"} =
+               ExSandbox.address(MultiPort, sandbox(service_port: 4000), 4001)
+    end
+
+    test "falls back to address/1 for the service port of one that does not" do
+      assert {:ok, "127.0.0.1:4000"} =
+               ExSandbox.address(Reachable, sandbox(service_port: 4000), 4000)
+    end
+
+    test "reports no address for any other port of one that does not" do
+      sandbox = sandbox(service_port: 4000, extra_service_ports: [4001])
+
+      assert {:ok, nil} = ExSandbox.address(Reachable, sandbox, 4001)
+      assert {:ok, nil} = ExSandbox.address(Silent, sandbox, 4000)
+    end
   end
 end

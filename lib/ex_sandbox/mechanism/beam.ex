@@ -28,6 +28,7 @@ defmodule ExSandbox.Mechanism.Beam do
 
   @behaviour ExSandbox.Mechanism
 
+  alias ExSandbox.Egress.Netns
   alias ExSandbox.Mechanism.Beam.Exec
   alias ExSandbox.Mechanism.Beam.NodeLauncher
   alias ExSandbox.Sandbox
@@ -1313,6 +1314,7 @@ defmodule ExSandbox.Mechanism.Beam do
 
   # `"127.0.0.1:<host_port>"`, the loopback port `pasta` publishes the sandbox's
   # `service_port` on (`NodeLauncher.launch/2`, `Netns.pasta_command/4`).
+  # `address/2` answers the same for any port in `extra_service_ports`.
   #
   # `nil` when the sandbox names no service port, and also when it is not
   # running: a stopped row keeps its old forward, but nothing listens on it.
@@ -1329,12 +1331,39 @@ defmodule ExSandbox.Mechanism.Beam do
     end
   end
 
+  @impl true
+  def address(%Sandbox{} = sandbox, port) do
+    case lookup_sandbox(sandbox) do
+      {:ok, launched} -> {:ok, address_of(launched, port)}
+      :error -> {:ok, nil}
+    end
+  end
+
   @doc false
   # Public so `ExSandbox.Mechanism.BeamAddressTest` can read a launched row's
   # address on a host where the launch path cannot run.
   def address_of(%{stopped: true}), do: nil
-  def address_of(%{forward: {host_port, _service_port}}), do: "127.0.0.1:#{host_port}"
+
+  def address_of(%{forward: forward}) do
+    case Netns.forward_pairs(forward) do
+      [{host_port, _ns_port} | _] -> "127.0.0.1:#{host_port}"
+      [] -> nil
+    end
+  end
+
   def address_of(_launched), do: nil
+
+  @doc false
+  def address_of(%{stopped: true}, _port), do: nil
+
+  def address_of(%{forward: forward}, port) do
+    case List.keyfind(Netns.forward_pairs(forward), port, 1) do
+      {host_port, ^port} -> "127.0.0.1:#{host_port}"
+      nil -> nil
+    end
+  end
+
+  def address_of(_launched, _port), do: nil
 
   @impl true
   def usage(%Sandbox{} = sandbox) do

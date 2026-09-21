@@ -35,6 +35,7 @@ defmodule ExSandbox.Sandbox do
           mechanism_ref: String.t() | nil,
           workspace_path: String.t() | nil,
           service_port: :inet.port_number() | nil,
+          extra_service_ports: [:inet.port_number()],
           user: String.t() | nil,
           context: term()
         }
@@ -99,6 +100,21 @@ defmodule ExSandbox.Sandbox do
     # `nil` means the image decides, which is the posture every sandbox had
     # before this field existed.
     :user,
+    # More ports inside the sandbox to publish the same way, beside
+    # `service_port`: loopback only, on host ports the mechanism picks, each
+    # read back through `c:ExSandbox.Mechanism.address/2`.
+    #
+    # ⚠️ Meaningful only with a `service_port`. The primary port is what turns
+    # the network on at all, so extra ports on a sandbox that names none are
+    # ignored rather than read as a request to be reachable: a host that fills
+    # this list and forgets the primary keeps the no-network posture, which is
+    # the safe way to be wrong. The use is a second instance of the tenant's
+    # application on `service_port + 1`, started while the first still serves.
+    #
+    # ⚠️ Fixed when the mechanism publishes, like `service_port`: at `create`
+    # for Docker, at launch for Beam. A port added to this list afterwards is
+    # not published by the running sandbox.
+    extra_service_ports: [],
     context: nil
   ]
 end

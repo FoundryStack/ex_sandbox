@@ -145,6 +145,12 @@ defmodule ExSandbox.Egress.Netns do
     }
   end
 
+  @doc "Normalises every accepted `forward()` shape to a list of pairs, primary first."
+  @spec forward_pairs(forward()) :: [forward_pair()]
+  def forward_pairs(nil), do: []
+  def forward_pairs({_host_port, _ns_port} = pair), do: [pair]
+  def forward_pairs(pairs) when is_list(pairs), do: pairs
+
   @doc """
   The commands that install the redirect into a *running* tenant's namespace.
 
@@ -179,8 +185,18 @@ defmodule ExSandbox.Egress.Netns do
   """
   @type resolver :: {String.t() | :inet.ip_address(), :inet.port_number()} | nil
 
-  @typedoc "One inbound TCP port published on host loopback, `{host_port, ns_port}`, or `nil` for none."
-  @type forward :: {:inet.port_number(), :inet.port_number()} | nil
+  @typedoc "One inbound TCP port published on host loopback, `{host_port, ns_port}`."
+  @type forward_pair :: {:inet.port_number(), :inet.port_number()}
+
+  @typedoc """
+  The inbound TCP ports published on host loopback, primary first.
+
+  ⚠️ A bare `forward_pair()` and `nil` are accepted too, and not for
+  convenience: a launched row persisted before a sandbox could publish more
+  than one port carries the single tuple, and `forward_pairs/1` is where every
+  shape becomes the list.
+  """
+  @type forward :: [forward_pair()] | forward_pair() | nil
 
   @spec redirect_commands(pos_integer(), :inet.port_number(), resolver(), forward()) ::
           [[String.t()]]
@@ -275,12 +291,10 @@ defmodule ExSandbox.Egress.Netns do
   # 127.0.0.1:<ns_port> from INSIDE the namespace, so the TCP redirect below
   # catches it as egress and the acceptor refuses it. OBSERVED 2026-09-21 on
   # production: `egress: refused (:not_permitted)` and the host connection
-  # closed. Only the forwarded port is exempt: the connection stays on the
+  # closed. Only the forwarded ports are exempt, one rule each: the connection stays on the
   # namespace's loopback, which reaches nothing outside the sandbox.
-  defp forward_exemption(_holder_pid, nil), do: []
-
-  defp forward_exemption(holder_pid, {_host_port, ns_port}) do
-    [
+  defp forward_exemption(holder_pid, forward) do
+    for {_host_port, ns_port} <- forward_pairs(forward) do
       nsenter(holder_pid, [
         "nft",
         "add",
@@ -296,7 +310,7 @@ defmodule ExSandbox.Egress.Netns do
         "#{ns_port}",
         "return"
       ])
-    ]
+    end
   end
 
   # ⚠️ **This closes a measured hole, not a theoretical one.** Phase 0's
@@ -567,7 +581,7 @@ defmodule ExSandbox.Egress.Netns do
   | flag | what the default does |
   |---|---|
   | `--no-map-gw` | maps the namespace's default gateway to the **host**, so the host is reachable at the gateway address |
-  | `-t none` | `-t auto` forwards **inbound TCP**: a tenant binding `0.0.0.0:8080` binds `0.0.0.0:8080` *on the host* (`FR-018`). With a `forward`, `-t 127.0.0.1/<host>:<ns>` instead: one port, host loopback only |
+  | `-t none` | `-t auto` forwards **inbound TCP**: a tenant binding `0.0.0.0:8080` binds `0.0.0.0:8080` *on the host* (`FR-018`). With a `forward`, one `-t 127.0.0.1/<host>:<ns>` per pair instead: named ports, host loopback only |
   | `-T none` | the same for TCP in the outbound-to-host direction |
   | `-u none` | `-u auto` forwards inbound **UDP** |
   | `-U none` | the same for UDP in the outbound-to-host direction |
@@ -582,12 +596,20 @@ defmodule ExSandbox.Egress.Netns do
 
   ⚠️ **`-t none` deliberately disables inbound forwarding, and `forward`
   narrows it rather than re-widening it.** Given `{host_port, ns_port}`, `-t
-  none` becomes `-t 127.0.0.1/<host_port>:<ns_port>`: one named port instead of
+  none` becomes `-t 127.0.0.1/<host_port>:<ns_port>`: named ports instead of
   every port the tenant chooses to bind, bound on host loopback only. Measured
   on the production host (2026-09-21): `ss -ltn` showed `127.0.0.1:<host_port>`
   and nothing else, and a host `curl` reached the server in the namespace.
   `-T`, `-u`, `-U` and `--no-map-gw` do not change, so the tenant still cannot
   reach the host. `nil` is today's `-t none`, byte for byte.
+
+  ⚠️ **Several pairs are several `-t` flags, not one comma list.** `pasta(1)`
+  documents `-t` as repeatable, and a comma list shares one address prefix and
+  one host-to-namespace mapping across its ports, which cannot say "host 52111
+  to 4000 and host 52112 to 4001". Each pair is exempted from the egress
+  redirect on its own (`redirect_commands/4`): pasta splices every forwarded
+  port through namespace loopback, so a pair published here and missing there
+  answers the host with a closed connection.
 
   ⚠️ This function builds a command. That the flags are **passed** is all a
   command-string assertion can show; that they **close the doors** is a
@@ -601,26 +623,29 @@ defmodule ExSandbox.Egress.Netns do
       "--config-net",
       "--runas",
       runas,
-      "--no-map-gw",
-      "-t",
-      inbound_tcp(forward),
-      "-T",
-      "none",
-      "-u",
-      "none",
-      "-U",
-      "none",
-      "-P",
-      pidfile,
-      "--"
-    ] ++ tenant_command
+      "--no-map-gw"
+    ] ++
+      inbound_tcp(forward_pairs(forward)) ++
+      [
+        "-T",
+        "none",
+        "-u",
+        "none",
+        "-U",
+        "none",
+        "-P",
+        pidfile,
+        "--"
+      ] ++ tenant_command
   end
 
-  defp inbound_tcp(nil), do: "none"
+  defp inbound_tcp([]), do: ["-t", "none"]
 
-  defp inbound_tcp({host_port, ns_port})
+  defp inbound_tcp(pairs), do: Enum.flat_map(pairs, &inbound_tcp_pair/1)
+
+  defp inbound_tcp_pair({host_port, ns_port})
        when is_integer(host_port) and host_port > 0 and is_integer(ns_port) and ns_port > 0,
-       do: "127.0.0.1/#{host_port}:#{ns_port}"
+       do: ["-t", "127.0.0.1/#{host_port}:#{ns_port}"]
 
   @doc """
   The `--runas` value for a uid, as `pasta` spells it.

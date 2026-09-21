@@ -155,6 +155,27 @@ defmodule ExSandbox do
   end
 
   @doc """
+  Where the application listening on `port` inside the sandbox can be reached
+  from this host, or `nil`. `port` is the sandbox's `service_port` or one of
+  its `extra_service_ports`.
+
+  A mechanism without the optional `address/2` publishes one port at most, so
+  asking it for `service_port` falls back to `address/1` and any other port is
+  `{:ok, nil}`, the same answer as for a port nothing publishes.
+  """
+  @spec address(mechanism(), Sandbox.t(), :inet.port_number()) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def address(mechanism, %Sandbox{} = sandbox, port) do
+    Code.ensure_loaded(mechanism)
+
+    cond do
+      function_exported?(mechanism, :address, 2) -> mechanism.address(sandbox, port)
+      port == sandbox.service_port -> address(mechanism, sandbox)
+      true -> {:ok, nil}
+    end
+  end
+
+  @doc """
   Every sandbox the mechanism currently believes is running.
 
   Nothing in the happy path calls this; it exists so a host can reconcile

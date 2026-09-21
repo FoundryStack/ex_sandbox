@@ -90,8 +90,9 @@ defmodule ExSandbox.Egress.LaunchPlan do
       the sandbox is meant to have no name resolution at all.
       ⚠️ An address that cannot be read **raises** — see the note at the call
       site.
-    * `:forward` — `{host_port, ns_port}` to publish one tenant port on host
-      loopback, or `nil` (the default) for none. See `Netns.pasta_command/4`.
+    * `:forward` — `{host_port, ns_port}` pairs, primary first, to publish
+      tenant ports on host loopback, or `nil` (the default) for none. A single
+      legacy pair is accepted too. See `Netns.pasta_command/4`.
   """
   @spec build(Policy.source_key(), :inet.port_number(), [String.t()], keyword()) ::
           {:ok, t()} | {:error, refusal()}

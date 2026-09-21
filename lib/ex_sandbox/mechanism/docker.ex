@@ -271,11 +271,14 @@ defmodule ExSandbox.Mechanism.Docker do
   end
 
   @impl true
-  def address(%Sandbox{mechanism_ref: nil}), do: {:ok, nil}
+  def address(%Sandbox{service_port: port} = sandbox), do: address(sandbox, port)
 
-  def address(%Sandbox{service_port: nil}), do: {:ok, nil}
+  @impl true
+  def address(%Sandbox{mechanism_ref: nil}, _port), do: {:ok, nil}
 
-  def address(%Sandbox{mechanism_ref: ref, service_port: port}) do
+  def address(%Sandbox{service_port: nil}, _port), do: {:ok, nil}
+
+  def address(%Sandbox{mechanism_ref: ref}, port) do
     # ⚠️ Asked of the daemon rather than remembered from `create`.
     #
     # The host port is the daemon's to choose, and a container that was
@@ -684,7 +687,8 @@ defmodule ExSandbox.Mechanism.Docker do
   # the second posture instead. See the moduledoc for what that gives up.
   defp network_args(%Sandbox{service_port: nil}), do: ["--network", "none"]
 
-  defp network_args(%Sandbox{service_port: port}) when is_integer(port) and port > 0 do
+  defp network_args(%Sandbox{service_port: port, extra_service_ports: extra})
+       when is_integer(port) and port > 0 do
     # ⚠️ `127.0.0.1::<port>` -- and the host address is the load-bearing half.
     #
     # `-p <port>` and `-p 0.0.0.0::<port>` both work, both make the preview
@@ -696,8 +700,14 @@ defmodule ExSandbox.Mechanism.Docker do
     # The **host** port is left empty so the daemon allocates a free one. A port
     # this library chose would have to be checked for availability first, and
     # the gap between that check and the bind is a race two concurrent
-    # provisions lose to each other. `address/1` reads back what was allocated.
-    ["--network", "bridge", "-p", "127.0.0.1::#{port}"]
+    # provisions lose to each other. `address/1` reads back what was allocated,
+    # and `address/2` does the same for each of `extra_service_ports`.
+    published =
+      [port | Enum.filter(extra, &(is_integer(&1) and &1 > 0))]
+      |> Enum.uniq()
+      |> Enum.flat_map(&["-p", "127.0.0.1::#{&1}"])
+
+    ["--network", "bridge" | published]
   end
 
   defp network_args(%Sandbox{}), do: ["--network", "none"]

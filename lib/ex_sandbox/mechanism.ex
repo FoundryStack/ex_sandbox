@@ -278,5 +278,24 @@ defmodule ExSandbox.Mechanism do
   """
   @callback address(Sandbox.t()) :: {:ok, String.t() | nil} | {:error, term()}
 
-  @optional_callbacks required_capabilities: 0, constructed_capabilities: 0, address: 1
+  @doc """
+  Where the application listening on `port` inside this sandbox can be reached
+  from the host, or `nil`.
+
+  Optional, and the same contract as `c:address/1` for any one of the ports a
+  sandbox publishes: its `service_port` or one of its `extra_service_ports`.
+  The loopback-only constraint applies to every one of them, for the reason
+  given there. `{:ok, nil}` when `port` is not one the sandbox publishes, and in
+  every case `c:address/1` answers `nil`.
+
+  A mechanism implementing both answers `address(sandbox, sandbox.service_port)`
+  exactly as it answers `address(sandbox)`.
+  """
+  @callback address(Sandbox.t(), :inet.port_number()) ::
+              {:ok, String.t() | nil} | {:error, term()}
+
+  @optional_callbacks required_capabilities: 0,
+                      constructed_capabilities: 0,
+                      address: 1,
+                      address: 2
 end

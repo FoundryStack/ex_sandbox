@@ -539,4 +539,74 @@ defmodule ExSandbox.Egress.NetnsTest do
              ]
     end
   end
+
+  describe "pasta_command/4 with several forwards" do
+    setup do
+      pairs = [{52_111, 4000}, {52_112, 4001}]
+
+      %{
+        command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "0", pairs),
+        pairs: pairs
+      }
+    end
+
+    test "publishes each pair with its own -t, primary first", %{command: command} do
+      published =
+        command
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.filter(&match?(["-t", _], &1))
+
+      assert published == [["-t", "127.0.0.1/52111:4000"], ["-t", "127.0.0.1/52112:4001"]]
+    end
+
+    test "all of them precede the argument separator", %{command: command} do
+      head = Enum.take_while(command, &(&1 != "--"))
+
+      assert "127.0.0.1/52111:4000" in head
+      assert "127.0.0.1/52112:4001" in head
+    end
+
+    test "a one-pair list is the legacy tuple's argv" do
+      assert Netns.pasta_command("/run/p.pid", ["erlexec"], "0", [{52_111, 4000}]) ==
+               Netns.pasta_command("/run/p.pid", ["erlexec"], "0", {52_111, 4000})
+    end
+
+    test "an empty list is today's -t none" do
+      assert Netns.pasta_command("/run/p.pid", ["erlexec"], "0", []) ==
+               Netns.pasta_command("/run/p.pid", ["erlexec"])
+    end
+
+    test "exempts every forwarded ns port from the redirect, ahead of it", %{pairs: pairs} do
+      steps = Enum.map(Netns.redirect_commands(4242, 18_080, nil, pairs), &Enum.join(&1, " "))
+      redirect = Enum.find_index(steps, &String.contains?(&1, "meta l4proto tcp redirect"))
+
+      for ns_port <- [4000, 4001] do
+        exempt =
+          Enum.find_index(
+            steps,
+            &String.ends_with?(&1, "ip daddr 127.0.0.1 tcp dport #{ns_port} return")
+          )
+
+        assert exempt, "no exemption for #{ns_port} in:\n" <> Enum.join(steps, "\n")
+        assert exempt < redirect
+      end
+    end
+
+    test "a legacy tuple still gets its one exemption" do
+      assert Netns.redirect_commands(4242, 18_080, nil, {52_111, 4000}) ==
+               Netns.redirect_commands(4242, 18_080, nil, [{52_111, 4000}])
+    end
+  end
+
+  describe "forward_pairs/1" do
+    test "reads every persisted shape as a list" do
+      assert Netns.forward_pairs(nil) == []
+      assert Netns.forward_pairs({52_111, 4000}) == [{52_111, 4000}]
+
+      assert Netns.forward_pairs([{52_111, 4000}, {52_112, 4001}]) == [
+               {52_111, 4000},
+               {52_112, 4001}
+             ]
+    end
+  end
 end

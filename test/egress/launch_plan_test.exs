@@ -186,6 +186,20 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       assert exempt < redirect
     end
 
+    test "records several pairs and exempts each ns port" do
+      forward = [{52_111, 4000}, {52_112, 4001}]
+      {:ok, plan} = LaunchPlan.build(@key, @port, @confined, forward: forward)
+      steps = Enum.map(LaunchPlan.redirect_steps(plan, 4242), &Enum.join(&1, " "))
+
+      assert plan.forward == forward
+      assert "127.0.0.1/52111:4000" in plan.pasta_command
+      assert "127.0.0.1/52112:4001" in plan.pasta_command
+
+      for ns_port <- [4000, 4001] do
+        assert Enum.any?(steps, &String.ends_with?(&1, "tcp dport #{ns_port} return"))
+      end
+    end
+
     test "exempts no loopback port when there is no forward" do
       {:ok, plan} = LaunchPlan.build(@key, @port, @confined)
 

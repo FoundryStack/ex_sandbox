@@ -57,8 +57,41 @@ defmodule ExSandbox.Mechanism.BeamAddressTest do
       assert Beam.address_of(%{}) == nil
     end
 
+    test "with several forwards is addressed at the primary pair" do
+      assert Beam.address_of(%{forward: [{52_111, 4000}, {52_112, 4001}]}) == "127.0.0.1:52111"
+      assert Beam.address_of(%{forward: []}) == nil
+    end
+
     test "that is stopped has no address, though it keeps its old forward" do
       assert Beam.address_of(%{forward: {52_111, 4000}, stopped: true, peer: nil}) == nil
+    end
+  end
+
+  describe "a launched row, asked for one port" do
+    @forward [{52_111, 4000}, {52_112, 4001}]
+
+    test "is addressed at the pair whose namespace port matches" do
+      assert Beam.address_of(%{forward: @forward}, 4000) == "127.0.0.1:52111"
+      assert Beam.address_of(%{forward: @forward}, 4001) == "127.0.0.1:52112"
+    end
+
+    test "has no address for a port it does not publish" do
+      assert Beam.address_of(%{forward: @forward}, 4002) == nil
+      assert Beam.address_of(%{forward: nil}, 4000) == nil
+      assert Beam.address_of(%{}, 4000) == nil
+    end
+
+    test "persisted as a legacy tuple still answers for its one port" do
+      assert Beam.address_of(%{forward: {52_111, 4000}}, 4000) == "127.0.0.1:52111"
+      assert Beam.address_of(%{forward: {52_111, 4000}}, 4001) == nil
+    end
+
+    test "that is stopped has no address for any port" do
+      assert Beam.address_of(%{forward: @forward, stopped: true}, 4001) == nil
+    end
+
+    test "never launched reports none" do
+      assert {:ok, nil} = Beam.address(%{sandbox() | service_port: 4000}, 4000)
     end
   end
 end
