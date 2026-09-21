@@ -182,8 +182,9 @@ defmodule ExSandbox.Egress.Netns do
   @typedoc "One inbound TCP port published on host loopback, `{host_port, ns_port}`, or `nil` for none."
   @type forward :: {:inet.port_number(), :inet.port_number()} | nil
 
-  @spec redirect_commands(pos_integer(), :inet.port_number(), resolver()) :: [[String.t()]]
-  def redirect_commands(holder_pid, pool_port, resolver \\ nil)
+  @spec redirect_commands(pos_integer(), :inet.port_number(), resolver(), forward()) ::
+          [[String.t()]]
+  def redirect_commands(holder_pid, pool_port, resolver \\ nil, forward \\ nil)
       when is_integer(holder_pid) and holder_pid > 0 do
     [
       nsenter(holder_pid, ["nft", "add", "table", "ip", "nat"]),
@@ -233,23 +234,53 @@ defmodule ExSandbox.Egress.Netns do
         "mark",
         "#{@acceptor_mark}",
         "return"
-      ]),
-      # ⚠️ Matches **all** outbound TCP, not a port list. The allowlist is
-      # enforced at the acceptor, which is the only component that knows the
-      # destination; filtering by port here would let an unlisted port bypass
-      # the enforcement point entirely rather than be refused by it.
-      #
-      # ⚠️ `meta l4proto tcp`, not a bare `tcp`. The latter is not valid nft
-      # grammar and every rule built from it was rejected at install time:
-      #
-      #     nft add rule ip nat output tcp redirect to :44697
-      #     Error: syntax error, unexpected redirect
-      #
-      # Measured -- `meta l4proto tcp` and `ip protocol tcp` are both accepted,
-      # as is `tcp dport 1-65535`. The first is used because it matches all TCP
-      # with no port predicate, which is the property the paragraph above
-      # depends on; `tcp dport 1-65535` would install but reintroduces exactly
-      # the port match ruled out there.
+      ])
+    ] ++
+      forward_exemption(holder_pid, forward) ++
+      [
+        # ⚠️ Matches **all** outbound TCP, not a port list. The allowlist is
+        # enforced at the acceptor, which is the only component that knows the
+        # destination; filtering by port here would let an unlisted port bypass
+        # the enforcement point entirely rather than be refused by it.
+        #
+        # ⚠️ `meta l4proto tcp`, not a bare `tcp`. The latter is not valid nft
+        # grammar and every rule built from it was rejected at install time:
+        #
+        #     nft add rule ip nat output tcp redirect to :44697
+        #     Error: syntax error, unexpected redirect
+        #
+        # Measured -- `meta l4proto tcp` and `ip protocol tcp` are both accepted,
+        # as is `tcp dport 1-65535`. The first is used because it matches all TCP
+        # with no port predicate, which is the property the paragraph above
+        # depends on; `tcp dport 1-65535` would install but reintroduces exactly
+        # the port match ruled out there.
+        nsenter(holder_pid, [
+          "nft",
+          "add",
+          "rule",
+          "ip",
+          "nat",
+          "output",
+          "meta",
+          "l4proto",
+          "tcp",
+          "redirect",
+          "to",
+          ":#{pool_port}"
+        ])
+      ] ++ udp_commands(holder_pid, resolver)
+  end
+
+  # pasta delivers a connection from host loopback by connecting to
+  # 127.0.0.1:<ns_port> from INSIDE the namespace, so the TCP redirect below
+  # catches it as egress and the acceptor refuses it. OBSERVED 2026-09-21 on
+  # production: `egress: refused (:not_permitted)` and the host connection
+  # closed. Only the forwarded port is exempt: the connection stays on the
+  # namespace's loopback, which reaches nothing outside the sandbox.
+  defp forward_exemption(_holder_pid, nil), do: []
+
+  defp forward_exemption(holder_pid, {_host_port, ns_port}) do
+    [
       nsenter(holder_pid, [
         "nft",
         "add",
@@ -257,14 +288,15 @@ defmodule ExSandbox.Egress.Netns do
         "ip",
         "nat",
         "output",
-        "meta",
-        "l4proto",
+        "ip",
+        "daddr",
+        "127.0.0.1",
         "tcp",
-        "redirect",
-        "to",
-        ":#{pool_port}"
+        "dport",
+        "#{ns_port}",
+        "return"
       ])
-    ] ++ udp_commands(holder_pid, resolver)
+    ]
   end
 
   # ⚠️ **This closes a measured hole, not a theoretical one.** Phase 0's

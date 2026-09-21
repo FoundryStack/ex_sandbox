@@ -237,8 +237,11 @@ defmodule ExSandbox.Egress.LaunchPlan do
   commands without having one.
   """
   @spec redirect_steps(t(), pos_integer()) :: [[String.t()]]
-  def redirect_steps(%__MODULE__{pool_port: pool_port, resolver: resolver}, holder_pid) do
-    Netns.redirect_commands(holder_pid, pool_port, resolver)
+  def redirect_steps(
+        %__MODULE__{pool_port: pool_port, resolver: resolver, forward: forward},
+        holder_pid
+      ) do
+    Netns.redirect_commands(holder_pid, pool_port, resolver, forward)
   end
 
   # ⚠️ Read through `ExSandbox.Egress.Resolver` rather than from configuration

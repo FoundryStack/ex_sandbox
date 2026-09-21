@@ -166,6 +166,31 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       assert plan.forward == nil
       assert Enum.chunk_every(plan.pasta_command, 2, 1, :discard) |> Enum.member?(["-t", "none"])
     end
+
+    # OBSERVED 2026-09-21 on production: pasta splices a connection from host
+    # loopback by connecting to 127.0.0.1:<ns_port> from INSIDE the namespace,
+    # which the nat output redirect sent to the acceptor. The acceptor refused it
+    # (`:not_permitted`) and the host saw the connection close.
+    test "exempts the forwarded port on namespace loopback, ahead of the redirect" do
+      {:ok, plan} = LaunchPlan.build(@key, @port, @confined, forward: {52_111, 4000})
+      steps = Enum.map(LaunchPlan.redirect_steps(plan, 4242), &Enum.join(&1, " "))
+
+      exempt =
+        Enum.find_index(steps, &String.ends_with?(&1, "ip daddr 127.0.0.1 tcp dport 4000 return"))
+
+      redirect = Enum.find_index(steps, &String.contains?(&1, "meta l4proto tcp redirect"))
+
+      assert exempt,
+             "no loopback exemption for the forwarded port in:\n" <> Enum.join(steps, "\n")
+
+      assert exempt < redirect
+    end
+
+    test "exempts no loopback port when there is no forward" do
+      {:ok, plan} = LaunchPlan.build(@key, @port, @confined)
+
+      refute Enum.any?(LaunchPlan.redirect_steps(plan, 4242), &("tcp" in &1 and "dport" in &1))
+    end
   end
 
   describe "refusal" do
