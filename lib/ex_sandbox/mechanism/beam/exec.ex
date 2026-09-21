@@ -68,6 +68,8 @@ defmodule ExSandbox.Mechanism.Beam.Exec do
            }}
           | {:could_not_run, term()}
 
+  @system_path "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
   @doc """
   The byte limit each captured stream is truncated at.
 
@@ -90,9 +92,19 @@ defmodule ExSandbox.Mechanism.Beam.Exec do
   every bare command name fails `:enoent` — which reads exactly like the sandbox
   *refusing* the operation. That ambiguity is the one thing this seam exists to
   remove, so the directories are named rather than hoped for.
+
+  A host whose toolchain lives outside `/usr` (a version manager's install
+  root, bound in through `:extra_ro_binds`) names its `bin` directories in
+  `:exec_path`; they come first. `:exec_env` adds variables the toolchain
+  needs, such as `MIX_HOME`. Both are `:beam` config.
   """
   @spec default_env() :: [{String.t(), String.t()}]
-  def default_env, do: [{"PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"}]
+  def default_env do
+    config = Application.get_env(:ex_sandbox, :beam, [])
+    path = Enum.join(Keyword.get(config, :exec_path, []) ++ [@system_path], ":")
+
+    [{"PATH", path} | Keyword.get(config, :exec_env, []) |> List.keydelete("PATH", 0)]
+  end
 
   @doc false
   # Public for the same reason `ExSandbox.Mechanism.Beam.probe_exprs/3` is: the
