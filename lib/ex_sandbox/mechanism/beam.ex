@@ -1382,6 +1382,13 @@ defmodule ExSandbox.Mechanism.Beam do
   # Launched nodes are tracked in ETS rather than in the sandbox struct because
   # `peer` pids do not survive the struct's round trip through the host's
   # registry -- the host stores `mechanism_ref`, a string, and nothing more.
+  #
+  # ⚠️ `ExSandbox.Mechanism.Beam.Table` creates and owns it. The fallback below
+  # only serves a caller running without the application, and the table it
+  # creates dies with that caller.
+  @doc false
+  def registry_table, do: @registry
+
   defp table do
     case :ets.whereis(@registry) do
       :undefined -> :ets.new(@registry, [:named_table, :public, :set])

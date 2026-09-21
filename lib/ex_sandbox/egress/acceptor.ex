@@ -104,6 +104,11 @@ defmodule ExSandbox.Egress.Acceptor do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
   end
 
+  @doc "`start_link/1` without the link: the acceptor outlives the caller."
+  def start(opts) do
+    GenServer.start(__MODULE__, opts, name: Keyword.get(opts, :name))
+  end
+
   @impl true
   def init(opts) do
     source_key = Keyword.fetch!(opts, :source_key)

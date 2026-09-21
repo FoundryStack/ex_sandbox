@@ -4,7 +4,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
   ## `:peer` is the launcher, not the boundary
 
-  `:peer.start_link/1` starts an OS-level BEAM node and gives us a supervised
+  `:peer.start/1` starts an OS-level BEAM node and gives us a
   handle on it. That is all it gives us. It does **not** confine the filesystem,
   drop privileges, cap memory, or clear the environment — every one of
   `FR-007` - `FR-011` is satisfied by the command in `exec`, built by
@@ -422,7 +422,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     # parsed off a pipe, and the failure mode the wait existed to catch cannot
     # occur: there is no state in which this returns `{:ok, _}` and nothing is
     # bound.
-    ExSandbox.Egress.Acceptor.start_link(
+    #
+    # ⚠️ `start/1`, not `start_link/1`, for the same reason as the peer: the
+    # caller that launched the sandbox is not its owner, and an abnormal exit
+    # of that caller must not take the sandbox's egress with it. `destroy/1`
+    # stops the acceptor through `acceptor_pid`.
+    ExSandbox.Egress.Acceptor.start(
       source_key: plan.source_key,
       holder_pid: holder_pid,
       port: plan.pool_port,
@@ -681,7 +686,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       connection: :standard_io
     }
 
-    # `:peer.start_link/1` **exits** on a failed boot (`peer.erl:934`) rather
+    # `:peer.start/1` **exits** on a failed boot (`peer.erl:934`) rather
     # than returning an error tuple, so a bare `case` would propagate a crash to
     # whoever asked to provision a sandbox. A failed launch is an ordinary,
     # expected outcome here -- the host was misconfigured, the image was
@@ -695,8 +700,16 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
+  # ⚠️ `:peer.start/1`, never `start_link/1`. The peer process traps exits and
+  # stops -- halting the node -- when its parent exits, whatever the reason. A
+  # linked sandbox therefore lived exactly as long as whoever provisioned it:
+  # a job, an HTTP request. OBSERVED 2026-09-21 on a host publishing a
+  # generated app: the sandbox's scope ended the instant the deployment job
+  # returned, and a sandbox woken by a request died as that request answered.
+  # A sandbox ends at `stop/1` or `destroy/1`, which reach it through the pid
+  # recorded in the registry.
   defp do_start_peer(options, cookie, sandbox) do
-    case :peer.start_link(options) do
+    case :peer.start(options) do
       {:ok, peer, node} ->
         case os_pid(peer) do
           {:ok, os_pid} ->
@@ -1116,7 +1129,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # alone identifies the process whose confinement must be verified -- see
   # `host_os_pid/1` and `confined_beam_pid/1`.
   #
-  # Read after `:peer.start_link/1` returns, so the BEAM has booted and is
+  # Read after `:peer.start/1` returns, so the BEAM has booted and is
   # present in the tree; a launch that never got that far has already failed.
   # `nil` when the hardening implementation does not name its scopes -- an
   # optional capability rather than part of the behaviour, for the same reason

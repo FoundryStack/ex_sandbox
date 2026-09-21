@@ -67,7 +67,11 @@ defmodule ExSandbox.Application do
       # answer and names do not resolve at all. A sandbox that cannot resolve is
       # visibly broken; a sandbox that resolves into nothing recorded would be
       # invisibly denied.
-      ExSandbox.Egress.Resolver
+      ExSandbox.Egress.Resolver,
+
+      # Owns the Beam mechanism's table of launched nodes, so the table does
+      # not die with the first process that provisioned a sandbox.
+      {ExSandbox.Mechanism.Beam.Table, ExSandbox.Mechanism.Beam.registry_table()}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
