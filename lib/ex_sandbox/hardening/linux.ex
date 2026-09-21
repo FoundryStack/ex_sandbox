@@ -72,6 +72,7 @@ defmodule ExSandbox.Hardening.Linux do
   )
 
   @cgroup_root "/sys/fs/cgroup"
+  @workspace_mountpoint "/workspace"
 
   # Bounded so a probe cannot hang the gateway's startup: `capabilities/0` is
   # called on the provisioning path. 2s total is far above the observed time for
@@ -360,7 +361,10 @@ defmodule ExSandbox.Hardening.Linux do
       [
         "--bind",
         storage,
-        storage,
+        storage
+      ] ++
+      workspace_bind(sandbox) ++
+      [
         "--proc",
         "/proc",
         "--dev",
@@ -562,6 +566,87 @@ defmodule ExSandbox.Hardening.Linux do
     with :ok <- File.mkdir_p(path),
          :ok <- File.chmod(path, 0o700) do
       chown(path, uid)
+    end
+  end
+
+  # The workspace appears at the path every mechanism that offers one uses, so a
+  # command naming `/workspace/...` means the same thing under Docker and here.
+  # `nil` binds nothing, which is what `Sandbox.workspace_path` promises.
+  defp workspace_bind(%{workspace_path: path}) when is_binary(path),
+    do: ["--bind", path, @workspace_mountpoint]
+
+  defp workspace_bind(_sandbox), do: []
+
+  @doc """
+  Hand the bound workspace to the uid the sandbox drops to.
+
+  Called at launch and again before every command, because the platform writes
+  into the workspace between commands (a credential file, a checkout) and what
+  it writes is owned by the platform, which the sandbox cannot read.
+
+  ⚠️ Two things stay the platform's, deliberately:
+
+    * **the root directory's owner.** git refuses a repository owned by another
+      uid ("dubious ownership"), and the platform runs git here. The root is
+      instead given the sandbox's group and mode `0o770`, which is enough for
+      the sandbox to create `deps/` and `_build/` beside the tenant's files.
+    * **`.git`.** Its config names programs git runs (`core.fsmonitor`,
+      `core.hooksPath`). Left writable by the tenant, the platform's next git
+      call would run the tenant's choice of program outside the sandbox.
+
+  `chown -h` changes a symlink itself rather than what it points at, and `-R`
+  does not descend through one. The tree is the tenant's; a link in it to a
+  platform file must not become a way to take that file over.
+  """
+  @spec prepare_workspace(ExSandbox.Sandbox.t()) :: :ok | {:error, term()}
+  def prepare_workspace(%{workspace_path: path} = sandbox) when is_binary(path) do
+    uid = sandbox_uid(sandbox)
+
+    with {:ok, entries} <- File.ls(path),
+         :ok <- chgrp(path, uid),
+         :ok <- File.chmod(path, 0o770) do
+      entries
+      |> workspace_handoff(path, uid)
+      |> run_handoff()
+    end
+  end
+
+  def prepare_workspace(_sandbox), do: :ok
+
+  @doc false
+  # The `chown` invocation, public so it is checked without root.
+  @spec workspace_handoff([String.t()], String.t(), non_neg_integer()) ::
+          {String.t(), [String.t()]} | nil
+  def workspace_handoff(entries, root, uid) do
+    case entries |> Enum.reject(&(&1 == ".git")) |> Enum.map(&Path.join(root, &1)) do
+      [] -> nil
+      paths -> {"chown", ["-R", "-h", "#{uid}:#{uid}", "--" | paths]}
+    end
+  end
+
+  defp run_handoff(nil), do: :ok
+
+  defp run_handoff({cmd, args}) do
+    case System.cmd(cmd, args, stderr_to_stdout: true) do
+      {_, 0} -> :ok
+      {output, status} -> handoff_failure(output, status)
+    end
+  end
+
+  # Same rule as `chown/2`: an unprivileged caller (tests, a developer's
+  # machine) cannot hand anything over, and that is not this function's failure
+  # to report.
+  defp handoff_failure(output, status) do
+    if String.contains?(output, "Operation not permitted"),
+      do: :ok,
+      else: {:error, {:workspace_handoff, status, output}}
+  end
+
+  defp chgrp(path, gid) do
+    case File.chgrp(path, gid) do
+      :ok -> :ok
+      {:error, :eperm} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 

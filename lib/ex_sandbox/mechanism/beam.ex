@@ -1178,10 +1178,16 @@ defmodule ExSandbox.Mechanism.Beam do
         env: Keyword.get(opts, :env, Exec.default_env())
       )
 
-    sandbox
-    |> call(:erl_eval, :exprs, [exprs, []], timeout)
-    |> interpret_execution(sandbox, budget, timeout)
-    |> emit_output(opts[:on_output])
+    case NodeLauncher.prepare_workspace(sandbox) do
+      :ok ->
+        sandbox
+        |> call(:erl_eval, :exprs, [exprs, []], timeout)
+        |> interpret_execution(sandbox, budget, timeout)
+        |> emit_output(opts[:on_output])
+
+      {:error, reason} ->
+        {:error, {:could_not_run, {:workspace, reason}}}
+    end
   end
 
   # ⚠️ Three outcomes in, three outcomes out, and the mapping is the whole

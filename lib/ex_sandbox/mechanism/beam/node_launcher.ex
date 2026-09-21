@@ -78,6 +78,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
     with :ok <- require_hardening(),
          :ok <- prepare_storage(sandbox),
+         :ok <- prepare_workspace(sandbox),
          :ok <- clear_stale_scope(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
          {:ok, exec, binding, plan} <- policed(sandbox, exec),
@@ -813,12 +814,20 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # mechanism whose hardening needs no pre-created directory should not be
   # obliged to define a no-op, and the substitutable fakes that make this launch
   # path testable off Linux implement only the three behaviour functions.
-  defp prepare_storage(sandbox) do
+  defp prepare_storage(sandbox), do: optional_hardening(:prepare_storage, sandbox)
+
+  @doc false
+  # Public because `Beam.execute/3` repeats it before every command: the
+  # platform writes into the workspace between commands, and a file it wrote is
+  # one the sandbox cannot read until it is handed over.
+  def prepare_workspace(sandbox), do: optional_hardening(:prepare_workspace, sandbox)
+
+  defp optional_hardening(function, sandbox) do
     module = hardening()
     Code.ensure_loaded(module)
 
-    if function_exported?(module, :prepare_storage, 1) do
-      module.prepare_storage(sandbox)
+    if function_exported?(module, function, 1) do
+      apply(module, function, [sandbox])
     else
       :ok
     end
