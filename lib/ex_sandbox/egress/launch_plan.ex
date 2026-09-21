@@ -59,10 +59,19 @@ defmodule ExSandbox.Egress.LaunchPlan do
           pasta_command: [String.t()],
           tenant_command: [String.t()],
           pool_port: :inet.port_number(),
-          resolver: Netns.resolver()
+          resolver: Netns.resolver(),
+          forward: Netns.forward()
         }
 
-  defstruct [:source_key, :pidfile, :pasta_command, :tenant_command, :pool_port, :resolver]
+  defstruct [
+    :source_key,
+    :pidfile,
+    :pasta_command,
+    :tenant_command,
+    :pool_port,
+    :resolver,
+    :forward
+  ]
 
   @doc """
   Builds the plan for one sandbox, or refuses.
@@ -81,6 +90,8 @@ defmodule ExSandbox.Egress.LaunchPlan do
       the sandbox is meant to have no name resolution at all.
       ⚠️ An address that cannot be read **raises** — see the note at the call
       site.
+    * `:forward` — `{host_port, ns_port}` to publish one tenant port on host
+      loopback, or `nil` (the default) for none. See `Netns.pasta_command/4`.
   """
   @spec build(Policy.source_key(), :inet.port_number(), [String.t()], keyword()) ::
           {:ok, t()} | {:error, refusal()}
@@ -102,6 +113,7 @@ defmodule ExSandbox.Egress.LaunchPlan do
          {:ok, {outer, uid, rest}} <- split_at_privilege_drop(inner) do
       pidfile = Keyword.get(opts, :pidfile, default_pidfile(source_key))
       runas = Netns.runas_for_uid(uid)
+      forward = Keyword.get(opts, :forward)
 
       # ⚠️ **Validated HERE, at build time, and it raises.** The address is read
       # from configuration, so a typo in it is a deployment mistake rather than
@@ -118,10 +130,11 @@ defmodule ExSandbox.Egress.LaunchPlan do
        %__MODULE__{
          source_key: source_key,
          pidfile: pidfile,
-         pasta_command: outer ++ Netns.pasta_command(pidfile, rest, runas),
+         pasta_command: outer ++ Netns.pasta_command(pidfile, rest, runas, forward),
          tenant_command: inner,
          pool_port: pool_port,
-         resolver: resolver
+         resolver: resolver,
+         forward: forward
        }}
     else
       false -> {:error, :no_network_confinement}

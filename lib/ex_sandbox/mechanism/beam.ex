@@ -1305,19 +1305,30 @@ defmodule ExSandbox.Mechanism.Beam do
 
   defp emit_output(result, _sink), do: result
 
-  # ⚠️ `nil`, and this mechanism has a handle it could have returned instead.
+  # `"127.0.0.1:<host_port>"`, the loopback port `pasta` publishes the sandbox's
+  # `service_port` on (`NodeLauncher.launch/2`, `Netns.pasta_command/4`).
   #
-  # `context.address` above is `"peer:<id>"`, which names the sandbox to the
-  # conformance suite and to nothing else: it is not a host, it is not a port,
-  # and it is reachable from no socket. Returning it here would give a caller a
-  # string where it asked for an address, and the failure would surface as a
-  # broken frame in somebody's browser rather than as the honest absence that
+  # `nil` when the sandbox names no service port, and also when it is not
+  # running: a stopped row keeps its old forward, but nothing listens on it.
+  #
+  # ⚠️ Never `context.address`. That is `"peer:<id>"`, a name for the sandbox
+  # that no socket can reach; returned here it would surface as a broken frame
+  # in somebody's browser rather than as the honest absence that
   # `c:ExSandbox.Mechanism.address/1` documents.
-  #
-  # A `:peer` node has no published port to offer, so `nil` is not a gap
-  # awaiting work -- it is the whole answer this mechanism has.
   @impl true
-  def address(%Sandbox{}), do: {:ok, nil}
+  def address(%Sandbox{} = sandbox) do
+    case lookup_sandbox(sandbox) do
+      {:ok, launched} -> {:ok, address_of(launched)}
+      :error -> {:ok, nil}
+    end
+  end
+
+  @doc false
+  # Public so `ExSandbox.Mechanism.BeamAddressTest` can read a launched row's
+  # address on a host where the launch path cannot run.
+  def address_of(%{stopped: true}), do: nil
+  def address_of(%{forward: {host_port, _service_port}}), do: "127.0.0.1:#{host_port}"
+  def address_of(_launched), do: nil
 
   @impl true
   def usage(%Sandbox{} = sandbox) do

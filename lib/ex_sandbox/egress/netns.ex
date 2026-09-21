@@ -179,6 +179,9 @@ defmodule ExSandbox.Egress.Netns do
   """
   @type resolver :: {String.t() | :inet.ip_address(), :inet.port_number()} | nil
 
+  @typedoc "One inbound TCP port published on host loopback, `{host_port, ns_port}`, or `nil` for none."
+  @type forward :: {:inet.port_number(), :inet.port_number()} | nil
+
   @spec redirect_commands(pos_integer(), :inet.port_number(), resolver()) :: [[String.t()]]
   def redirect_commands(holder_pid, pool_port, resolver \\ nil)
       when is_integer(holder_pid) and holder_pid > 0 do
@@ -532,7 +535,7 @@ defmodule ExSandbox.Egress.Netns do
   | flag | what the default does |
   |---|---|
   | `--no-map-gw` | maps the namespace's default gateway to the **host**, so the host is reachable at the gateway address |
-  | `-t none` | `-t auto` forwards **inbound TCP**: a tenant binding `0.0.0.0:8080` binds `0.0.0.0:8080` *on the host* (`FR-018`) |
+  | `-t none` | `-t auto` forwards **inbound TCP**: a tenant binding `0.0.0.0:8080` binds `0.0.0.0:8080` *on the host* (`FR-018`). With a `forward`, `-t 127.0.0.1/<host>:<ns>` instead: one port, host loopback only |
   | `-T none` | the same for TCP in the outbound-to-host direction |
   | `-u none` | `-u auto` forwards inbound **UDP** |
   | `-U none` | the same for UDP in the outbound-to-host direction |
@@ -545,19 +548,22 @@ defmodule ExSandbox.Egress.Netns do
   presents identically to one that has none — `curl` to the gateway address
   gets nothing, which is exactly what a correct configuration looks like.
 
-  ⚠️ **`-t none` deliberately disables the inbound forwarding Phase 3 wants.**
-  That is not an oversight to be repaired when Phase 3 lands. Phase 3 replaces
-  it with an explicit `-t <hostport>:<nsport>`, which is a **narrowing** of
-  `auto` — one named port instead of every port the tenant chooses to bind —
-  and not a re-widening back to the default.
+  ⚠️ **`-t none` deliberately disables inbound forwarding, and `forward`
+  narrows it rather than re-widening it.** Given `{host_port, ns_port}`, `-t
+  none` becomes `-t 127.0.0.1/<host_port>:<ns_port>`: one named port instead of
+  every port the tenant chooses to bind, bound on host loopback only. Measured
+  on the production host (2026-09-21): `ss -ltn` showed `127.0.0.1:<host_port>`
+  and nothing else, and a host `curl` reached the server in the namespace.
+  `-T`, `-u`, `-U` and `--no-map-gw` do not change, so the tenant still cannot
+  reach the host. `nil` is today's `-t none`, byte for byte.
 
   ⚠️ This function builds a command. That the flags are **passed** is all a
   command-string assertion can show; that they **close the doors** is a
   different claim needing a live namespace, and it belongs to `T012`/`T014`'s
   probe set, not here.
   """
-  @spec pasta_command(String.t(), [String.t()], String.t()) :: [String.t()]
-  def pasta_command(pidfile, [_ | _] = tenant_command, runas \\ "0") do
+  @spec pasta_command(String.t(), [String.t()], String.t(), forward()) :: [String.t()]
+  def pasta_command(pidfile, [_ | _] = tenant_command, runas \\ "0", forward \\ nil) do
     [
       pasta_path(),
       "--config-net",
@@ -565,7 +571,7 @@ defmodule ExSandbox.Egress.Netns do
       runas,
       "--no-map-gw",
       "-t",
-      "none",
+      inbound_tcp(forward),
       "-T",
       "none",
       "-u",
@@ -577,6 +583,12 @@ defmodule ExSandbox.Egress.Netns do
       "--"
     ] ++ tenant_command
   end
+
+  defp inbound_tcp(nil), do: "none"
+
+  defp inbound_tcp({host_port, ns_port})
+       when is_integer(host_port) and host_port > 0 and is_integer(ns_port) and ns_port > 0,
+       do: "127.0.0.1/#{host_port}:#{ns_port}"
 
   @doc """
   The `--runas` value for a uid, as `pasta` spells it.

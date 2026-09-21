@@ -151,6 +151,23 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
     end
   end
 
+  describe "the service-port forward" do
+    test "is recorded on the plan and reaches pasta" do
+      {:ok, plan} = LaunchPlan.build(@key, @port, @confined, forward: {52_111, 4000})
+
+      assert plan.forward == {52_111, 4000}
+      assert "127.0.0.1/52111:4000" in plan.pasta_command
+      refute Enum.chunk_every(plan.pasta_command, 2, 1, :discard) |> Enum.member?(["-t", "none"])
+    end
+
+    test "is absent by default, leaving inbound TCP off" do
+      {:ok, plan} = LaunchPlan.build(@key, @port, @confined)
+
+      assert plan.forward == nil
+      assert Enum.chunk_every(plan.pasta_command, 2, 1, :discard) |> Enum.member?(["-t", "none"])
+    end
+  end
+
   describe "refusal" do
     test "a tenant command that never unshared the network is refused" do
       # ⚠️ Not a no-op. If the caller hands over a command with no

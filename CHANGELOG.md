@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added: `Beam.address/1` returns the sandbox's service port on host loopback
+
+A Beam sandbox that names a `service_port` is launched with `pasta -t 127.0.0.1/<host>:<port>`
+in place of `-t none`, and `address/1` returns `"127.0.0.1:<host>"`, as the Docker mechanism
+already does. `-T`, `-u`, `-U` and `--no-map-gw` are unchanged, so the tenant still cannot reach
+the host. A sandbox with no `service_port` launches with today's argv and still reports `nil`.
+
+⚠️ The forward rides on the policed launch path, which is taken only for a sandbox with a
+non-empty `network_allowlist`. A sandbox with an empty allowlist still runs in an empty
+`--unshare-net` namespace and reports `nil`.
+
 ## 1.4.0 — 2026-09-11
 
 ### Fixed: `Docker.execute/3` reported "did not run" as an exit status

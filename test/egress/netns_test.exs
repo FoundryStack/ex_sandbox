@@ -497,4 +497,46 @@ defmodule ExSandbox.Egress.NetnsTest do
       command |> Enum.drop_while(&(&1 != flag)) |> Enum.at(1)
     end
   end
+
+  describe "pasta_command/4 with a forward" do
+    setup do
+      %{
+        command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "0", {52_111, 4000}),
+        plain: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "0", nil)
+      }
+    end
+
+    test "publishes the one named port on host loopback in place of -t none", %{command: command} do
+      pairs = Enum.chunk_every(command, 2, 1, :discard)
+
+      assert ["-t", "127.0.0.1/52111:4000"] in pairs
+      refute ["-t", "none"] in pairs
+    end
+
+    test "leaves every door from the tenant to the host closed", %{command: command} do
+      pairs = Enum.chunk_every(command, 2, 1, :discard)
+
+      assert "--no-map-gw" in command
+
+      for flag <- ~w(-T -u -U) do
+        assert [flag, "none"] in pairs, "#{flag} must stay none with a forward"
+      end
+    end
+
+    test "precedes the argument separator", %{command: command} do
+      assert "127.0.0.1/52111:4000" in Enum.take_while(command, &(&1 != "--"))
+    end
+
+    test "a nil forward is today's argv", %{plain: plain} do
+      assert plain == Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
+    end
+
+    test "differs from the unforwarded argv only in the -t value", %{command: c, plain: p} do
+      assert length(c) == length(p)
+
+      assert c |> Enum.zip(p) |> Enum.reject(fn {a, b} -> a == b end) == [
+               {"127.0.0.1/52111:4000", "none"}
+             ]
+    end
+  end
 end

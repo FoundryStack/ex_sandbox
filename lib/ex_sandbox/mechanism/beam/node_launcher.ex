@@ -57,7 +57,11 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
           # process *and* keep one namespace alive, indefinitely.
           #
           # `nil` on a host with no egress path, as with `binding`.
-          acceptor_pid: pid() | nil
+          acceptor_pid: pid() | nil,
+          # `{host_port, service_port}` published on host loopback by `pasta`,
+          # read by `Beam.address/1`. `nil` when the sandbox names no service
+          # port or the launch took no egress path.
+          forward: ExSandbox.Egress.Netns.forward()
         }
 
   @doc """
@@ -87,7 +91,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       {:ok,
        launched
        |> Map.put(:binding, binding)
-       |> Map.put(:acceptor_pid, acceptor_pid)}
+       |> Map.put(:acceptor_pid, acceptor_pid)
+       |> Map.put(:forward, plan && plan.forward)}
     end
   end
 
@@ -122,9 +127,20 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         {:ok, exec, nil, nil}
 
       allowed ->
-        install_policy(exec, allowed)
+        install_policy(exec, allowed, &ExSandbox.Egress.Binding.acquire/1, forward(sandbox))
     end
   end
+
+  # The service port is published on a host loopback port picked here. The pick
+  # races: another process could take the port between this close and `pasta`'s bind.
+  defp forward(%Sandbox{service_port: port}) when is_integer(port) and port > 0 do
+    {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
+    {:ok, host_port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    {host_port, port}
+  end
+
+  defp forward(%Sandbox{}), do: nil
 
   @doc """
   Turns an allowlist into a policed command, or refuses the launch.
@@ -142,13 +158,24 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   as the `--unshare-net` trap this whole feature exists to close.
 
   `acquire` is injectable so the refusal can be provoked without exhausting a
-  real pool; it defaults to `ExSandbox.Egress.Binding.acquire/1`.
+  real pool; it defaults to `ExSandbox.Egress.Binding.acquire/1`. `forward` is
+  the plan's `:forward` (`ExSandbox.Egress.LaunchPlan.build/4`).
   """
-  @spec install_policy([ExSandbox.Egress.Policy.destination()], term(), (list() -> term())) ::
+  @spec install_policy(
+          term(),
+          [ExSandbox.Egress.Policy.destination()],
+          (list() -> term()),
+          ExSandbox.Egress.Netns.forward()
+        ) ::
           {:ok, term(), term(), term()} | {:error, atom()}
-  def install_policy(exec, allowed, acquire \\ &ExSandbox.Egress.Binding.acquire/1) do
+  def install_policy(
+        exec,
+        allowed,
+        acquire \\ &ExSandbox.Egress.Binding.acquire/1,
+        forward \\ nil
+      ) do
     with {:ok, binding} <- acquire_binding(allowed, acquire),
-         {:ok, rewritten, plan} <- build_plan(binding, exec) do
+         {:ok, rewritten, plan} <- build_plan(binding, exec, forward) do
       {:ok, rewritten, binding, plan}
     end
   end
@@ -186,10 +213,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # original `prog` is what keeps that correct as the ordering changes: under
   # the split ordering the head is `systemd-run` again, but it was `pasta` while
   # pasta wrapped the whole command, and neither is hardcoded here.
-  defp build_plan(binding, {prog, args}) do
+  defp build_plan(binding, {prog, args}, forward) do
     flat = [prog | args]
 
-    case ExSandbox.Egress.LaunchPlan.build(binding.source_key, acceptor_port(), flat) do
+    case ExSandbox.Egress.LaunchPlan.build(binding.source_key, acceptor_port(), flat,
+           forward: forward
+         ) do
       {:ok, plan} ->
         # ⚠️ Nothing is *run* here any more, and that inversion is the whole of
         # the T060a3 rework. The old code executed `setup_steps` at this point,

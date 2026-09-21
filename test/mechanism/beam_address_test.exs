@@ -1,7 +1,8 @@
 defmodule ExSandbox.Mechanism.BeamAddressTest do
   @moduledoc """
-  A mechanism with no address says so, rather than offering the handle it has
-  (design D13).
+  A launched sandbox that names a service port is addressed at the host
+  loopback port `pasta` publishes it on; any other sandbox says it has no
+  address, rather than offering the handle it has (design D13).
 
   `ExSandbox.Mechanism.Beam` publishes `"peer:<id>"` as its conformance context
   address -- a name for the sandbox that no socket can reach. The risk this file
@@ -42,9 +43,22 @@ defmodule ExSandbox.Mechanism.BeamAddressTest do
     refute address == "peer:" <> sandbox.id
   end
 
-  test "reports none for a sandbox that names a service port, since it can publish none" do
-    # A host may set the field for every sandbox it creates without knowing
-    # which mechanism will run it. The field is a request, not a promise.
+  test "reports none for a sandbox this mechanism never launched, service port or not" do
     assert {:ok, nil} = Beam.address(%{sandbox() | service_port: 4000})
+  end
+
+  describe "a launched row" do
+    test "with a forward is addressed at the host loopback port pasta publishes" do
+      assert Beam.address_of(%{forward: {52_111, 4000}}) == "127.0.0.1:52111"
+    end
+
+    test "without a forward has no address" do
+      assert Beam.address_of(%{forward: nil}) == nil
+      assert Beam.address_of(%{}) == nil
+    end
+
+    test "that is stopped has no address, though it keeps its old forward" do
+      assert Beam.address_of(%{forward: {52_111, 4000}, stopped: true, peer: nil}) == nil
+    end
   end
 end
