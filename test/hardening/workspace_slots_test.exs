@@ -73,9 +73,9 @@ defmodule ExSandbox.Hardening.WorkspaceSlotsTest do
 
     assert :ok = Linux.prepare_workspace(sandbox)
 
-    assert mode(dir) == 0o1770
+    assert mode(dir) == 0o770
     assert mode(Path.join(dir, ".slots")) == 0o750
-    assert mode(Path.join([dir, ".slots", "a"])) == 0o1770
+    assert mode(Path.join([dir, ".slots", "a"])) == 0o770
 
     if root?() do
       tenant = File.stat!(Path.join(dir, "mix.exs")).uid

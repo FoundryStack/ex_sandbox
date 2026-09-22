@@ -77,7 +77,7 @@ defmodule ExSandbox.Hardening.WorkspaceBindTest do
       assert :ok = Linux.prepare_workspace(sandbox(dir))
 
       stat = File.stat!(dir)
-      assert Bitwise.band(stat.mode, 0o7777) == 0o1770
+      assert Bitwise.band(stat.mode, 0o7777) == 0o770
       assert stat.uid == owner
     end
 

@@ -614,10 +614,14 @@ defmodule ExSandbox.Hardening.Linux do
   escape above one level down. A `.git` the tenant owns is left as it is, for
   the platform to throw away and recreate.
 
-  The root and every slot are sticky (`0o1770`): the sandbox writes beside the
-  platform's files and cannot delete or rename them. Without it the root's
-  write bit is enough to swap `.slots` for a symlink between this function's
-  check and its `chown`.
+  ⚠️ Nothing here is sticky. MEASURED 2026-09-22 on production, where
+  `fs.protected_regular = 2`: in a sticky group-writable directory the kernel
+  refuses even root an `O_CREAT` open of an existing file another uid owns,
+  and the platform's rewrite of the tenant-owned `.axonn-db.env` failed with
+  `:eacces`. The race stickiness was guarding (the sandbox swapping `.slots`
+  for a symlink between a check and a `chown`) is closed instead by doing the
+  slot work in one shell whose working directory is pinned to the inode that
+  was checked.
   """
   @spec prepare_workspace(ExSandbox.Sandbox.t()) :: :ok | {:error, term()}
   def prepare_workspace(%{workspace_path: path} = sandbox) when is_binary(path) do
@@ -628,7 +632,7 @@ defmodule ExSandbox.Hardening.Linux do
     with {:ok, %{uid: platform}} <- File.lstat(path),
          {:ok, entries} <- File.ls(path),
          :ok <- chgrp(path, uid),
-         :ok <- chmod(path, 0o1770),
+         :ok <- chmod(path, 0o770),
          :ok <- run_handoff(workspace_handoff(entries, path, uid, [".git" | List.wrap(slots)])) do
       prepare_slots(slots && Path.join(path, slots), platform, uid)
     end
@@ -652,50 +656,46 @@ defmodule ExSandbox.Hardening.Linux do
     Application.get_env(:ex_sandbox, :beam, []) |> Keyword.get(:workspace_slots)
   end
 
+  # $1 platform uid, $2 sandbox uid, $3 the inode `lstat` saw, $4 the slots
+  # directory. After `cd -P` the working directory is that inode or nothing
+  # happens; every path below it is relative, so a symlink swapped in above it
+  # afterwards is never followed. Once the slots directory is the platform's
+  # at `0750`, the sandbox cannot add or rename a slot in it.
+  @slots_handoff ~S"""
+  p=$1 u=$2
+  cd -P -- "$4" 2>/dev/null || exit 0
+  [ "$(ls -di . | awk '{print $1}')" = "$3" ] || exit 0
+  chown -h "$p:$u" . 2>/dev/null
+  chmod 0750 .
+  [ "$(ls -dn . | awk '{print $3}')" = "$p" ] || exit 0
+  for s in *; do
+    [ -d "$s" ] && [ ! -L "$s" ] || continue
+    (
+      cd -P -- "$s" || exit 0
+      chown -h "$p:$u" . 2>/dev/null
+      chmod 0770 .
+      for e in * .[!.]* ..?*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        [ "$e" = .git ] && continue
+        chown -R -h "$u:$u" -- "$e" 2>/dev/null
+      done
+    )
+  done
+  exit 0
+  """
+
   defp prepare_slots(nil, _platform, _uid), do: :ok
 
   defp prepare_slots(dir, platform, uid) do
-    with :ok <- keep(dir, platform, uid, 0o750),
-         {:ok, entries} <- File.ls(dir) do
-      entries
-      |> Enum.map(&Path.join(dir, &1))
-      |> Enum.reduce_while(:ok, fn slot, :ok ->
-        case prepare_slot(slot, platform, uid) do
-          :ok -> {:cont, :ok}
-          error -> {:halt, error}
-        end
-      end)
-    else
-      :skip -> :ok
-      error -> error
-    end
-  end
+    case File.lstat(dir) do
+      {:ok, %{type: :directory, inode: inode}} ->
+        run_handoff(
+          {"sh",
+           ["-c", @slots_handoff, "slots", "#{platform}", "#{uid}", "#{inode}", Path.expand(dir)]}
+        )
 
-  # Anything in the slots directory that is not a directory (the platform's
-  # `serving` file) is left as it is.
-  defp prepare_slot(slot, platform, uid) do
-    with :ok <- keep(slot, platform, uid, 0o1770),
-         {:ok, entries} <- File.ls(slot) do
-      run_handoff(workspace_handoff(entries, slot, uid))
-    else
-      :skip -> :ok
-      error -> error
-    end
-  end
-
-  # Makes `path` the platform's with the sandbox's group, when it is a real
-  # directory. `chown -h` never follows a link, and the second `lstat` is what
-  # decides: a path that is not then a directory the platform owns is skipped,
-  # so nothing below it is handed over.
-  defp keep(path, platform, gid, mode) do
-    with {:ok, %{type: :directory}} <- File.lstat(path),
-         :ok <- run_handoff({"chown", ["-h", "#{platform}:#{gid}", "--", path]}),
-         :ok <- chmod(path, mode),
-         {:ok, %{type: :directory, uid: ^platform}} <- File.lstat(path) do
-      :ok
-    else
-      {:error, reason} when reason != :enoent -> {:error, reason}
-      _ -> :skip
+      _ ->
+        :ok
     end
   end
 
@@ -722,7 +722,11 @@ defmodule ExSandbox.Hardening.Linux do
   # the slots depend on. No `--`, which BSD `chmod` reads as a path; the
   # path is expanded, so it cannot begin with a dash.
   defp chmod(path, mode) do
-    case System.cmd("chmod", [Integer.to_string(mode, 8), Path.expand(path)], stderr_to_stdout: true) do
+    case System.cmd(
+           "chmod",
+           [String.pad_leading(Integer.to_string(mode, 8), 4, "0"), Path.expand(path)],
+           stderr_to_stdout: true
+         ) do
       {_, 0} -> :ok
       {output, status} -> {:error, {:chmod, status, output}}
     end
