@@ -59,6 +59,11 @@ defmodule ExSandbox.Hardening.WorkspaceBindTest do
                Linux.workspace_handoff(["lib", ".git", ".axonn-db.env"], "/ws", 4242)
     end
 
+    test "keeps the entries it is told to" do
+      assert {"chown", ["-R", "-h", "4242:4242", "--", "/ws/lib"]} =
+               Linux.workspace_handoff(["lib", ".git", ".slots"], "/ws", 4242, [".git", ".slots"])
+    end
+
     test "runs nothing for a workspace holding only .git" do
       assert Linux.workspace_handoff([".git"], "/ws", 4242) == nil
       assert Linux.workspace_handoff([], "/ws", 4242) == nil
@@ -72,7 +77,7 @@ defmodule ExSandbox.Hardening.WorkspaceBindTest do
       assert :ok = Linux.prepare_workspace(sandbox(dir))
 
       stat = File.stat!(dir)
-      assert Bitwise.band(stat.mode, 0o777) == 0o770
+      assert Bitwise.band(stat.mode, 0o7777) == 0o1770
       assert stat.uid == owner
     end
 

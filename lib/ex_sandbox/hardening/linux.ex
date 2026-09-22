@@ -597,30 +597,105 @@ defmodule ExSandbox.Hardening.Linux do
   `chown -h` changes a symlink itself rather than what it points at, and `-R`
   does not descend through one. The tree is the tenant's; a link in it to a
   platform file must not become a way to take that file over.
+
+  ## Slots
+
+  `config :ex_sandbox, :beam, workspace_slots: ".slots"` names a directory
+  whose subdirectories are linked git worktrees of the root. Each is treated
+  like the root: kept the platform's, given the sandbox's group, with only its
+  contents other than `.git` handed over. The slots directory itself is the
+  platform's, mode `0o750`, so the sandbox can enter it and cannot rename a
+  slot or put its own in one's place.
+
+  OBSERVED 2026-09-22 on production: the recursive hand-off gave `.slots`
+  away whole, and the platform's next `git checkout` in a slot died with
+  "detected dubious ownership". Re-owning a slot's `.git` would silence that
+  and hand the tenant the gitdir pointer, which is the `core.fsmonitor`
+  escape above one level down. A `.git` the tenant owns is left as it is, for
+  the platform to throw away and recreate.
+
+  The root and every slot are sticky (`0o1770`): the sandbox writes beside the
+  platform's files and cannot delete or rename them. Without it the root's
+  write bit is enough to swap `.slots` for a symlink between this function's
+  check and its `chown`.
   """
   @spec prepare_workspace(ExSandbox.Sandbox.t()) :: :ok | {:error, term()}
   def prepare_workspace(%{workspace_path: path} = sandbox) when is_binary(path) do
     uid = sandbox_uid(sandbox)
 
-    with {:ok, entries} <- File.ls(path),
+    slots = workspace_slots()
+
+    with {:ok, %{uid: platform}} <- File.lstat(path),
+         {:ok, entries} <- File.ls(path),
          :ok <- chgrp(path, uid),
-         :ok <- File.chmod(path, 0o770) do
-      entries
-      |> workspace_handoff(path, uid)
-      |> run_handoff()
+         :ok <- chmod(path, 0o1770),
+         :ok <- run_handoff(workspace_handoff(entries, path, uid, [".git" | List.wrap(slots)])) do
+      prepare_slots(slots && Path.join(path, slots), platform, uid)
     end
   end
 
   def prepare_workspace(_sandbox), do: :ok
 
   @doc false
-  # The `chown` invocation, public so it is checked without root.
-  @spec workspace_handoff([String.t()], String.t(), non_neg_integer()) ::
+  # The `chown` invocation, public so it is checked without root. `kept` are
+  # the entries of `root` that stay the platform's.
+  @spec workspace_handoff([String.t()], String.t(), non_neg_integer(), [String.t()]) ::
           {String.t(), [String.t()]} | nil
-  def workspace_handoff(entries, root, uid) do
-    case entries |> Enum.reject(&(&1 == ".git")) |> Enum.map(&Path.join(root, &1)) do
+  def workspace_handoff(entries, root, uid, kept \\ [".git"]) do
+    case entries |> Enum.reject(&(&1 in kept)) |> Enum.map(&Path.join(root, &1)) do
       [] -> nil
       paths -> {"chown", ["-R", "-h", "#{uid}:#{uid}", "--" | paths]}
+    end
+  end
+
+  defp workspace_slots do
+    Application.get_env(:ex_sandbox, :beam, []) |> Keyword.get(:workspace_slots)
+  end
+
+  defp prepare_slots(nil, _platform, _uid), do: :ok
+
+  defp prepare_slots(dir, platform, uid) do
+    with :ok <- keep(dir, platform, uid, 0o750),
+         {:ok, entries} <- File.ls(dir) do
+      entries
+      |> Enum.map(&Path.join(dir, &1))
+      |> Enum.reduce_while(:ok, fn slot, :ok ->
+        case prepare_slot(slot, platform, uid) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end)
+    else
+      :skip -> :ok
+      error -> error
+    end
+  end
+
+  # Anything in the slots directory that is not a directory (the platform's
+  # `serving` file) is left as it is.
+  defp prepare_slot(slot, platform, uid) do
+    with :ok <- keep(slot, platform, uid, 0o1770),
+         {:ok, entries} <- File.ls(slot) do
+      run_handoff(workspace_handoff(entries, slot, uid))
+    else
+      :skip -> :ok
+      error -> error
+    end
+  end
+
+  # Makes `path` the platform's with the sandbox's group, when it is a real
+  # directory. `chown -h` never follows a link, and the second `lstat` is what
+  # decides: a path that is not then a directory the platform owns is skipped,
+  # so nothing below it is handed over.
+  defp keep(path, platform, gid, mode) do
+    with {:ok, %{type: :directory}} <- File.lstat(path),
+         :ok <- run_handoff({"chown", ["-h", "#{platform}:#{gid}", "--", path]}),
+         :ok <- chmod(path, mode),
+         {:ok, %{type: :directory, uid: ^platform}} <- File.lstat(path) do
+      :ok
+    else
+      {:error, reason} when reason != :enoent -> {:error, reason}
+      _ -> :skip
     end
   end
 
@@ -640,6 +715,17 @@ defmodule ExSandbox.Hardening.Linux do
     if String.contains?(output, "Operation not permitted"),
       do: :ok,
       else: {:error, {:workspace_handoff, status, output}}
+  end
+
+  # ⚠️ The `chmod` binary, not `File.chmod/2`: MEASURED 2026-09-22 on macOS,
+  # `File.chmod(dir, 0o1770)` left `0o770`, silently dropping the sticky bit
+  # the slots depend on. No `--`, which BSD `chmod` reads as a path; the
+  # path is expanded, so it cannot begin with a dash.
+  defp chmod(path, mode) do
+    case System.cmd("chmod", [Integer.to_string(mode, 8), Path.expand(path)], stderr_to_stdout: true) do
+      {_, 0} -> :ok
+      {output, status} -> {:error, {:chmod, status, output}}
+    end
   end
 
   defp chgrp(path, gid) do
