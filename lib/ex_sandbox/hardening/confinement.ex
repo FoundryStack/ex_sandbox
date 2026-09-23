@@ -160,6 +160,36 @@ defmodule ExSandbox.Hardening.Confinement do
   Each entry is resolved the way `:permit_path` is, and is emitted **after** the
   blanket deny, because later rules win in a `sandbox-exec` profile.
 
+    * `:egress` — `:open` (the default) or `{:loopback_only, port}`. See
+      "Egress narrowed to one loopback port".
+
+  ## Egress narrowed to one loopback port
+
+  `{:loopback_only, port}` takes egress away except for TCP to `127.0.0.1:port`
+  on the host, where the caller runs a proxy that decides what the process may
+  reach. It narrows the posture above; it never widens it, and `:open` is still
+  what a caller gets by saying nothing.
+
+    * **darwin**: the profile gains `(deny network-outbound)` and one allow for
+      `localhost:<port>`. MEASURED on darwin 25.5.0: `curl --noproxy '*'` to a
+      public name exits 6 (the resolver is outbound too), to a public address
+      exits 7, to another loopback port exits 7, to a unix socket exits 7, and
+      the same request through a CONNECT proxy on `port` answers 200.
+    * **Linux**: `bwrap --unshare-net`, so the process has only its own `lo`,
+      and a bridge over a unix socket inside `:permit_path`: `socat` on the
+      host connects the socket to `127.0.0.1:port`, and `socat` inside the
+      namespace listens on `127.0.0.1:port` and connects to the socket. The
+      process sees the proxy at the same address it would on darwin. MEASURED
+      in a Debian trixie container: direct exits 6 and 7, proxied answers 200.
+      The host half runs in the launched process group, so a wrapper that
+      reaps the group reaps the bridge.
+
+  Neither half is a policy. What the process may reach is whatever the proxy on
+  `port` permits, and that proxy is the caller's.
+
+  Returns `{:error, {:cannot_enforce, :network_restriction, detail}}` for an
+  `:egress` value it does not know, and on Linux when `socat` is not on `PATH`.
+
   Returns `{:error, {:cannot_enforce, capability, detail}}` when this host
   cannot build the profile, matching `ExSandbox.Hardening`'s contract. It never
   returns a spec with the confinement omitted — that is the fail-open shape
@@ -212,6 +242,21 @@ defmodule ExSandbox.Hardening.Confinement do
   end
 
   defp build(command, args, permit_path, opts) do
+    case Keyword.get(opts, :egress, :open) do
+      :open ->
+        build(command, args, permit_path, opts, :open)
+
+      {:loopback_only, port} = egress when is_integer(port) and port in 1..65_535 ->
+        build(command, args, permit_path, opts, egress)
+
+      other ->
+        {:error,
+         {:cannot_enforce, :network_restriction,
+          "unknown :egress #{inspect(other)}; expected :open or {:loopback_only, port}"}}
+    end
+  end
+
+  defp build(command, args, permit_path, opts, egress) do
     env = Keyword.get(opts, :env, [])
     cd = Keyword.get(opts, :cd)
 
@@ -233,7 +278,7 @@ defmodule ExSandbox.Hardening.Confinement do
     extras = extra_subpaths(opts, permit_path)
 
     with :ok <- ensure_permit_path(permit_path),
-         {:ok, cmd, wrapped} <- wrap(:os.type(), command, args, permit_path, extras) do
+         {:ok, cmd, wrapped} <- wrap(:os.type(), command, args, permit_path, extras, egress) do
       # ⚠️ The RESOLVED path, for the same reason the grant uses it: on darwin
       # `System.tmp_dir!()` is a symlink, and a `cd` into the unresolved
       # spelling lands the child somewhere the profile does not name.
@@ -298,7 +343,7 @@ defmodule ExSandbox.Hardening.Confinement do
     end
   end
 
-  defp wrap({:unix, :linux}, command, args, permit_path, extras) do
+  defp wrap({:unix, :linux}, command, args, permit_path, extras, egress) do
     # ⚠️ The resolved path, not the name. This branch looked the executable up
     # and then threw the answer away, returning the literal "bwrap" while the
     # darwin branch below returns what `find_executable/1` gave it. The
@@ -314,11 +359,11 @@ defmodule ExSandbox.Hardening.Confinement do
           "bubblewrap (`bwrap`) is not on PATH; the path boundary cannot be built"}}
 
       bwrap ->
-        {:ok, bwrap, bwrap_args(command, args, permit_path, extras)}
+        linux_egress(egress, bwrap, command, args, permit_path, extras)
     end
   end
 
-  defp wrap({:unix, :darwin}, command, args, permit_path, extras) do
+  defp wrap({:unix, :darwin}, command, args, permit_path, extras, egress) do
     case System.find_executable("sandbox-exec") do
       nil ->
         {:error,
@@ -328,20 +373,104 @@ defmodule ExSandbox.Hardening.Confinement do
       sandbox_exec ->
         # `-p` takes the profile inline, so there is no temporary file to create,
         # secure, or leak. `release/1` has nothing to clean up as a result.
-        {:ok, sandbox_exec, ["-p", sandbox_profile(permit_path, command, extras), command | args]}
+        {:ok, sandbox_exec,
+         ["-p", sandbox_profile(permit_path, command, extras, egress), command | args]}
     end
   end
 
-  defp wrap(other, _command, _args, _permit_path, _extras) do
+  defp wrap(other, _command, _args, _permit_path, _extras, _egress) do
     {:error,
      {:cannot_enforce, :path_confinement,
       "no path-confinement facility is known for #{inspect(other)}"}}
   end
 
+  # Both halves write nothing: the caller reads the confined process's output,
+  # often with stderr folded into stdout, and MEASURED a bridge killed on exit
+  # printed "socat[…] W exiting on signal 15" into it. A bridge that fails is
+  # seen as a refused connection, which is how the process sees every refusal.
+  #
+  # Host half. `unlink-early` because a socket left by a killed run would make
+  # `UNIX-LISTEN` fail, and the wait is on the file because the inner half dials
+  # it only once the confined process connects, which can be at once.
+  @outer_bridge ~S"""
+  socat="$1" sock="$2" port="$3"; shift 3
+  "$socat" UNIX-LISTEN:"$sock",fork,unlink-early,unlink-close TCP:127.0.0.1:"$port" 2>/dev/null &
+  bridge=$!
+  trap 'kill "$bridge" 2>/dev/null' EXIT
+  i=0; while [ ! -S "$sock" ] && [ $i -lt 200 ]; do sleep 0.01; i=$((i+1)); done
+  "$@"
+  """
+
+  # Namespace half. `exec` so the confined command is the process the caller's
+  # signals reach, and the wait reads the kernel's listen table because `socat`
+  # reports nothing when it is ready: a command that dials first gets refused.
+  @inner_bridge ~S"""
+  socat="$1" sock="$2" port="$3"; shift 3
+  "$socat" TCP-LISTEN:"$port",bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:"$sock" 2>/dev/null &
+  hex=$(printf '%04X' "$port")
+  i=0; until grep -q ":$hex 00000000:0000 0A" /proc/net/tcp 2>/dev/null || [ $i -ge 200 ]; do sleep 0.01; i=$((i+1)); done
+  exec "$@"
+  """
+
+  defp linux_egress(:open, bwrap, command, args, permit_path, extras) do
+    {:ok, bwrap, bwrap_args(command, args, permit_path, extras, [])}
+  end
+
+  # ⚠️ The unix socket is the only thing crossing the namespace, and it lives in
+  # `permit_path` because that is the one directory both sides can already see.
+  # Its name is random so two launches sharing a directory never answer each
+  # other's bridge. A process that unlinks it and listens there itself reaches
+  # only its own listener: the socket leads to the proxy or to nothing.
+  defp linux_egress({:loopback_only, port}, bwrap, command, args, permit_path, extras) do
+    with {:ok, socat} <- socat(),
+         {:ok, sh} <- sh() do
+      socket = Path.join(permit_path, ".ex_sandbox-egress-#{random_suffix()}.sock")
+
+      inner = [
+        "-c",
+        @inner_bridge,
+        "sh",
+        socat,
+        socket,
+        Integer.to_string(port),
+        command | args
+      ]
+
+      # The command is launched by the inner `sh`, so its grant is written here
+      # rather than by `bwrap_args/5`, which grants only what it launches.
+      network = command_bind(command, permit_path) ++ ["--unshare-net"]
+      bwrap_args = bwrap_args(sh, inner, permit_path, extras, network)
+
+      {:ok, sh,
+       ["-c", @outer_bridge, "sh", socat, socket, Integer.to_string(port), bwrap | bwrap_args]}
+    end
+  end
+
+  defp socat do
+    case System.find_executable("socat") do
+      nil ->
+        {:error,
+         {:cannot_enforce, :network_restriction,
+          "`socat` is not on PATH; the loopback bridge out of the network namespace cannot be built"}}
+
+      socat ->
+        {:ok, resolve(socat)}
+    end
+  end
+
+  defp sh do
+    case System.find_executable("sh") do
+      nil -> {:error, {:cannot_enforce, :network_restriction, "`sh` is not on PATH"}}
+      sh -> {:ok, sh}
+    end
+  end
+
+  defp random_suffix, do: 8 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+
   # ⚠️ `--ro-bind` the runtime, `--bind` exactly one data path. Note what is
   # ABSENT and deliberately so, against the tenant profile at `linux.ex:316-345`:
   # no `--unshare-net`, because this process must reach the model endpoint.
-  defp bwrap_args(command, args, permit_path, extras) do
+  defp bwrap_args(command, args, permit_path, extras, network) do
     runtime_read_paths()
     |> Enum.flat_map(&["--ro-bind", &1, &1])
     |> Kernel.++(command_bind(command, permit_path))
@@ -360,9 +489,10 @@ defmodule ExSandbox.Hardening.Confinement do
       "--unshare-pid",
       "--unshare-ipc",
       "--unshare-uts",
-      "--die-with-parent",
-      command
+      "--die-with-parent"
     ])
+    |> Kernel.++(network)
+    |> Kernel.++([command])
     |> Kernel.++(args)
   end
 
@@ -371,7 +501,7 @@ defmodule ExSandbox.Hardening.Confinement do
   # before any read happens, so every breach assertion "passes" while the
   # control fails. The order matters: later rules win in a `sandbox-exec`
   # profile, so the permitted subpath must come after the blanket deny.
-  defp sandbox_profile(permit_path, command, extras) do
+  defp sandbox_profile(permit_path, command, extras, egress) do
     runtime =
       runtime_read_paths()
       |> Enum.map(&"(subpath #{sb_string(&1)})")
@@ -394,6 +524,19 @@ defmodule ExSandbox.Hardening.Confinement do
     #{writable_devices()}
     #{executable_grant(command, permit_path)}
     #{extra_grants(extras)}
+    #{network_rules(egress)}
+    """
+  end
+
+  # ⚠️ After `(allow default)`, which is what permits egress today, so this is
+  # the rule that narrows it. SBPL takes only `localhost` or `*` as the host in
+  # a `remote ip` filter, and `localhost` is loopback.
+  defp network_rules(:open), do: ""
+
+  defp network_rules({:loopback_only, port}) do
+    """
+    (deny network-outbound)
+    (allow network-outbound (remote ip "localhost:#{port}"))
     """
   end
 
@@ -594,6 +737,15 @@ defmodule ExSandbox.Hardening.Confinement do
       "/etc",
       "/private/var/db/timezone"
     ]
+    # ⚠️ Each path AND its resolved form. On darwin `/etc` is a symlink to
+    # `/private/etc` and SBPL matches the resolved path, so the `/etc` grant
+    # alone matched nothing. MEASURED: a confined `curl -p -x …` exited 1 with
+    # "Auto configuration failed", denied `/private/etc/ssl/openssl.cnf`.
+    # Replacing rather than adding broke Linux: on a usrmerge system `/lib` is
+    # a symlink to `usr/lib`, and without the symlink bound the dynamic loader's
+    # path is gone -- MEASURED on Debian trixie, every exec failed with
+    # `execvp /usr/bin/cat: No such file or directory`.
+    |> Enum.flat_map(&[&1, resolve(&1)])
     |> Enum.uniq()
     |> Enum.filter(&File.exists?/1)
     |> Enum.reject(&nested_in_other?(&1, ["/usr", "/lib", "/System"]))

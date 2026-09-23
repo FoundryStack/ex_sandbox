@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added: `Confinement.confine/2` takes `egress: {:loopback_only, port}`
+
+A confined control-plane process can be left one way out: TCP to `127.0.0.1:port`, where the
+caller runs a proxy that decides what it may reach. On darwin the profile gains `(deny
+network-outbound)` and an allow for `localhost:<port>`. On Linux the process runs under
+`bwrap --unshare-net` with a `socat` bridge over a unix socket in `:permit_path`, so it sees the
+proxy at the same address. `:open`, the default, is today's posture. An unknown value, or Linux
+without `socat`, returns `{:cannot_enforce, :network_restriction, _}`.
+`ConfinementEgressTest` refuses a direct `curl --noproxy '*'` to a non-loopback address and
+reaches the same address through a CONNECT proxy on the port, on darwin 25.5.0 and Debian trixie.
+
+### Fixed: the runtime read grant names both a path and its resolved form
+
+On darwin `/etc` is a symlink to `/private/etc`, and SBPL matches resolved paths, so the `/etc`
+grant matched nothing: a confined `curl` could not read `/private/etc/ssl/openssl.cnf`. Both
+spellings are granted now. The symlink is kept because Linux needs it: on a usrmerge system the
+dynamic loader is reached through `/lib`.
+
 ### Added: `Beam.address/1` returns the sandbox's service port on host loopback
 
 A Beam sandbox that names a `service_port` is launched with `pasta -t 127.0.0.1/<host>:<port>`
