@@ -39,7 +39,9 @@ defmodule ExSandbox.Egress.Policy do
   A permitted destination. `:any_port` admits a host on every port; a specific
   port admits only that one.
   """
-  @type destination :: {ip() | String.t(), :inet.port_number() | :any_port}
+  @type destination ::
+          {ip() | String.t(), :inet.port_number() | :any_port}
+          | {:public, [:inet.ip_address()]}
 
   @typedoc "The /30 a sandbox's connections originate from, as `{a, b, c, d}`."
   @type source_key :: ip()
@@ -73,6 +75,11 @@ defmodule ExSandbox.Egress.Policy do
   addresses}`. It is what makes a hostname entry able to match at all
   (`029-FR-012`); omitted, it defaults to `%{}` and no hostname entry matches
   anything, which is the pre-`029` behaviour and is default-deny.
+
+  A `{:public, alias_addresses}` entry (`ExSandbox.Egress.Allowlist`'s
+  `"public"`) permits a destination on any port whose **address** falls in no
+  class `ExSandbox.Egress.Refusal` refuses, `alias_addresses` included. A
+  destination given as a name is never permitted by it.
   """
   @spec permits?([destination()], {ip() | String.t(), :inet.port_number()}, resolutions()) ::
           boolean()
@@ -83,6 +90,9 @@ defmodule ExSandbox.Egress.Policy do
     normalised = normalise_host(host)
 
     Enum.any?(allowed, fn
+      {:public, alias_addresses} ->
+        public?(normalised, alias_addresses)
+
       {allowed_host, allowed_port} when allowed_port == port or allowed_port == :any_port ->
         host_matches?(allowed_host, normalised, resolutions)
 
@@ -110,6 +120,15 @@ defmodule ExSandbox.Egress.Policy do
   # tenant's connection against an answer the tenant never received -- a
   # different name-to-address mapping than the one it acted on, so a rotation
   # or a split-horizon zone would refuse a connection the operator permitted.
+  # ⚠️ Only an address is classified. A destination that is still a name after
+  # `normalise_host/1` is refused here: the name says nothing about where the
+  # connection lands, and the dialled address is the only thing the tenant
+  # cannot choose after the fact (`ExSandbox.Egress.Refusal`).
+  defp public?(address, alias_addresses) when is_tuple(address),
+    do: not ExSandbox.Egress.Refusal.refused?(address, alias_addresses)
+
+  defp public?(_name, _alias_addresses), do: false
+
   defp host_matches?(allowed_host, normalised_destination, resolutions) do
     case normalise_host(allowed_host) do
       host when is_tuple(host) ->

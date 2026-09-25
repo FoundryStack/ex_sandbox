@@ -37,7 +37,7 @@ defmodule ExSandbox.Egress.HostAliases do
   against.
 
   ⚠️ **`:host_alias` wins over `:rfc1918_private` when both match**, which is
-  the ordering `Allowlist.host_class/2` already fixes. Nearly every address here
+  the ordering `ExSandbox.Egress.Refusal.class/2` already fixes. Nearly every address here
   is also private, so without that ordering this whole list would be invisible
   in the error an operator reads.
 

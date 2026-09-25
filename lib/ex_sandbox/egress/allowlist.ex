@@ -73,6 +73,26 @@ defmodule ExSandbox.Egress.Allowlist do
   | `"host:*"` | that host on every port |
   | `{"host", 443}` | already-parsed, passes through |
   | `{"host", :any_port}` | already-parsed, passes through |
+  | `"public"` or `:public` | every public address on every port; see below |
+
+  ### `"public"`
+
+  Parses to `{:public, alias_addresses}`: the host aliases this parse was
+  given, carried as data so the per-connection decision can refuse them
+  without asking the host again. `ExSandbox.Egress.Policy.permits?/3` permits a
+  connection under it when the address the connection was **dialled to** is
+  outside every refused class below. It never looks at a name, so a public
+  name whose zone answers `10.0.0.5` is refused as `:rfc1918_private` on
+  connect.
+
+  ⚠️ **A word, not `*:*`.** `host:port` is a grammar for one host, and `*` in
+  the host position would read as a wildcard that `"*:443"` could narrow. It
+  cannot: this form has no port, and granting every public host on one port is
+  not expressible. `"public"` has no colon, so it collides with no
+  `host:port` entry, and with no host (a bare host is always unreadable).
+
+  An already-parsed `{:public, _}` handed back in is rebuilt with **this**
+  parse's aliases, never passed through with its own.
 
   ⚠️ There is deliberately **no bare `"host"` form**. It reads as "this host",
   but it has to resolve to either one port or all of them, and the safe reading
@@ -134,9 +154,10 @@ defmodule ExSandbox.Egress.Allowlist do
   """
 
   alias ExSandbox.Egress.Policy
+  alias ExSandbox.Egress.Refusal
 
   @typedoc "An entry as a project's settings may express it."
-  @type entry :: String.t() | Policy.destination()
+  @type entry :: String.t() | :public | Policy.destination()
 
   @typedoc """
   The class an entry was refused for (`029-FR-015`).
@@ -150,14 +171,7 @@ defmodule ExSandbox.Egress.Allowlist do
   *is the host* depends on the mechanism the caller runs, so it arrives as
   data (see `parse/2`) rather than being recognised here.
   """
-  @type class ::
-          :loopback
-          | :rfc1918_private
-          | :link_local
-          | :cloud_metadata
-          | :unique_local
-          | :unspecified
-          | :host_alias
+  @type class :: ExSandbox.Egress.Refusal.class()
 
   @typedoc """
   A thing that *is* the host, as a caller may express it.
@@ -166,7 +180,7 @@ defmodule ExSandbox.Egress.Allowlist do
   (`"host.docker.internal"`). Ports are not part of an alias: a destination is
   the host, or it is not, and naming a port would permit every other one.
   """
-  @type host_alias :: String.t() | :inet.ip_address()
+  @type host_alias :: ExSandbox.Egress.Refusal.host_alias()
 
   @typedoc """
   Why parsing refused.
@@ -198,11 +212,12 @@ defmodule ExSandbox.Egress.Allowlist do
   def parse(nil, _host_aliases), do: {:ok, []}
 
   def parse(entries, host_aliases) when is_list(entries) do
-    aliases = normalise_aliases(host_aliases)
+    aliases = Refusal.normalise_aliases(host_aliases)
+    public = {:public, aliases.addresses |> MapSet.to_list()}
 
     {parsed, invalid, refused} =
       Enum.reduce(entries, {[], [], []}, fn entry, {ok, bad, no} ->
-        with {:ok, destination} <- parse_entry(entry),
+        with {:ok, destination} <- parse_entry(entry, public),
              nil <- refusal_class(destination, aliases) do
           {[destination | ok], bad, no}
         else
@@ -247,7 +262,7 @@ defmodule ExSandbox.Egress.Allowlist do
   """
   @spec classify(term(), [host_alias()]) :: class() | nil
   def classify(host, host_aliases \\ []),
-    do: host_class(host, normalise_aliases(host_aliases))
+    do: Refusal.class(host, Refusal.normalise_aliases(host_aliases))
 
   @doc """
   Why an entry of `class` was refused, as a clause a person can act on.
@@ -258,10 +273,10 @@ defmodule ExSandbox.Egress.Allowlist do
   "provisioning failed" — the exact sentence the class was added to replace.
   A class nobody renders is the same defect as a check that cannot fail.
 
-  The sentence lives **here**, beside the classifier, rather than at whichever
+  The sentence lives **here**, beside the table of classes, rather than at whichever
   surface happens to show it. Two surfaces writing their own would be two
   vocabularies for one set of atoms, and the one nobody reads is the one that
-  stops matching `address_class/1`.
+  stops matching `ExSandbox.Egress.Refusal`.
 
   ⚠️ The atom is **not** in the sentence — `describe/1` puts it there. This is
   the prose half only, so a caller rendering somewhere the atom would be noise
@@ -290,7 +305,7 @@ defmodule ExSandbox.Egress.Allowlist do
 
   This is what `029-FR-014` asks for and what nothing produced: the answer to
   *"why was this refused?"* in a form that can be put in front of a person
-  who is not going to read `address_class/1`.
+  who is not going to read `ExSandbox.Egress.Refusal`.
 
   ⚠️ **The class atom is printed literally, alongside its prose.** Not
   decoration: `:cloud_metadata` is the string an operator greps for, pastes
@@ -335,100 +350,21 @@ defmodule ExSandbox.Egress.Allowlist do
 
   defp format_host(other), do: inspect(other)
 
+  # `:public` names no host, so there is nothing to refuse at parse time; the
+  # classes are applied to each dialled address instead (`Policy.permits?/3`).
+  defp refusal_class({:public, _alias_addresses}, _aliases), do: nil
+
   # The port is deliberately unread. A destination either is the host or is not;
   # a class that depended on the port would refuse `127.0.0.1:5432` and permit
   # `127.0.0.1:5433`.
-  defp refusal_class({host, _port}, aliases), do: host_class(host, aliases)
+  defp refusal_class({host, _port}, aliases), do: Refusal.class(host, aliases)
 
-  # ⚠️ **The alias comparison happens AFTER normalisation, and that placement is
-  # the whole of `029 T009a`.** Compared as written, an alias `"10.0.0.1"` would
-  # miss an entry spelled `"10.0.0.01"`, `{10, 0, 0, 1}` or `"0xa000001"` --
-  # all of which `:inet.parse_address/1` reads as the same address (measured:
-  # `:inet.parse_address(~c"127.1") == {:ok, {127, 0, 0, 1}}`). Normalising
-  # first means aliases inherit that permissive parsing for free rather than
-  # needing a spelling table nobody can keep complete.
-  #
-  # ⚠️ **029 T008's built-in classes are folded in below** -- `:loopback`,
-  # `:rfc1918_private`, `:link_local`, `:cloud_metadata`, `:unique_local`,
-  # `:unspecified` on the address branch and the `localhost` family on the name
-  # branch. (An earlier revision of this comment said they were absent from the
-  # tree; they were merged in the same fold and the note outlived its subject.)
-  @spec host_class(term(), %{addresses: MapSet.t(), names: MapSet.t()}) :: class() | nil
-  defp host_class(host, aliases) do
-    case normalise_host(host) do
-      {:address, address} ->
-        # ⚠️ **`:host_alias` wins over a built-in class when both match, and the
-        # first fold of these two functions had it the other way round.** The
-        # agent's own tests caught it: a host alias is very often *also*
-        # RFC1918 -- pasta's gateway and Docker Desktop's host address both are
-        # -- so built-in-first makes `:host_alias` a class that almost never
-        # fires. A refusal reason that cannot be reached is the same defect as
-        # a check that cannot fail, in the error vocabulary instead of the
-        # suite.
-        #
-        # It is also the more useful of the two true statements. "This is a
-        # private address" and "this is the machine you are running on" are
-        # both correct about `10.0.0.1`; only the second tells the operator
-        # what `FR-015` is actually for. An operator who then tries a different
-        # private address gets `:rfc1918_private` and learns the general rule
-        # too.
-        alias_class(aliases.addresses, address) || address_class(address)
-
-      {:name, name} ->
-        alias_class(aliases.names, name) || name_class(name)
-    end
-  end
-
-  defp alias_class(set, value), do: if(MapSet.member?(set, value), do: :host_alias)
-
-  defp normalise_aliases(host_aliases) when is_list(host_aliases) do
-    Enum.reduce(host_aliases, %{addresses: MapSet.new(), names: MapSet.new()}, fn
-      host, acc ->
-        case normalise_host(host) do
-          {:address, address} -> %{acc | addresses: MapSet.put(acc.addresses, address)}
-          {:name, name} -> %{acc | names: MapSet.put(acc.names, name)}
-        end
-    end)
-  end
-
-  # ⚠️ A non-list alias set is a caller bug and is raised rather than coerced.
-  # Treating it as "no aliases" would silently drop the FR-015 exclusion, which
-  # is the one failure this whole task exists to prevent.
-  defp normalise_aliases(other),
-    do: raise(ArgumentError, "host_aliases must be a list, got: #{inspect(other)}")
-
-  defp normalise_host(host) when is_tuple(host), do: {:address, canonicalise(host)}
-
-  defp normalise_host(host) when is_binary(host) do
-    # ⚠️ Brackets are stripped first, and this is not cosmetic. `parse/1`
-    # **keeps** them: `parse(["[::1]:5432"])` yields `{"[::1]", 5432}`
-    # (measured), and `:inet.parse_address(~c"[::1]")` is `{:error, :einval}`.
-    # So any classifier that hands the host straight to `parse_address/1` reads
-    # every bracketed IPv6 literal as a *hostname* and lets it through.
-    case :inet.parse_address(host |> strip_brackets() |> String.to_charlist()) do
-      {:ok, address} -> {:address, canonicalise(address)}
-      {:error, _} -> {:name, String.downcase(host)}
-    end
-  end
-
-  # Anything else cannot be a host; `parse_entry/1` has already refused it.
-  defp normalise_host(other), do: {:name, inspect(other)}
-
-  defp strip_brackets("[" <> rest) do
-    case String.split(rest, "]") do
-      [inner | _] -> inner
-      _ -> rest
-    end
-  end
-
-  defp strip_brackets(host), do: host
-
-  # An IPv4-mapped IPv6 address is the IPv4 address wearing a second spelling.
-  # Collapsing it means one alias covers both forms.
-  defp canonicalise({0, 0, 0, 0, 0, 0xFFFF, a, b}),
-    do: {Bitwise.bsr(a, 8), Bitwise.band(a, 0xFF), Bitwise.bsr(b, 8), Bitwise.band(b, 0xFF)}
-
-  defp canonicalise(address), do: address
+  # ⚠️ The alias addresses are this parse's, never the entry's. An already-parsed
+  # `{:public, addresses}` handed back in is rebuilt rather than passed through,
+  # so a caller cannot narrow the host's exclusion by editing the list it carries.
+  defp parse_entry(entry, public) when entry in ["public", :public], do: {:ok, public}
+  defp parse_entry({:public, addresses}, public) when is_list(addresses), do: {:ok, public}
+  defp parse_entry(entry, _public), do: parse_entry(entry)
 
   defp parse_entry({host, :any_port} = destination) when is_binary(host) or is_tuple(host),
     do: {:ok, destination}
@@ -467,75 +403,4 @@ defmodule ExSandbox.Egress.Allowlist do
 
   defp build("", _port), do: :error
   defp build(host, port), do: {:ok, {host, port}}
-
-  # --- 029-FR-015: refused address classes -----------------------------------
-
-  # ⚠️ RFC 6761 reserves these names for loopback, so they are addresses
-  # wearing a name rather than hostnames that happen to resolve inward.
-  # Without them the entire guard is bypassed by writing `localhost:8080`,
-  # which is the first thing anyone tries.
-  @loopback_names ~w(localhost localhost.localdomain ip6-localhost ip6-loopback)
-
-  # ⚠️ The bracket-stripping and the reliance on `:inet.parse_address/1` being
-  # *permissive* both moved into `normalise_host/1` above, where the alias set
-  # goes through the same normalisation. That is the point of T009a: compared
-  # as written, an alias `"10.0.0.1"` would miss an entry spelled `"10.0.0.01"`
-  # or `"0xa000001"`, which `parse_address/1` reads as the same address.
-  # Measured on OTP: `"127.1"`, `"2130706433"` and `"0x7f000001"` all parse to
-  # `{127, 0, 0, 1}`, and glibc resolves every one of them to loopback. A
-  # dotted-quad-only regexp would have let all three through as "hostnames".
-  defp name_class(host) do
-    if String.downcase(host) in @loopback_names, do: :loopback, else: nil
-  end
-
-  # --- IPv4 ---
-
-  @spec address_class(:inet.ip_address()) :: class() | nil
-  defp address_class({127, _, _, _}), do: :loopback
-
-  # ⚠️ `0.0.0.0` is not "nowhere". Linux `connect(2)` to it reaches
-  # `127.0.0.1`, so it is a loopback spelling that does not contain `127`.
-  defp address_class({0, _, _, _}), do: :unspecified
-
-  defp address_class({10, _, _, _}), do: :rfc1918_private
-  defp address_class({172, b, _, _}) when b >= 16 and b <= 31, do: :rfc1918_private
-  defp address_class({192, 168, _, _}), do: :rfc1918_private
-
-  # ⚠️ Before the general link-local clause, and the ordering is the message.
-  # See the moduledoc: "link-local" is a true and useless thing to tell an
-  # operator who typed the instance-credentials endpoint.
-  defp address_class({169, 254, 169, 254}), do: :cloud_metadata
-  defp address_class({169, 254, _, _}), do: :link_local
-
-  defp address_class({a, b, c, d})
-       when is_integer(a) and is_integer(b) and is_integer(c) and is_integer(d),
-       do: nil
-
-  # --- IPv6 ---
-
-  defp address_class({0, 0, 0, 0, 0, 0, 0, 1}), do: :loopback
-  defp address_class({0, 0, 0, 0, 0, 0, 0, 0}), do: :unspecified
-
-  # ⚠️ IPv4-mapped (`::ffff:a.b.c.d`). `"::ffff:127.0.0.1"` parses to
-  # `{0, 0, 0, 0, 0, 65535, 32512, 1}` -- no `127` anywhere in the tuple, and
-  # every IPv4 clause above misses it. Re-ask the question of the embedded
-  # address rather than adding an IPv6 spelling of each rule.
-  defp address_class({0, 0, 0, 0, 0, 0xFFFF, ab, cd}) do
-    address_class({
-      Bitwise.bsr(ab, 8),
-      Bitwise.band(ab, 0xFF),
-      Bitwise.bsr(cd, 8),
-      Bitwise.band(cd, 0xFF)
-    })
-  end
-
-  # `fe80::/10` -- the top ten bits are `1111111010`.
-  defp address_class({a, _, _, _, _, _, _, _}) when Bitwise.band(a, 0xFFC0) == 0xFE80,
-    do: :link_local
-
-  # `fc00::/7` -- the top seven bits are `1111110`, covering `fc00::`-`fdff::`.
-  defp address_class({a, _, _, _, _, _, _, _}) when Bitwise.band(a, 0xFE00) == 0xFC00,
-    do: :unique_local
-
-  defp address_class(_address), do: nil
 end
