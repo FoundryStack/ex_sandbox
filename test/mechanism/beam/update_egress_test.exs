@@ -19,8 +19,13 @@ defmodule ExSandbox.Mechanism.Beam.UpdateEgressTest do
   alias ExSandbox.Sandbox
 
   test "a destination added to a running sandbox is reachable on the next dial" do
-    permitted = Network.permitted_address()
-    {host, port} = added = Network.denied_address()
+    # ⚠️ The destination that moves onto the list is `permitted_address/0`,
+    # not `denied_address/0`. The probe sends one byte and reads, and 8.8.8.8:53
+    # closes on it: measured from the host with no sandbox at all, it answers
+    # `{error, closed}`, which the probe scores `:refused`. A test adding it
+    # could never see `:connected`, however well the update worked.
+    initial = Network.denied_address()
+    {host, port} = added = Network.permitted_address()
 
     sandbox =
       ExSandbox.Test.IsolationLaunch.provision_or_skip(Beam, %Sandbox{
@@ -30,7 +35,7 @@ defmodule ExSandbox.Mechanism.Beam.UpdateEgressTest do
         cpu_limit: 500,
         memory_limit_mb: 128,
         disk_quota_mb: 256,
-        context: %{network_allowlist: [permitted]}
+        context: %{network_allowlist: [initial]}
       })
 
     # ⚠️ The host must reach the destination itself, or "still refused after
@@ -69,9 +74,9 @@ defmodule ExSandbox.Mechanism.Beam.UpdateEgressTest do
                    5_000
 
     assert {:ok, updated} =
-             ExSandbox.update_egress(Beam, sandbox, [permitted, added], host_aliases: [])
+             ExSandbox.update_egress(Beam, sandbox, [initial, added], host_aliases: [])
 
-    assert updated.context.network_allowlist == [permitted, added]
+    assert updated.context.network_allowlist == [initial, added]
 
     assert sandbox.context.connect.(host, port) == :connected,
            "the running sandbox still refused #{host}:#{port} after the update"

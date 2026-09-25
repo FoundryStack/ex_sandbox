@@ -18,8 +18,11 @@ defmodule ExSandbox.Mechanism.Beam.PublicEgressTest do
   alias ExSandbox.Sandbox
 
   test "public reaches a host on no list and never the refused classes" do
-    permitted = Network.permitted_address()
-    {host, port} = Network.denied_address()
+    # ⚠️ The destination on no list is `permitted_address/0`, which answers the
+    # probe's byte. `denied_address/0` (8.8.8.8:53) closes on it, and the probe
+    # scores that `:refused` even when the connection was relayed.
+    listed = Network.denied_address()
+    {host, port} = Network.permitted_address()
 
     sandbox =
       ExSandbox.Test.IsolationLaunch.provision_or_skip(Beam, %Sandbox{
@@ -29,7 +32,7 @@ defmodule ExSandbox.Mechanism.Beam.PublicEgressTest do
         cpu_limit: 500,
         memory_limit_mb: 128,
         disk_quota_mb: 256,
-        context: %{network_allowlist: [permitted]}
+        context: %{network_allowlist: [listed]}
       })
 
     case :gen_tcp.connect(String.to_charlist(host), port, [], 3_000) do
@@ -49,6 +52,13 @@ defmodule ExSandbox.Mechanism.Beam.PublicEgressTest do
 
     on_exit(fn -> :telemetry.detach(handler) end)
 
+    {:ok, target} = :inet.parse_address(String.to_charlist(host))
+
+    refute sandbox.context.connect.(host, port) == :connected,
+           "#{host}:#{port} was reachable before public was set"
+
+    assert_receive {:refused_event, %{address: ^target, port: ^port}}, 5_000
+
     assert {:ok, _} = ExSandbox.update_egress(Beam, sandbox, ["public"])
 
     assert sandbox.context.connect.(host, port) == :connected,
@@ -66,9 +76,13 @@ defmodule ExSandbox.Mechanism.Beam.PublicEgressTest do
                      "#{inward} was not refused by the acceptor's decision"
     end
 
-    assert {:ok, _} = ExSandbox.update_egress(Beam, sandbox, [permitted])
+    assert {:ok, _} = ExSandbox.update_egress(Beam, sandbox, [listed])
 
     refute sandbox.context.connect.(host, port) == :connected,
            "#{host}:#{port} stayed reachable after public was replaced"
+
+    assert_receive {:refused_event, %{address: ^target, port: ^port, reason: :not_permitted}},
+                   5_000,
+                   "#{host}:#{port} was not refused by the decision after public was replaced"
   end
 end
