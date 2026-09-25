@@ -1339,6 +1339,34 @@ defmodule ExSandbox.Mechanism.Beam do
     end
   end
 
+  @impl true
+  def update_egress(%Sandbox{} = sandbox, allowed) when is_list(allowed) do
+    with {:ok, launched} <- lookup_or_absent(sandbox),
+         :ok <- rebind(launched, allowed) do
+      {:ok, %{sandbox | context: put_allowlist(sandbox.context, allowed)}}
+    end
+  end
+
+  defp lookup_or_absent(sandbox) do
+    with :error <- lookup_sandbox(sandbox), do: {:error, :absent}
+  end
+
+  # ⚠️ A sandbox launched with an empty allowlist has no binding, no acceptor
+  # and no redirect: its namespace reaches nothing because nothing was built.
+  # There is no policy to replace, so saying the list applied would be false.
+  defp rebind(%{binding: %ExSandbox.Egress.Binding{} = binding}, allowed),
+    do: ExSandbox.Egress.Binding.rebind(binding, allowed)
+
+  defp rebind(_launched, _allowed), do: {:error, :no_live_policy}
+
+  # Where `NodeLauncher.egress_allowlist/1` reads it, so a stopped sandbox
+  # started again launches with the list it had last, not the one it was
+  # provisioned with.
+  defp put_allowlist(context, allowed) when is_map(context),
+    do: Map.put(context, :network_allowlist, allowed)
+
+  defp put_allowlist(_context, allowed), do: %{network_allowlist: allowed}
+
   @doc false
   # Public so `ExSandbox.Mechanism.BeamAddressTest` can read a launched row's
   # address on a host where the launch path cannot run.

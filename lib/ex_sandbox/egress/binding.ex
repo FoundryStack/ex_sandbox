@@ -84,6 +84,22 @@ defmodule ExSandbox.Egress.Binding do
   end
 
   @doc """
+  Replaces the allowlist this binding's `/30` carries, while the sandbox runs.
+
+  The `/30` stays held and the next connection is decided against `allowed`.
+  Connections already relayed are not touched: the decision is taken once,
+  when a connection is accepted.
+
+  Refuses with `{:error, :not_registered}` for a binding already released, so a
+  late update cannot resurrect a policy under a `/30` the pool may have handed
+  to another tenant.
+  """
+  @spec rebind(t(), [Policy.destination()], keyword()) :: :ok | {:error, :not_registered}
+  def rebind(%__MODULE__{source_key: source_key}, allowed, opts \\ []) when is_list(allowed) do
+    EgressRegistry.replace(source_key, allowed, Keyword.get(opts, :registry, EgressRegistry))
+  end
+
+  @doc """
   Gives back the policy and then the `/30`.
 
   Idempotent, and safe for a binding this host never issued (`003-FR-013`):

@@ -176,6 +176,43 @@ defmodule ExSandbox do
   end
 
   @doc """
+  Replaces the destinations a running sandbox may reach, without restarting it.
+
+  `entries` are written as `ExSandbox.Egress.Allowlist.parse/2` reads them, and
+  are parsed by it here, so an entry refused at provision is refused here too,
+  with the same error. `opts[:host_aliases]` is handed to the parser; it
+  defaults to `ExSandbox.Egress.HostAliases.detect/0`.
+
+  Returns the sandbox with the new list recorded for the next start, or:
+
+    * `{:error, :egress_not_enforced}` when the mechanism does not implement
+      `c:ExSandbox.Mechanism.update_egress/2`. Its sandboxes are not held to any
+      list, so there is nothing to update and the caller must not report one
+      as applied.
+    * `{:error, Allowlist.error()}` when an entry is unreadable or refused.
+    * whatever the mechanism refuses with, such as a sandbox it does not hold.
+
+  Not capability-gated, like `execute/4`: it changes a sandbox whose
+  confinement was decided at its launch.
+  """
+  @spec update_egress(mechanism(), Sandbox.t(), [ExSandbox.Egress.Allowlist.entry()], keyword()) ::
+          {:ok, Sandbox.t()}
+          | {:error, :egress_not_enforced | ExSandbox.Egress.Allowlist.error() | term()}
+  def update_egress(mechanism, %Sandbox{} = sandbox, entries, opts \\ []) do
+    aliases = Keyword.get_lazy(opts, :host_aliases, &ExSandbox.Egress.HostAliases.detect/0)
+
+    with {:ok, allowed} <- ExSandbox.Egress.Allowlist.parse(entries, aliases) do
+      Code.ensure_loaded(mechanism)
+
+      if function_exported?(mechanism, :update_egress, 2) do
+        mechanism.update_egress(sandbox, allowed)
+      else
+        {:error, :egress_not_enforced}
+      end
+    end
+  end
+
+  @doc """
   Every sandbox the mechanism currently believes is running.
 
   Nothing in the happy path calls this; it exists so a host can reconcile

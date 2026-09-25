@@ -25,7 +25,7 @@ host.
 | | |
 |---|---|
 | **[Getting started](docs/getting-started.md)** | Provision, start, execute and destroy a real sandbox, end to end. Start here. |
-| **[How to implement a mechanism](docs/how-to/implement-a-mechanism.md)** | The 11 callbacks, in the order to build them, and what each one must not do. |
+| **[How to implement a mechanism](docs/how-to/implement-a-mechanism.md)** | The 13 callbacks, in the order to build them, and what each one must not do. |
 | **[How to read a refusal](docs/how-to/read-a-refusal.md)** | The three shapes a refusal takes and the decision each one implies. |
 | **[Why refusal is the design](docs/explanation/refusal.md)** | The argument, and the four times this repository shipped the opposite defect. |
 | **[What `005-FR-011` means](docs/requirement-ids.md)** | The citation scheme in the source, and the name `Axonn`. |

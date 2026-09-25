@@ -10,8 +10,9 @@ with a callback.
 
 ## 0. Know the size of the job
 
-`ExSandbox.Mechanism` declares **11 callbacks**, 3 of them optional
-(`required_capabilities/0`, `constructed_capabilities/0`, `address/1`).
+`ExSandbox.Mechanism` declares **13 callbacks**, 5 of them optional
+(`required_capabilities/0`, `constructed_capabilities/0`, `address/1`,
+`address/2`, `update_egress/2`).
 
 ⚠️ Do not trust that count either — including this one. That moduledoc said
 "seven" while the file declared eight. Count `@callback` in
@@ -150,7 +151,18 @@ sandbox: `Mechanism.Beam` returns `nil` rather than its `"peer:<id>"` reference,
 because a caller putting that in an `iframe` gets a broken frame instead of a
 clear absence.
 
-## 7. There is no `compile` callback, and there will not be one
+## 7. Optional: `update_egress/2`
+
+Implement it only if your sandboxes' egress is decided per connection, so a new
+list can take effect on the next connection without a restart. It receives the
+list already parsed by `ExSandbox.Egress.Allowlist.parse/2`.
+
+⚠️ A mechanism whose sandboxes reach every host must **not** implement it.
+`ExSandbox.update_egress/4` answers `{:error, :egress_not_enforced}` when the
+callback is absent, and that answer is how a caller learns the list is not in
+force. Accepting the list and doing nothing would tell it the opposite.
+
+## 8. There is no `compile` callback, and there will not be one
 
 Building a tenant's application is per-stack work, owned by `009-stack-adapters`
 and run *inside* an already-provisioned sandbox (`007-FR-041`, `013-FR-021`). A
@@ -158,7 +170,7 @@ and run *inside* an already-provisioned sandbox (`007-FR-041`, `013-FR-021`). A
 stack — the coupling Principle VI exists to prevent. A mechanism provisions a
 place to run things; what gets built there is not its business.
 
-## 8. Run conformance, in your own project
+## 9. Run conformance, in your own project
 
 ```elixir
 defmodule MyMechanismConformanceTest do
@@ -186,7 +198,7 @@ this repository could never be run against a third-party mechanism at all
 passing. See [How to read a refusal](read-a-refusal.md) — a report of all ⚠️ is a
 report that nothing was verified.
 
-## 9. Probe what the launch actually does
+## 10. Probe what the launch actually does
 
 If your mechanism contributes a capability probe, the probe must attempt the
 operation the launch attempts. A probe testing an easier operation reports a

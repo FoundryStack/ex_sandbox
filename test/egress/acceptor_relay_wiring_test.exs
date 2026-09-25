@@ -214,6 +214,33 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
     Task.shutdown(echo, :brutal_kill)
   end
 
+  test "a replaced allowlist decides the next connection", %{registry: registry} do
+    # ⚠️ The acceptor reads the registry per connection, so a replace takes
+    # effect on the next accept with no restart. A replace that delegated to
+    # `assign/3` would answer `:still_registered` and fail the match below.
+    {dest_port, echo} = echo_server()
+    :ok = Registry.assign(@source_key, [{"127.0.0.1", dest_port + 1}], registry)
+
+    {refused_client, refused_side} = accepted_pair()
+    handle_owned(refused_side, state(registry, {:ok, {{127, 0, 0, 1}, dest_port}}))
+    assert_receive {:handled, :ok}, 5_000
+
+    assert {:error, :closed} = :gen_tcp.recv(refused_client, 0, 5_000),
+           "the destination was reachable before the allowlist named it"
+
+    assert :ok = Registry.replace(@source_key, [{"127.0.0.1", dest_port}], registry)
+
+    {client, server_side} = accepted_pair()
+    handle_owned(server_side, state(registry, {:ok, {{127, 0, 0, 1}, dest_port}}))
+
+    assert :ok = :gen_tcp.send(client, "after")
+
+    assert {:ok, "after"} = :gen_tcp.recv(client, 0, 5_000),
+           "the connection after the replace was still refused"
+
+    Task.shutdown(echo, :brutal_kill)
+  end
+
   test "an unknown source is closed even though a relay now exists", %{registry: registry} do
     # Default-deny, re-checked now that a forwarding path exists. `decide/3`'s
     # unit test covers the verdict; this covers the consequence at the socket.

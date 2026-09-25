@@ -82,6 +82,29 @@ defmodule ExSandbox.Egress.Registry do
   end
 
   @doc """
+  Replaces the allowlist of a `source_key` that is already registered, keeping
+  what the sandbox resolved.
+
+  Refuses with `{:error, :not_registered}` for a /30 carrying no policy.
+
+  ⚠️ **Not an `assign/3` that tolerates overwrite, and the difference is the
+  invariant above.** `assign/3` hands a /30 to a *new* tenant and must refuse a
+  stale entry. This changes the policy of the tenant that already holds the
+  /30, so it must refuse the opposite state: a key with no entry is a sandbox
+  that was released or never assigned, and creating one here would file a
+  policy no `release/2` will ever remove.
+
+  The resolutions are kept because they are this same tenant's answers. A
+  connection opened against a name resolved before the change is judged
+  against the new list with the address that name really returned.
+  """
+  @spec replace(Policy.source_key(), [Policy.destination()], GenServer.server()) ::
+          :ok | {:error, :not_registered}
+  def replace(source_key, allowed, server \\ @name) when is_list(allowed) do
+    GenServer.call(server, {:replace, source_key, allowed})
+  end
+
+  @doc """
   Returns the allowlist for `source_key`, or `[]` when none is registered.
 
   ⚠️ `[]` rather than an error, and rather than `nil`. An unregistered source
@@ -164,6 +187,13 @@ defmodule ExSandbox.Egress.Registry do
 
       :error ->
         {:reply, :ok, Map.put(policies, key, %{allowed: allowed, resolutions: %{}})}
+    end
+  end
+
+  def handle_call({:replace, key, allowed}, _from, policies) do
+    case Map.fetch(policies, key) do
+      {:ok, existing} -> {:reply, :ok, Map.put(policies, key, %{existing | allowed: allowed})}
+      :error -> {:reply, {:error, :not_registered}, policies}
     end
   end
 

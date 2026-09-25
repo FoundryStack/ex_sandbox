@@ -294,8 +294,26 @@ defmodule ExSandbox.Mechanism do
   @callback address(Sandbox.t(), :inet.port_number()) ::
               {:ok, String.t() | nil} | {:error, term()}
 
+  @doc """
+  Replaces the destinations a running sandbox may reach, without restarting it.
+
+  `allowed` is already parsed, as `ExSandbox.Egress.Allowlist.parse/2` returns
+  it. The next connection the sandbox opens is decided against it; connections
+  already open are left alone. Returns the sandbox with `allowed` recorded
+  where this mechanism reads it at launch, so a later start keeps it.
+
+  Optional, and **only for a mechanism that enforces egress per connection**.
+  A mechanism whose sandboxes reach every host must leave it out rather than
+  accept the list and do nothing: `ExSandbox.update_egress/4` answers
+  `{:error, :egress_not_enforced}` for a mechanism without it, and that answer
+  is the only way a caller learns the list is not in force.
+  """
+  @callback update_egress(Sandbox.t(), [ExSandbox.Egress.Policy.destination()]) ::
+              {:ok, Sandbox.t()} | {:error, term()}
+
   @optional_callbacks required_capabilities: 0,
                       constructed_capabilities: 0,
                       address: 1,
-                      address: 2
+                      address: 2,
+                      update_egress: 2
 end
