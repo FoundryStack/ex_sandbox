@@ -389,14 +389,17 @@ defmodule ExSandbox.Hardening.Confinement do
   # printed "socat[…] W exiting on signal 15" into it. A bridge that fails is
   # seen as a refused connection, which is how the process sees every refusal.
   #
-  # Host half. `unlink-early` because a socket left by a killed run would make
+  # Host half. It makes the socket's directory, owner-only, and removes it on
+  # exit. `unlink-early` because a socket left by a killed run would make
   # `UNIX-LISTEN` fail, and the wait is on the file because the inner half dials
   # it only once the confined process connects, which can be at once.
   @outer_bridge ~S"""
   socat="$1" sock="$2" port="$3"; shift 3
+  dir=$(dirname "$sock")
+  mkdir -m 700 "$dir" 2>/dev/null
   "$socat" UNIX-LISTEN:"$sock",fork,unlink-early,unlink-close TCP:127.0.0.1:"$port" 2>/dev/null &
   bridge=$!
-  trap 'kill "$bridge" 2>/dev/null' EXIT
+  trap 'kill "$bridge" 2>/dev/null; rm -rf "$dir"' EXIT
   i=0; while [ ! -S "$sock" ] && [ $i -lt 200 ]; do sleep 0.01; i=$((i+1)); done
   "$@"
   """
@@ -416,15 +419,20 @@ defmodule ExSandbox.Hardening.Confinement do
     {:ok, bwrap, bwrap_args(command, args, permit_path, extras, [])}
   end
 
-  # ⚠️ The unix socket is the only thing crossing the namespace, and it lives in
-  # `permit_path` because that is the one directory both sides can already see.
-  # Its name is random so two launches sharing a directory never answer each
-  # other's bridge. A process that unlinks it and listens there itself reaches
-  # only its own listener: the socket leads to the proxy or to nothing.
+  # ⚠️ The unix socket is the only thing crossing the namespace. It lives in a
+  # directory of its own under the temp dir, bound into the sandbox at the same
+  # path, and not in `permit_path`: a socket address holds 108 bytes, and
+  # MEASURED 2026-09-25 a platform's permit path
+  # (`/var/lib/axonn/tenants/<uuid>/<uuid>`) put it at 127. `socat` refused
+  # the address and every connection the confined process made was reset.
+  # The directory is random and bound for this launch alone, so no launch sees
+  # another's bridge. A process that unlinks the socket and listens there itself
+  # reaches only its own listener: the socket leads to the proxy or to nothing.
   defp linux_egress({:loopback_only, port}, bwrap, command, args, permit_path, extras) do
     with {:ok, socat} <- socat(),
-         {:ok, sh} <- sh() do
-      socket = Path.join(permit_path, ".ex_sandbox-egress-#{random_suffix()}.sock")
+         {:ok, sh} <- sh(),
+         {:ok, socket} <- bridge_socket() do
+      socket_dir = Path.dirname(socket)
 
       inner = [
         "-c",
@@ -438,7 +446,10 @@ defmodule ExSandbox.Hardening.Confinement do
 
       # The command is launched by the inner `sh`, so its grant is written here
       # rather than by `bwrap_args/5`, which grants only what it launches.
-      network = command_bind(command, permit_path) ++ ["--unshare-net"]
+      network =
+        command_bind(command, permit_path) ++
+          ["--bind", socket_dir, socket_dir, "--unshare-net"]
+
       bwrap_args = bwrap_args(sh, inner, permit_path, extras, network)
 
       {:ok, sh,
@@ -462,6 +473,30 @@ defmodule ExSandbox.Hardening.Confinement do
     case System.find_executable("sh") do
       nil -> {:error, {:cannot_enforce, :network_restriction, "`sh` is not on PATH"}}
       sh -> {:ok, sh}
+    end
+  end
+
+  # 107 and not 108: the kernel's field counts the terminating NUL.
+  @max_socket_path 107
+
+  defp bridge_socket do
+    case System.tmp_dir() do
+      nil ->
+        {:error,
+         {:cannot_enforce, :network_restriction,
+          "no writable temp dir for the loopback bridge's socket"}}
+
+      tmp ->
+        socket = Path.join([tmp, "ex_sandbox-#{random_suffix()}", "egress.sock"])
+
+        if byte_size(socket) <= @max_socket_path do
+          {:ok, socket}
+        else
+          {:error,
+           {:cannot_enforce, :network_restriction,
+            "the loopback bridge's socket path #{inspect(socket)} is #{byte_size(socket)} bytes, " <>
+              "past the #{@max_socket_path} a unix socket address holds; set TMPDIR to a shorter path"}}
+        end
     end
   end
 

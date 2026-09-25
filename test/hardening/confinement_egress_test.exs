@@ -77,6 +77,50 @@ defmodule ExSandbox.Hardening.ConfinementEgressTest do
     assert {out, status} == {"target\n", 0}
   end
 
+  # MEASURED 2026-09-25 on Ubuntu 24.04: a platform's permit path was
+  # `/var/lib/axonn/tenants/<uuid>/<uuid>`, the bridge socket inside it came to
+  # 127 bytes, and `socat` refused it ("max length is 108"). Every connection
+  # the confined process made was reset, the model endpoint included. A path
+  # that deep is ordinary, so the socket must not depend on it.
+  test "a permit path deeper than a unix socket address allows still reaches the proxy", ctx do
+    deep = Path.join([ctx.permit | List.duplicate(String.duplicate("d", 40), 3)])
+    File.mkdir_p!(deep)
+    assert byte_size(deep) > 108
+
+    {out, status} =
+      confined(%{ctx | permit: deep}, [
+        "-sS",
+        "-m",
+        "10",
+        "-p",
+        "-x",
+        "http://127.0.0.1:#{ctx.proxy_port}",
+        ctx.url
+      ])
+
+    assert {out, status} == {"target\n", 0}
+  end
+
+  test "a temp dir too deep for the bridge's socket refuses the launch rather than resetting every connection",
+       ctx do
+    deep = Path.join([ctx.permit | List.duplicate(String.duplicate("t", 40), 3)])
+    File.mkdir_p!(deep)
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", deep)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+    end)
+
+    assert {:error, {:cannot_enforce, :network_restriction, detail}} =
+             Confinement.confine({ctx.curl, ["-sS", ctx.url]},
+               permit_path: ctx.permit,
+               egress: {:loopback_only, ctx.proxy_port}
+             )
+
+    assert detail =~ "TMPDIR"
+  end
+
   test "another loopback port is refused", ctx do
     {out, status} =
       confined(ctx, ["-sS", "--noproxy", "*", "-m", "5", "http://127.0.0.1:#{ctx.other_port}/"])
