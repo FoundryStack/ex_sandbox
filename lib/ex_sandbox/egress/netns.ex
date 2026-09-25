@@ -250,6 +250,24 @@ defmodule ExSandbox.Egress.Netns do
         "mark",
         "#{@acceptor_mark}",
         "return"
+      ]),
+      # Namespace loopback stays in the namespace: pasta runs with `-T none`
+      # and `--no-map-gw`, so `127.0.0.0/8` here reaches nothing but the
+      # sandbox. Redirecting it made the acceptor refuse the tenant's own
+      # servers -- a test endpoint on `127.0.0.1:<ephemeral>` -- as egress.
+      # OBSERVED 2026-09-25 on staging: refusals for 127.0.0.1:55205 and
+      # 127.0.0.1:58963 from an application's own test run.
+      nsenter(holder_pid, [
+        "nft",
+        "add",
+        "rule",
+        "ip",
+        "nat",
+        "output",
+        "ip",
+        "daddr",
+        "127.0.0.0/8",
+        "return"
       ])
     ] ++
       forward_exemption(holder_pid, forward) ++

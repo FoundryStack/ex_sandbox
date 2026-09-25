@@ -85,6 +85,15 @@ defmodule ExSandbox.Egress.NetnsTest do
       end
     end
 
+    test "namespace loopback is exempt, ahead of the redirect", %{commands: commands} do
+      steps = Enum.map(commands, &Enum.join(&1, " "))
+      exempt = Enum.find_index(steps, &String.ends_with?(&1, "ip daddr 127.0.0.0/8 return"))
+      redirect = Enum.find_index(steps, &String.contains?(&1, "meta l4proto tcp redirect"))
+
+      assert exempt, "the tenant's own loopback servers are redirected and refused"
+      assert exempt < redirect
+    end
+
     test "redirects to the acceptor's port", %{commands: commands} do
       rule = rule(commands)
       assert ":18080" in rule
