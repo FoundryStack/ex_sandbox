@@ -101,6 +101,8 @@ defmodule ExSandbox.Hardening.ConfinementEgressTest do
     assert {out, status} == {"target\n", 0}
   end
 
+  # Linux only: macOS confines the network with sandbox-exec and has no bridge.
+  @tag :isolation
   test "a temp dir too deep for the bridge's socket refuses the launch rather than resetting every connection",
        ctx do
     deep = Path.join([ctx.permit | List.duplicate(String.duplicate("t", 40), 3)])
