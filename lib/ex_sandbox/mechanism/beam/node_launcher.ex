@@ -89,7 +89,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          # and unpoliced. The window cannot be closed by reordering -- the
          # namespace does not exist until `pasta` starts the tenant in it -- so
          # it is closed by failing toward termination instead. See `police/2`.
-         {:ok, acceptor_pid} <- police_or_terminate(plan, launched, binding),
+         {:ok, acceptor_pid} <- police_or_terminate(plan, launched, binding, sandbox),
          :ok <- verify_or_terminate(launched, sandbox) do
       {:ok,
        launched
@@ -349,10 +349,16 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # worse than failing -- an unenforced allowlist that the census records as a
   # demonstrated boundary, because every denial check passes for reasons that
   # have nothing to do with policy.
-  defp police_or_terminate(nil, _launched, _binding), do: {:ok, nil}
+  defp police_or_terminate(nil, _launched, _binding, _sandbox), do: {:ok, nil}
 
-  defp police_or_terminate(plan, launched, binding) do
-    case police(plan, pasta_pid: pasta_pid(plan)) do
+  defp police_or_terminate(plan, launched, binding, sandbox) do
+    # `owner_ref` and `sandbox_id` ride along so a refusal the acceptor emits
+    # can be attributed without the host mapping a /30 back to a sandbox.
+    case police(plan,
+           pasta_pid: pasta_pid(plan),
+           owner_ref: sandbox.owner_ref,
+           sandbox_id: sandbox.id
+         ) do
       {:ok, acceptor_pid} ->
         {:ok, acceptor_pid}
 
@@ -459,7 +465,9 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       # the resolver cannot end up bound somewhere the rule does not point.
       # Reading the config key a second time here is exactly that drift.
       resolver: plan.resolver,
-      registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry)
+      registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry),
+      owner_ref: Keyword.get(opts, :owner_ref),
+      sandbox_id: Keyword.get(opts, :sandbox_id)
     )
     |> case do
       {:ok, pid} ->

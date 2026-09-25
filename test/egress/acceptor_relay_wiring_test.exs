@@ -63,6 +63,8 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
   # this key -- so registering it here is registering the policy for the sandbox
   # this acceptor serves.
   @source_key {127, 0, 0, 0}
+  @owner_ref "owner-wiring"
+  @sandbox_id "sandbox-wiring"
 
   setup do
     registry = start_supervised!({Registry, name: :"reg_#{System.unique_integer([:positive])}"})
@@ -77,6 +79,8 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
         port: 18_080,
         resolver: nil,
         registry: registry,
+        owner_ref: @owner_ref,
+        sandbox_id: @sandbox_id,
         listen: false
       )
 
@@ -269,5 +273,88 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
     assert_receive {:handled, :ok}, 5_000
 
     assert {:error, :closed} = :gen_tcp.recv(client, 0, 5_000)
+  end
+
+  describe "[:ex_sandbox, :egress, :refused]" do
+    setup do
+      handler = "egress-refused-#{System.unique_integer([:positive])}"
+      test_process = self()
+
+      :telemetry.attach(
+        handler,
+        [:ex_sandbox, :egress, :refused],
+        fn _event, measurements, metadata, _ ->
+          send(test_process, {:refused_event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+    end
+
+    test "a refused connection emits one event naming what it resolved", %{registry: registry} do
+      {dest_port, echo} = echo_server()
+      :ok = Registry.assign(@source_key, [{"127.0.0.1", dest_port + 1}], registry)
+      :ok = Registry.record_resolution(@source_key, "api.example.com", [{127, 0, 0, 1}], registry)
+      :ok = Registry.record_resolution(@source_key, "cdn.example.com", [{127, 0, 0, 1}], registry)
+
+      :ok =
+        Registry.record_resolution(@source_key, "other.example.com", [{10, 0, 0, 9}], registry)
+
+      {_client, server_side} = accepted_pair()
+      handle_owned(server_side, state(registry, {:ok, {{127, 0, 0, 1}, dest_port}}))
+      assert_receive {:handled, :ok}, 5_000
+
+      assert_received {:refused_event, %{count: 1}, metadata}
+
+      assert metadata == %{
+               owner_ref: @owner_ref,
+               sandbox_id: @sandbox_id,
+               address: {127, 0, 0, 1},
+               port: dest_port,
+               names: ["api.example.com", "cdn.example.com"],
+               reason: :not_permitted
+             }
+
+      refute_received {:refused_event, _, _}, "one refused connection emitted more than one event"
+      Task.shutdown(echo, :brutal_kill)
+    end
+
+    test "a sandbox with no policy is reported as :unknown_source", %{registry: registry} do
+      {_client, server_side} = accepted_pair()
+      handle_owned(server_side, state(registry, {:ok, {{93, 184, 216, 34}, 443}}))
+      assert_receive {:handled, :ok}, 5_000
+
+      assert_received {:refused_event, %{count: 1},
+                       %{
+                         address: {93, 184, 216, 34},
+                         port: 443,
+                         names: [],
+                         reason: :unknown_source
+                       }}
+    end
+
+    test "a permitted connection emits nothing", %{registry: registry} do
+      # ⚠️ The test that catches an event sent before the decision returns.
+      {dest_port, echo} = echo_server()
+      :ok = Registry.assign(@source_key, [{"127.0.0.1", dest_port}], registry)
+
+      {client, server_side} = accepted_pair()
+      handle_owned(server_side, state(registry, {:ok, {{127, 0, 0, 1}, dest_port}}))
+
+      assert :ok = :gen_tcp.send(client, "through")
+      assert {:ok, "through"} = :gen_tcp.recv(client, 0, 5_000)
+
+      refute_received {:refused_event, _, _}, "a PERMITTED connection was reported as refused"
+      Task.shutdown(echo, :brutal_kill)
+    end
+
+    test "a destination that cannot be read emits nothing", %{registry: registry} do
+      {_client, server_side} = accepted_pair()
+      handle_owned(server_side, state(registry, {:error, :unavailable}))
+      assert_receive {:handled, :ok}, 5_000
+
+      refute_received {:refused_event, _, _}
+    end
   end
 end

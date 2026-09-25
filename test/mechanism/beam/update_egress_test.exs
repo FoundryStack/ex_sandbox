@@ -6,6 +6,9 @@ defmodule ExSandbox.Mechanism.Beam.UpdateEgressTest do
   because the allowlist does not name it; `ExSandbox.update_egress/4` then adds
   it, and the second dial connects. The sandbox is never stopped in between, so
   the only thing that can explain the second verdict is the replaced policy.
+
+  The first dial also proves the launch hands the acceptor the sandbox's
+  `owner_ref` and `sandbox_id`: the refusal event carries both.
   """
   use ExUnit.Case, async: false
 
@@ -37,8 +40,33 @@ defmodule ExSandbox.Mechanism.Beam.UpdateEgressTest do
       {:error, reason} -> flunk("the host cannot reach #{host}:#{port} (#{inspect(reason)})")
     end
 
+    handler = "update-egress-#{System.unique_integer([:positive])}"
+    test_process = self()
+
+    :telemetry.attach(
+      handler,
+      [:ex_sandbox, :egress, :refused],
+      fn _event, _measurements, metadata, _ -> send(test_process, {:refused_event, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
     refute sandbox.context.connect.(host, port) == :connected,
            "#{host}:#{port} was reachable before the allowlist named it"
+
+    # The launch threads the sandbox's identity to its acceptor, so the refusal
+    # arrives attributed without the host mapping a /30 back to a sandbox.
+    sandbox_id = sandbox.id
+
+    assert_receive {:refused_event,
+                    %{
+                      owner_ref: "tenant-update-egress",
+                      sandbox_id: ^sandbox_id,
+                      port: ^port,
+                      reason: :not_permitted
+                    }},
+                   5_000
 
     assert {:ok, updated} =
              ExSandbox.update_egress(Beam, sandbox, [permitted, added], host_aliases: [])

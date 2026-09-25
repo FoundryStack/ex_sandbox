@@ -124,6 +124,11 @@ defmodule ExSandbox.Egress.Acceptor do
       resolver: Keyword.get(opts, :resolver),
       registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry),
 
+      # Carried only into the refusal event, never into a decision: the
+      # decision is keyed by `source_key` alone.
+      owner_ref: Keyword.get(opts, :owner_ref),
+      sandbox_id: Keyword.get(opts, :sandbox_id),
+
       # ⚠️ Fixed here, and deliberately **not** read from `opts`. A host able to
       # substitute the destination reader could name any destination it liked
       # and have the policy checked against that instead of against the kernel's
@@ -340,7 +345,7 @@ defmodule ExSandbox.Egress.Acceptor do
   @spec handle_connection(:gen_tcp.socket(), map()) :: :ok
   def handle_connection(socket, state) do
     with {:ok, destination} <- state.destination_reader.(socket),
-         :permitted <- verdict(state, destination, state.registry) do
+         :permitted <- decide_and_report(state, destination) do
       Relay.splice(socket, destination, netns: state.netns)
       :ok
     else
@@ -348,6 +353,43 @@ defmodule ExSandbox.Egress.Acceptor do
         log_refusal(other)
         :gen_tcp.close(socket)
     end
+  end
+
+  # ⚠️ The event is emitted only once `verdict/3` has returned a refusal. An
+  # event sent before the decision would report connections that were then
+  # permitted, and a host counting them would ask a person to allow a host the
+  # sandbox already reaches.
+  #
+  # A destination that could not be read emits nothing: there is no address to
+  # attribute, and it is a host fault rather than a host the tenant was refused.
+  defp decide_and_report(state, destination) do
+    case verdict(state, destination, state.registry) do
+      {:refused, reason} = refused ->
+        report_refusal(state, destination, reason)
+        refused
+
+      :permitted ->
+        :permitted
+    end
+  end
+
+  defp report_refusal(state, {address, port}, reason) do
+    ExSandbox.Telemetry.egress_refused(
+      %{owner_ref: state.owner_ref, sandbox_id: state.sandbox_id},
+      {address, port},
+      names_resolved_to(state, address),
+      reason
+    )
+  end
+
+  # The names this sandbox looked up that answered with `address`, so a host can
+  # record the refusal by the name the tenant asked for rather than by an
+  # address that rotates.
+  defp names_resolved_to(state, address) do
+    for {name, addresses} <-
+          ExSandbox.Egress.Registry.resolutions(state.source_key, state.registry),
+        MapSet.member?(addresses, address),
+        do: name
   end
 
   # ⚠️ `warning`, not `debug`, and the level is load-bearing rather than a

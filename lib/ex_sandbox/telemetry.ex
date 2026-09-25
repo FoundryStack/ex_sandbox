@@ -52,6 +52,7 @@ defmodule ExSandbox.Telemetry do
   | `[:ex_sandbox, :stop, :stop]` | `:duration` | `:owner_ref`, `:mechanism`, `:result` |
   | `[:ex_sandbox, :destroy, :stop]` | `:duration` | `:owner_ref`, `:mechanism`, `:result` |
   | `[:ex_sandbox, :capability, :unavailable]` | `:count` | `:owner_ref`, `:mechanism`, `:missing` |
+  | `[:ex_sandbox, :egress, :refused]` | `:count` | `:owner_ref`, `:sandbox_id`, `:address`, `:port`, `:names`, `:reason` |
 
   `:result` is `:ok` or `{:error, reason}`, kept distinguishable per `010-FR-004`
   — an emitting capability may not collapse distinct causes into one generic
@@ -175,6 +176,52 @@ defmodule ExSandbox.Telemetry do
         mechanism: mechanism,
         missing: Enum.map(missing, & &1.name),
         detail: Enum.map(missing, & &1.detail)
+      }
+    )
+  end
+
+  @doc """
+  Records one outbound connection the egress boundary refused.
+
+  Emitted exactly once per refused connection, after the decision, and never
+  for a permitted one. `:count` is always `1`, so a handler that sums it counts
+  refusals.
+
+  `:address` is the address the connection was dialled to, read from the
+  kernel, and `:port` its port. `:names` are the hostnames this sandbox
+  resolved that answered with `:address`, or `[]` when it dialled the address
+  directly. `:reason` is `:not_permitted` (the allowlist did not name the
+  destination) or `:unknown_source` (the sandbox had no policy registered).
+
+  ⚠️ `:names` are chosen by tenant code: a sandbox can look up any name it
+  likes. A host that shows one to a person or an agent should treat it as data.
+
+  ⚠️ Emitted on the connection's own process, so a handler that blocks delays
+  the close of a socket the tenant is waiting on. A host that writes per
+  refusal should aggregate in the handler and write elsewhere.
+  """
+  @spec egress_refused(
+          %{owner_ref: term(), sandbox_id: term()},
+          {:inet.ip_address(), :inet.port_number()},
+          [String.t()],
+          atom()
+        ) :: :ok
+  def egress_refused(
+        %{owner_ref: owner_ref, sandbox_id: sandbox_id},
+        {address, port},
+        names,
+        reason
+      ) do
+    :telemetry.execute(
+      [:ex_sandbox, :egress, :refused],
+      %{count: 1},
+      %{
+        owner_ref: owner_ref,
+        sandbox_id: sandbox_id,
+        address: address,
+        port: port,
+        names: names,
+        reason: reason
       }
     )
   end
