@@ -21,6 +21,41 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncherForwardTest do
     assert host_port > 0
   end
 
+  describe "egress_route/2" do
+    @confined {"systemd-run", ["--unshare-net", "erl"]}
+    @unconfined {"erl", []}
+
+    test "a service port goes through pasta even with an empty allowlist" do
+      # Without pasta there is no forward, and `Beam.address/1` answers nil.
+      served = sandbox(service_port: 4000, context: %{network_allowlist: []})
+      assert NodeLauncher.egress_route(served, @confined) == {:police, []}
+    end
+
+    test "an allowlist is policed with or without a service port" do
+      allowed = [{"example.test", 443}]
+
+      assert NodeLauncher.egress_route(
+               sandbox(context: %{network_allowlist: allowed}),
+               @confined
+             ) == {:police, allowed}
+
+      assert NodeLauncher.egress_route(
+               sandbox(service_port: 4000, context: %{network_allowlist: allowed}),
+               @confined
+             ) == {:police, allowed}
+    end
+
+    test "no allowlist and no service port installs nothing" do
+      assert NodeLauncher.egress_route(sandbox(context: %{network_allowlist: []}), @confined) ==
+               :passthrough
+    end
+
+    test "a command that confines no network passes through, service port or not" do
+      served = sandbox(service_port: 4000, context: %{network_allowlist: []})
+      assert NodeLauncher.egress_route(served, @unconfined) == :passthrough
+    end
+  end
+
   test "pairs every port, primary first, each on its own host port" do
     pairs = NodeLauncher.forward(sandbox(service_port: 4000, extra_service_ports: [4001, 4000]))
 

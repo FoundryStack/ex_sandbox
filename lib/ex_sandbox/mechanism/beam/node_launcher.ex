@@ -119,20 +119,58 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # clause. That is not a fallback: nothing was confined to begin with, and
   # `require_hardening/0` above has already refused if confinement was required.
   defp policed(%Sandbox{} = sandbox, exec) do
-    case egress_allowlist(sandbox) do
-      [] ->
-        # No allowlist means no policy to install. The tenant keeps whatever
-        # confinement `build_command/2` produced -- today `--unshare-net`, which
-        # denies everything. ⚠️ Correct only because it is *also* what the
-        # census reports as the third outcome rather than a pass: `:permitted`
-        # is absent, so `require_permitted_reachable/2` reports
-        # `capability_unavailable` instead of scoring a boundary it never saw.
+    case egress_route(sandbox, exec) do
+      :passthrough ->
         {:ok, exec, nil, nil}
 
-      allowed ->
+      {:police, allowed} ->
         install_policy(exec, allowed, &ExSandbox.Egress.Binding.acquire/1, forward(sandbox))
     end
   end
+
+  @doc """
+  Whether a launch goes through `pasta`, and with which allowlist.
+
+  `{:police, allowed}` when the sandbox has an allowlist, **or** when it names a
+  service port and its command confines the network. `:passthrough` otherwise.
+
+  ⚠️ **A service port is a reason to start `pasta` on its own.** The forward that
+  publishes the port on host loopback is a `pasta` flag, so a sandbox that
+  skipped `pasta` because its allowlist was `[]` got no forward and
+  `Beam.address/1` answered nil for it: a sandbox that serves nothing anyone can
+  reach. It is policed with the empty allowlist instead, which denies every
+  destination through the acceptor -- the same reach `--unshare-net` alone gave
+  it, now with the one inbound port it asked for.
+
+  A command that does not confine the network (a host where `Hardening.Linux`
+  never ran) passes through as before: the tenant already listens on the host,
+  and `LaunchPlan.build/4` would refuse it with `:no_network_confinement`.
+
+  With no allowlist and no service port there is no policy to install, and the
+  tenant keeps whatever `build_command/2` produced -- `--unshare-net`, which
+  denies everything. Correct only because it is *also* what the census reports
+  as the third outcome rather than a pass: `:permitted` is absent, so
+  `require_permitted_reachable/2` reports `capability_unavailable` instead of
+  scoring a boundary it never saw.
+
+  Public for the same reason as `egress_allowlist/1`: it is a decision, and
+  `launch/2` runs on Linux and nowhere else.
+  """
+  @spec egress_route(Sandbox.t(), {String.t(), [String.t()]}) ::
+          :passthrough | {:police, [ExSandbox.Egress.Policy.destination()]}
+  def egress_route(%Sandbox{} = sandbox, {prog, args}) do
+    case egress_allowlist(sandbox) do
+      [] ->
+        if serves?(sandbox) and "--unshare-net" in [prog | args],
+          do: {:police, []},
+          else: :passthrough
+
+      allowed ->
+        {:police, allowed}
+    end
+  end
+
+  defp serves?(%Sandbox{service_port: port}), do: is_integer(port) and port > 0
 
   @doc false
   # Public so `ExSandbox.Mechanism.Beam.NodeLauncherForwardTest` can read the pairs on a host where the
