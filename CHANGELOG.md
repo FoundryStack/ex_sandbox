@@ -2,23 +2,115 @@
 
 ## Unreleased
 
+### ⚠️ Changed: a Beam sandbox outlives the process that provisioned it
+
+The node was started with `:peer.start_link/1`, which halts it when its parent exits, `:normal`
+included, and the table of launched nodes was an ETS table owned by its first caller. A sandbox
+provisioned from a job or a request therefore ended when that job returned. The node now starts
+with `:peer.start/1`, the egress acceptor is unlinked, and `ExSandbox.Mechanism.Beam.Table` owns
+the table under `ExSandbox.Supervisor`. A host that relied on a sandbox dying with its caller must
+now call `stop/1` or `destroy/1`.
+
 ### Added: `Confinement.confine/2` takes `egress: :none`
 
 A confined tool with nothing to reach runs with no network: `(deny network-outbound)` on darwin,
 `bwrap --unshare-net` with no bridge on Linux. `ConfinementEgressTest` refuses a direct dial to a
 non-loopback address and to a loopback listener that `:open` reaches, and the process still reads
-and writes under `:permit_path`; measured on darwin 25.5.0, Linux not yet run.
+and writes under `:permit_path`.
 
 ### Added: `Confinement.confine/2` takes `egress: {:loopback_only, port}`
 
 A confined control-plane process can be left one way out: TCP to `127.0.0.1:port`, where the
 caller runs a proxy that decides what it may reach. On darwin the profile gains `(deny
 network-outbound)` and an allow for `localhost:<port>`. On Linux the process runs under
-`bwrap --unshare-net` with a `socat` bridge over a unix socket in `:permit_path`, so it sees the
-proxy at the same address. `:open`, the default, is today's posture. An unknown value, or Linux
-without `socat`, returns `{:cannot_enforce, :network_restriction, _}`.
+`bwrap --unshare-net` with a `socat` bridge over a unix socket, so it sees the proxy at the same
+address. The socket lives in a random owner-only directory under the temp dir, bound in at the
+same path: a deep `:permit_path` would pass the 108 bytes a `sun_path` holds. A temp dir too deep
+for it returns `cannot_enforce`. `:open`, the default, is today's posture. An unknown value, or
+Linux without `socat`, returns `{:cannot_enforce, :network_restriction, _}`.
 `ConfinementEgressTest` refuses a direct `curl --noproxy '*'` to a non-loopback address and
 reaches the same address through a CONNECT proxy on the port, on darwin 25.5.0 and Debian trixie.
+
+### Added: `Confinement.confine/2` takes `:permit_read_subpaths`
+
+Directories the process may only read, such as the install prefix of a program outside the
+runtime read set (Homebrew's `/opt/homebrew`). `:permit_extra_subpaths` would also make them
+writable. Granted as `file-read*` with their ancestors on darwin and `--ro-bind` on Linux;
+missing ones are dropped.
+
+### Added: a `"public"` egress entry, decided on each dialled address
+
+`Allowlist.parse/2` reads `"public"` (or `:public`) as every address outside the refused classes,
+on any port. The decision classifies the address a connection was dialled to, never a name, so a
+public name resolving to `10.0.0.5` is refused. The classes moved into `ExSandbox.Egress.Refusal`,
+shared by the parser, the resolver and the decision; `Allowlist.classify/2` is unchanged.
+
+### Added: `ExSandbox.update_egress/4` replaces a running sandbox's allowlist
+
+Entries are parsed as provision parses them and handed to the mechanism's new optional
+`update_egress/2` callback; a mechanism without it answers `{:error, :egress_not_enforced}`. Beam
+implements it, and the acceptor reads the registry per connection, so the next connection sees
+the new list without a restart.
+
+### Added: `[:ex_sandbox, :egress, :refused]` telemetry
+
+Emitted once per refused egress connection with `%{count: 1}` and `%{owner_ref, sandbox_id,
+address, port, names, reason}`, where `names` are the hostnames this sandbox resolved to the
+dialled address. A permitted connection emits nothing.
+
+### Added: `extra_service_ports` and `ExSandbox.address/3`
+
+A sandbox can publish more ports beside its `service_port`, loopback only, and `address/3` reads
+back where each landed. Beam forwards each pair through `pasta`; Docker publishes one
+`-p 127.0.0.1::<port>` per port. `address/3` falls back to `address/1` for the service port of a
+mechanism without `address/2`.
+
+### Added: `Beam.address/1` returns the sandbox's service port on host loopback
+
+A Beam sandbox that names a `service_port` is launched with `pasta -t 127.0.0.1/<host>:<port>`
+in place of `-t none`, and `address/1` returns `"127.0.0.1:<host>"`, as the Docker mechanism
+already does. `-T`, `-u`, `-U` and `--no-map-gw` are unchanged, so the tenant still cannot reach
+the host. A sandbox with a `service_port` and an empty allowlist is policed with that empty list:
+every destination is refused and the one inbound port is published.
+
+### Added: a Beam sandbox's workspace is bound at `/workspace`
+
+Read-write, as Docker does. Ownership is handed to the sandbox uid at launch and before every
+execute: every entry but `.git` (links not followed), while the root keeps its owner with the
+sandbox's group and `0770`, so the platform's git still passes its ownership check.
+`config :ex_sandbox, :beam, workspace_slots: ".slots"` names slot worktrees kept the same way.
+Neither the root nor a slot is sticky: with `fs.protected_regular = 2`, a sticky group-writable
+directory makes even root fail to rewrite a file another uid owns.
+
+### Added: host configuration for a Beam sandbox
+
+`config :ex_sandbox, :beam` takes `extra_ro_binds:` (absolute paths bound read-only at the same
+path, for a co-located pooler's unix socket; a relative path raises), `exec_path:` (bin
+directories put before the system `PATH`, for a toolchain in a version manager's root) and
+`exec_env:` (variables such as `MIX_HOME`; `PATH` itself stays owned by the library). The Linux
+trust store (`/etc/ssl/certs` and Fedora's directories, never `/etc`) is now bound read-only, so
+an allowlisted HTTPS destination can finish TLS.
+
+### Fixed: the egress redirect caught loopback inside the namespace
+
+A tenant's connection to its own server on `127.0.0.1:<port>`, and `pasta`'s delivery of a
+forwarded service-port connection, both went to the acceptor and were refused as egress. Return
+rules ahead of the redirect now exempt namespace loopback and each forwarded port.
+
+### Fixed: three capability probes measured something other than their subject
+
+`:resource_limits` probed that `cgroup.controllers` exists, which holds on hosts where no
+transient scope can be created; `writable_cgroup?/0` probed a user scope while the launcher used
+a system scope; `:privilege_separation` asked `id -u` instead of trying the `setpriv` drop the
+launcher runs. All three were invisible as root. `scope_mode/0` is now the single measurement the
+probe and the launcher share, and the Linux privilege probe runs `can_drop_privilege?/0`.
+
+### Fixed: Docker 29's wording for a missing container, port and daemon
+
+Docker 29.8 writes `no such object`, `no public port` and `failed to connect to the docker API`.
+The case-sensitive matches missed them, so a removed container, an unstarted container's address
+and a dead daemon came back as `{:error, {:docker_error, _}}` instead of `:absent`, `nil` and
+`:unknown`.
 
 ### Fixed: the runtime read grant names both a path and its resolved form
 
@@ -26,17 +118,6 @@ On darwin `/etc` is a symlink to `/private/etc`, and SBPL matches resolved paths
 grant matched nothing: a confined `curl` could not read `/private/etc/ssl/openssl.cnf`. Both
 spellings are granted now. The symlink is kept because Linux needs it: on a usrmerge system the
 dynamic loader is reached through `/lib`.
-
-### Added: `Beam.address/1` returns the sandbox's service port on host loopback
-
-A Beam sandbox that names a `service_port` is launched with `pasta -t 127.0.0.1/<host>:<port>`
-in place of `-t none`, and `address/1` returns `"127.0.0.1:<host>"`, as the Docker mechanism
-already does. `-T`, `-u`, `-U` and `--no-map-gw` are unchanged, so the tenant still cannot reach
-the host. A sandbox with no `service_port` launches with today's argv and still reports `nil`.
-
-⚠️ The forward rides on the policed launch path, which is taken only for a sandbox with a
-non-empty `network_allowlist`. A sandbox with an empty allowlist still runs in an empty
-`--unshare-net` namespace and reports `nil`.
 
 ## 1.4.0 — 2026-09-11
 
