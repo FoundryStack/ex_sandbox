@@ -88,6 +88,15 @@ left a phase ungated for as long as the baseline file had existed.
 CI runs it in the boundary job, not the nightly one: an hour's wait to learn the gate is broken is
 an hour the gate was not gating.
 
+## ⚠️ Docker Desktop's 7.0 kernel refuses the unprivileged grant
+
+Measured 2026-10-22 on Docker 29.8.2, `Linux 7.0.14-linuxkit`: with the grant below, `bwrap`
+fails with `pivot_root: Operation not permitted`, `capabilities/0` reports
+`filesystem_confinement` and `network_restriction` missing, and the gate exits 2. v1.4.0 fails the
+same way, so the host changed, not the code. With `privileged: true` added in an override file the
+same tree reports all five `ok` and passes, which shows the code works and nothing about
+`013-FR-006b`. Until the minimal grant is found again, a green gate needs a host where it holds.
+
 ## Two traps this directory has already fallen into
 
 ⚠️ **No `command:` override, and no `docker compose run`.** A container command becomes PID 1 and

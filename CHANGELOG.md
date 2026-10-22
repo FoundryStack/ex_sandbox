@@ -16,7 +16,8 @@ now call `stop/1` or `destroy/1`.
 A confined tool with nothing to reach runs with no network: `(deny network-outbound)` on darwin,
 `bwrap --unshare-net` with no bridge on Linux. `ConfinementEgressTest` refuses a direct dial to a
 non-loopback address and to a loopback listener that `:open` reaches, and the process still reads
-and writes under `:permit_path`.
+and writes under `:permit_path`, on darwin 25.5.0 and in the isolation harness on Linux
+7.0.14-linuxkit.
 
 ### Added: `Confinement.confine/2` takes `egress: {:loopback_only, port}`
 

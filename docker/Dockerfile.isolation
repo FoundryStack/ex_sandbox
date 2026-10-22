@@ -70,7 +70,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       systemd systemd-container dbus \
       bubblewrap util-linux \
-      iproute2 passt nftables uidmap \
+      iproute2 passt nftables uidmap socat \
       build-essential git ca-certificates \
       procps xfsprogs e2fsprogs \
       python3 \
