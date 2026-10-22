@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 — 2026-10-22
 
 ### ⚠️ Changed: a Beam sandbox outlives the process that provisioned it
 

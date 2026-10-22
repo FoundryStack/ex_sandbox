@@ -87,7 +87,7 @@ end
 defmodule ExSandbox.MixProject do
   use Mix.Project
 
-  @version "1.4.0"
+  @version "1.5.0"
   @source_url "https://github.com/FoundryStack/ex_sandbox"
 
   def project do
