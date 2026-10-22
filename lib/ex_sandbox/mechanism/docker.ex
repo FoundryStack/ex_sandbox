@@ -303,7 +303,7 @@ defmodule ExSandbox.Mechanism.Docker do
         # where a running one returns, for a difference the caller cannot act
         # on.
         if absent?(message) or unreachable?(message) or message =~ "is not running" or
-             message =~ "No public port" do
+             message =~ ~r/no public port/i do
           {:ok, nil}
         else
           {:error, {:docker_error, message}}
@@ -835,12 +835,12 @@ defmodule ExSandbox.Mechanism.Docker do
   # Matched on the daemon's own wording, which is the only signal the CLI gives:
   # both cases exit 1, so the exit status cannot tell them apart.
   defp absent?(message) do
-    message =~ "No such container" or message =~ "No such object" or
-      message =~ "is already in progress"
+    message =~ ~r/no such (container|object)/i or message =~ "is already in progress"
   end
 
   defp unreachable?(message) do
     message =~ "Cannot connect to the Docker daemon" or
+      message =~ "failed to connect to the docker API" or
       message =~ "error during connect" or message =~ "docker daemon is not running"
   end
 
