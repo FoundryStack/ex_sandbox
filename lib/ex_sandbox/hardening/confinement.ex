@@ -114,6 +114,10 @@ defmodule ExSandbox.Hardening.Confinement do
     * `:permit_extra_subpaths` — additional directories the process may read and
       write, **on top of** `:permit_path`. Defaults to `[]`, which is the only
       value this library ever chooses for itself.
+    * `:permit_read_subpaths` — directories the process may only read, such as
+      the install prefix of a program outside the runtime read set (Homebrew's
+      `/opt/homebrew`). Resolved like `:permit_path`; missing ones are dropped.
+      Defaults to `[]`.
 
   ## ⚠️ The working directory is part of the boundary
 
@@ -282,7 +286,10 @@ defmodule ExSandbox.Hardening.Confinement do
     # that passes anything names a path under `/tmp`, and `/tmp` is a symlink to
     # `/private/tmp` on darwin. A grant written against the unresolved spelling
     # builds cleanly, reads correctly, and matches nothing.
-    extras = extra_subpaths(opts, permit_path)
+    extras = %{
+      write: extra_subpaths(opts, permit_path),
+      read: read_subpaths(opts, permit_path)
+    }
 
     with :ok <- ensure_permit_path(permit_path),
          {:ok, cmd, wrapped} <- wrap(:os.type(), command, args, permit_path, extras, egress) do
@@ -306,6 +313,16 @@ defmodule ExSandbox.Hardening.Confinement do
     |> Enum.filter(&is_binary/1)
     |> Enum.map(&resolve/1)
     |> Enum.uniq()
+    |> Enum.reject(&(&1 == permit_path or nested_in_other?(&1, [permit_path])))
+  end
+
+  defp read_subpaths(opts, permit_path) do
+    opts
+    |> Keyword.get(:permit_read_subpaths, [])
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&resolve/1)
+    |> Enum.uniq()
+    |> Enum.filter(&File.dir?/1)
     |> Enum.reject(&(&1 == permit_path or nested_in_other?(&1, [permit_path])))
   end
 
@@ -596,12 +613,18 @@ defmodule ExSandbox.Hardening.Confinement do
   # not permitted` to exit 0, `touch` inside it exit 0, and the control -- `ls
   # ~/.ssh` -- stayed `Operation not permitted`. The grant reaches what it names
   # and does not leak sideways.
-  defp extra_grants([]), do: ""
+  defp extra_grants(%{write: write, read: read}) do
+    reads =
+      Enum.map(read, fn path ->
+        ancestors = path |> ancestor_dirs() |> Enum.map_join(" ", &"(literal #{sb_string(&1)})")
 
-  defp extra_grants(extras) do
-    Enum.map_join(extras, "\n", fn path ->
-      "(allow file-read* file-write* (subpath #{sb_string(path)}))"
-    end)
+        "(allow file-read* file-map-executable #{ancestors} (subpath #{sb_string(path)}))"
+      end)
+
+    writes =
+      Enum.map(write, &"(allow file-read* file-write* (subpath #{sb_string(&1)}))")
+
+    Enum.join(reads ++ writes, "\n")
   end
 
   # ⚠️ Only what exists, which is the one asymmetry between the platforms here:
@@ -613,11 +636,15 @@ defmodule ExSandbox.Hardening.Confinement do
   # Paths under the runtime read set are dropped for the mount-over-its-own-mount
   # reason on `grantable_command?/2`; `extra_subpaths/2` has already dropped the
   # ones under `permit_path`.
-  defp extra_binds(extras) do
-    extras
-    |> Enum.filter(&File.exists?/1)
-    |> Enum.reject(&nested_in_other?(&1, runtime_read_paths()))
-    |> Enum.flat_map(&["--bind", &1, &1])
+  defp extra_binds(%{write: write, read: read}) do
+    binds = fn paths, flag ->
+      paths
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.reject(&nested_in_other?(&1, runtime_read_paths()))
+      |> Enum.flat_map(&[flag, &1, &1])
+    end
+
+    binds.(read, "--ro-bind") ++ binds.(write, "--bind")
   end
 
   # ⚠️ Two device nodes by name, NOT `file-write*` on `(subpath "/dev")`.

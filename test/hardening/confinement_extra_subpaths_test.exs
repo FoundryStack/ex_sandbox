@@ -118,6 +118,34 @@ defmodule ExSandbox.Hardening.ConfinementExtraSubpathsTest do
     end
   end
 
+  describe ":permit_read_subpaths" do
+    test "a read-only grant reads the path", %{p: p, extra: extra} do
+      {out, status} =
+        run(p, "cat", [Path.join(extra, "scratch.txt")], permit_read_subpaths: [extra])
+
+      assert {0, "granted-by-the-caller"} == {status, out}
+    end
+
+    test "a read-only grant does not write it", %{p: p, extra: extra} do
+      target = Path.join(extra, "written-by-the-child.txt")
+
+      {out, status} =
+        run(p, "sh", ["-c", "echo wrote > #{target}"], permit_read_subpaths: [extra])
+
+      assert status != 0
+      assert out =~ "Operation not permitted" or out =~ "Read-only file system"
+      refute File.exists?(target)
+    end
+
+    test "a sibling of a read-only grant stays denied", %{p: p, extra: extra, denied: denied} do
+      {out, status} =
+        run(p, "cat", [Path.join(denied, "secret.txt")], permit_read_subpaths: [extra])
+
+      assert status != 0
+      assert out =~ "Operation not permitted" or out =~ "No such file"
+    end
+  end
+
   describe "and it does not leak sideways" do
     test "a sibling of the granted path stays denied", %{p: p, extra: extra, denied: denied} do
       {out, status} =
