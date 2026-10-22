@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added: `Confinement.confine/2` takes `egress: :none`
+
+A confined tool with nothing to reach runs with no network: `(deny network-outbound)` on darwin,
+`bwrap --unshare-net` with no bridge on Linux. `ConfinementEgressTest` refuses a direct dial to a
+non-loopback address and to a loopback listener that `:open` reaches, and the process still reads
+and writes under `:permit_path`; measured on darwin 25.5.0, Linux not yet run.
+
 ### Added: `Confinement.confine/2` takes `egress: {:loopback_only, port}`
 
 A confined control-plane process can be left one way out: TCP to `127.0.0.1:port`, where the

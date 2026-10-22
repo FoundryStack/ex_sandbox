@@ -160,8 +160,15 @@ defmodule ExSandbox.Hardening.Confinement do
   Each entry is resolved the way `:permit_path` is, and is emitted **after** the
   blanket deny, because later rules win in a `sandbox-exec` profile.
 
-    * `:egress` — `:open` (the default) or `{:loopback_only, port}`. See
-      "Egress narrowed to one loopback port".
+    * `:egress` — `:open` (the default), `:none` or `{:loopback_only, port}`.
+      See "No egress" and "Egress narrowed to one loopback port".
+
+  ## No egress
+
+  `:none` takes the network away: `(deny network-outbound)` on darwin, and
+  `bwrap --unshare-net` with no bridge on Linux, so the process has only its
+  own `lo`. For a tool that reads and writes files under `:permit_path` and has
+  nothing to reach.
 
   ## Egress narrowed to one loopback port
 
@@ -243,8 +250,8 @@ defmodule ExSandbox.Hardening.Confinement do
 
   defp build(command, args, permit_path, opts) do
     case Keyword.get(opts, :egress, :open) do
-      :open ->
-        build(command, args, permit_path, opts, :open)
+      egress when egress in [:open, :none] ->
+        build(command, args, permit_path, opts, egress)
 
       {:loopback_only, port} = egress when is_integer(port) and port in 1..65_535 ->
         build(command, args, permit_path, opts, egress)
@@ -252,7 +259,7 @@ defmodule ExSandbox.Hardening.Confinement do
       other ->
         {:error,
          {:cannot_enforce, :network_restriction,
-          "unknown :egress #{inspect(other)}; expected :open or {:loopback_only, port}"}}
+          "unknown :egress #{inspect(other)}; expected :open, :none or {:loopback_only, port}"}}
     end
   end
 
@@ -419,6 +426,10 @@ defmodule ExSandbox.Hardening.Confinement do
     {:ok, bwrap, bwrap_args(command, args, permit_path, extras, [])}
   end
 
+  defp linux_egress(:none, bwrap, command, args, permit_path, extras) do
+    {:ok, bwrap, bwrap_args(command, args, permit_path, extras, ["--unshare-net"])}
+  end
+
   # ⚠️ The unix socket is the only thing crossing the namespace. It lives in a
   # directory of its own under the temp dir, bound into the sandbox at the same
   # path, and not in `permit_path`: a socket address holds 108 bytes, and
@@ -567,6 +578,7 @@ defmodule ExSandbox.Hardening.Confinement do
   # the rule that narrows it. SBPL takes only `localhost` or `*` as the host in
   # a `remote ip` filter, and `localhost` is loopback.
   defp network_rules(:open), do: ""
+  defp network_rules(:none), do: "(deny network-outbound)"
 
   defp network_rules({:loopback_only, port}) do
     """

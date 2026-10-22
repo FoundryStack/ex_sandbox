@@ -138,13 +138,55 @@ defmodule ExSandbox.Hardening.ConfinementEgressTest do
              )
 
     assert {:error, {:cannot_enforce, :network_restriction, _}} =
-             Confinement.confine({ctx.curl, []}, permit_path: ctx.permit, egress: :none)
+             Confinement.confine({ctx.curl, []}, permit_path: ctx.permit, egress: :closed)
   end
 
-  defp confined(ctx, args) do
+  describe "egress: :none" do
+    test "a direct dial to a non-loopback host is refused", ctx do
+      {out, status} = confined(ctx, ["-sS", "--noproxy", "*", "-m", "5", ctx.url], :none)
+
+      assert status != 0, "a direct dial got through: #{out}"
+      refute out =~ "target"
+    end
+
+    test "the host's loopback is refused, where :open reaches the same listener", ctx do
+      {:ok, listen} =
+        :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+      {:ok, port} = :inet.port(listen)
+
+      serve(listen, fn socket ->
+        {:ok, _request} = read_head(socket, "")
+        :gen_tcp.send(socket, "HTTP/1.0 200 OK\r\ncontent-length: 9\r\n\r\nloopback\n")
+      end)
+
+      args = ["-sS", "--noproxy", "*", "-m", "5", "http://127.0.0.1:#{port}/"]
+
+      assert {"loopback\n", 0} = confined(ctx, args, :open)
+
+      {out, status} = confined(ctx, args, :none)
+      assert status != 0, "loopback got through: #{out}"
+    end
+
+    test "the process still runs, reading and writing under its permit path", ctx do
+      permit = Confinement.resolve_executable(ctx.permit)
+      File.write!(Path.join(permit, "source"), "local\n")
+
+      assert {_out, 0} =
+               confined(
+                 ctx,
+                 ["-sS", "-o", Path.join(permit, "written"), "file://#{permit}/source"],
+                 :none
+               )
+
+      assert File.read!(Path.join(permit, "written")) == "local\n"
+    end
+  end
+
+  defp confined(ctx, args, egress \\ nil) do
     case Confinement.confine({ctx.curl, args},
            permit_path: ctx.permit,
-           egress: {:loopback_only, ctx.proxy_port}
+           egress: egress || {:loopback_only, ctx.proxy_port}
          ) do
       {:ok, %{cmd: cmd, args: args, env: env, cd: cd}} ->
         System.cmd(cmd, args, env: env, cd: cd, stderr_to_stdout: true)
