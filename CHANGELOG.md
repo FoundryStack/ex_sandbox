@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added: a Beam sandbox's slice and out-of-memory score
+
+`config :ex_sandbox, :beam` takes `slice:` (the scope is started with `--slice=`, so a host can
+cap all sandboxes together) and `oom_score_adjust:` (an integer in -1000..1000, applied with
+util-linux `choom` inside the scope, so a sandbox does not inherit its launcher's protection
+from the out-of-memory killer). A scope unit accepts no `OOMScoreAdjust=` property. Both default
+to unset, which emits the 1.5.0 argv.
+
 ## 1.5.0 — 2026-10-22
 
 ### ⚠️ Changed: a Beam sandbox outlives the process that provisioned it

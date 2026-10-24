@@ -229,6 +229,7 @@ defmodule ExSandbox.Hardening.Linux do
   defp compose(sandbox, limits, granted_env) do
     args =
       systemd_run_args(limits, sandbox) ++
+        oom_score_args() ++
         setpriv_args(sandbox_uid(sandbox)) ++
         confinement_args(sandbox, limits) ++
         env_args(sandbox, granted_env) ++
@@ -297,7 +298,10 @@ defmodule ExSandbox.Hardening.Linux do
         # it. The unit object survives in `failed` state and reports
         # `Result=oom-kill`, which is what distinguishes a tenant's cap breach
         # (`:resource_cap`) from a platform fault (`:mechanism_error`).
-        "--unit=#{scope_unit_name(sandbox)}",
+        "--unit=#{scope_unit_name(sandbox)}"
+      ] ++
+      slice_args() ++
+      [
         "-p",
         "MemoryMax=#{limits.memory_mb}M",
         "-p",
@@ -309,6 +313,32 @@ defmodule ExSandbox.Hardening.Linux do
         "MemorySwapMax=0"
       ]
   end
+
+  defp slice_args do
+    case beam_config(:slice) do
+      nil -> []
+      slice -> ["--slice=#{slice}"]
+    end
+  end
+
+  # ⚠️ `choom`, not `-p OOMScoreAdjust=`: a scope unit accepts no exec
+  # properties (systemd 255's `dbus-scope.c` takes only `OOMPolicy`), so the
+  # property would fail every launch. Raising a score needs no privilege.
+  defp oom_score_args do
+    case beam_config(:oom_score_adjust) do
+      nil ->
+        []
+
+      adj when is_integer(adj) and adj in -1000..1000 ->
+        ["choom", "-n", "#{adj}", "--"]
+
+      adj ->
+        raise ArgumentError,
+              "config :ex_sandbox, :beam, oom_score_adjust: expected -1000..1000, got #{inspect(adj)}"
+    end
+  end
+
+  defp beam_config(key), do: Application.get_env(:ex_sandbox, :beam, []) |> Keyword.get(key)
 
   defp scope_kind_args do
     case scope_mode() do
