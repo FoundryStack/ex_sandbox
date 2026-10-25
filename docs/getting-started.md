@@ -10,7 +10,7 @@ Desktop 27.4.0; the output blocks are what it printed.
 ## 1. Install
 
 ```elixir
-Mix.install([{:ex_sandbox, "~> 1.5"}])
+Mix.install([{:ex_sandbox, "~> 1.6"}])
 ```
 
 Nothing else. This library depends on `:telemetry` and nothing beyond it — no Ash, no web

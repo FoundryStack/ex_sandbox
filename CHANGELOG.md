@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.0 — 2026-10-25
 
 ### Added: a Beam sandbox's slice and out-of-memory score
 
