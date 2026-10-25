@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.7.0 — 2026-10-25
 
 ### Added: a consumer runs the isolation harness from its dependency checkout
 

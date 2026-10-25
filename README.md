@@ -10,7 +10,7 @@ cannot**, and producing evidence that the boundary is real.
 
 ```elixir
 def deps do
-  [{:ex_sandbox, "~> 1.6"}]
+  [{:ex_sandbox, "~> 1.7"}]
 end
 ```
 
