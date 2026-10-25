@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added: a consumer runs the isolation harness from its dependency checkout
+
+`docker/compose.isolation.yml` reads its build context, image and project names, results
+directory, test paths, included tags, setup command, census key and baseline path, a plain test
+phase, extra packages and environment, the storage root and an optional Postgres (the `database`
+profile) from `ISOLATION_*` variables, tabled at the head of the file. Every default is this
+repository's own run. The runner, unit and gate reach the image through the `harness` build
+context, so a consumer's repository can be the build context. The runner refuses to start when its
+census key has no line in the baseline, and carries the `ISOLATION_SCRIPT` diagnosis hatch. The
+image now copies the tree before `deps.get`, so a source edit recompiles the dependencies; a
+consumer's manifests are not known to a fixed `COPY`.
+
 ## 1.6.0 — 2026-10-25
 
 ### Added: a Beam sandbox's slice and out-of-memory score

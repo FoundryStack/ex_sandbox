@@ -21,31 +21,101 @@
 # `test/mechanism/beam/conformance_test.exs` printed the `run` form until they
 # were corrected to match this file.
 #
-# ⚠️ There is no `postgres` service here, and its absence is a statement rather
-# than an omission. This library has no data store (`012-FR-001`), so its
-# conformance run supplies no credential probe and the credentials group reports
-# `host capability unavailable` -- the third outcome, which is neither a pass nor
-# a breach. A consumer with a database instantiates the same suite with its own
-# probe; that is where those six checks are demonstrated. Adding Postgres here to
-# turn them green would mean this library had grown the database concept it is
-# defined by not having.
+# ⚠️ This library's own run starts no `postgres` service. It has no data store
+# (`012-FR-001`), so its conformance run supplies no credential probe and the
+# credentials group reports `host capability unavailable` -- the third outcome,
+# which is neither a pass nor a breach. A consumer with a database instantiates
+# the same suite with its own probe; that is where those six checks are
+# demonstrated, and the `database` profile below is the consumer's switch.
+#
+# ## A consumer runs this same file
+#
+# Every value below has a default that is this repository's own run. A
+# consumer exports the variables and points `-f` at this file inside its
+# dependency checkout, so the harness is maintained here once:
+#
+# | Variable | Default | Meaning |
+# |---|---|---|
+# | `ISOLATION_PROJECT` | `ex-sandbox-isolation` | compose project name |
+# | `ISOLATION_IMAGE` | `ex-sandbox-isolation:latest` | image tag |
+# | `ISOLATION_CONSUMER_DIR` | `..` | build context: the consumer's repository root |
+# | `ISOLATION_DOCKERFILE` | `docker/Dockerfile.isolation` | this directory's Dockerfile, absolute when the context is elsewhere |
+# | `ISOLATION_HARNESS_DIR` | `.` | this directory, absolute when the context is elsewhere |
+# | `ISOLATION_RESULTS_DIR` | `./results` | where `suite.log` and `census.txt` land |
+# | `ISOLATION_ELIXIR_IMAGE` | `elixir:1.20.2-otp-29` | base image |
+# | `ISOLATION_APT_PACKAGES` | (none) | extra Debian packages, space separated |
+# | `ISOLATION_ENV` | (none) | `KEY=VALUE` pairs set at compile time and in the unit |
+# | `ISOLATION_STORAGE_DIR` | `/var/lib/ex_sandbox/sandboxes` | the consumer's `storage_root` |
+# | `ISOLATION_APP_DIR` | `/app` | where `mix test` runs, inside the image |
+# | `ISOLATION_SETUP` | (none) | a command run in `ISOLATION_APP_DIR` before the suite; failure stops the run |
+# | `ISOLATION_TESTS` | (none: the whole suite) | test paths for the census-gated phase |
+# | `ISOLATION_INCLUDE` | `isolation reclamation` | tags passed as `--include` |
+# | `ISOLATION_CENSUS_KEY` | `isolation` | the phase's key in the census baseline |
+# | `ISOLATION_CENSUS_BASELINE` | `docker/census-baseline.txt` | baseline path in the build context |
+# | `ISOLATION_PLAIN_TESTS` | (none) | test paths for a second, ungated `mix test` phase |
+# | `ISOLATION_POSTGRES_IMAGE` | `postgres:18` | image for the `database` profile |
+#
+# `COMPOSE_PROFILES=database` starts Postgres beside the suite.
 
 # ⚠️ Named explicitly, and the default is actively wrong here.
 #
 # compose derives a project name from the compose file's PARENT DIRECTORY, which
-# is `docker` -- the same name the originating umbrella's harness derives, since
-# its compose files live in a directory called `docker` too. Both then share one
-# project: MEASURED on the first run of this file, which reported
+# is `docker` -- the same name a consumer's harness derives when its compose files
+# live in a directory called `docker` too. Both then share one project: MEASURED
+# on the first run of this file, which reported
 # `Found orphan containers ([docker-postgres-1])` and offered to remove them.
-# Those are the umbrella's. A `down -v` from either side would take the other's
-# containers, networks and volumes with it.
-name: ex-sandbox-isolation
+# A `down -v` from either side would take the other's containers, networks and
+# volumes with it.
+name: ${ISOLATION_PROJECT:-ex-sandbox-isolation}
 
 services:
+  # A real PostgreSQL for a consumer's credential probe. The two defects that
+  # group catches -- a `REVOKE` that reports success while revoking nothing, and
+  # a null ACL that means "wide open" -- are server behaviours, so no stub
+  # stands in. No published port: the suite reaches it over the compose network.
+  postgres:
+    profiles: [database]
+    image: ${ISOLATION_POSTGRES_IMAGE:-postgres:18}
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    healthcheck:
+      # Over TCP: `pg_isready` on the socket reports ready during init, before
+      # TCP is accepted, and the first refused connection reads as a credential
+      # failure.
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1 -p 5432 -d postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    tmpfs:
+      - /var/lib/postgresql
+
   isolation:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile.isolation
+      context: ${ISOLATION_CONSUMER_DIR:-..}
+      dockerfile: ${ISOLATION_DOCKERFILE:-docker/Dockerfile.isolation}
+      # The runner, unit and gate come from this directory even when the context
+      # is a consumer's repository.
+      additional_contexts:
+        harness: ${ISOLATION_HARNESS_DIR:-.}
+      args:
+        ISOLATION_ELIXIR_IMAGE: ${ISOLATION_ELIXIR_IMAGE:-elixir:1.20.2-otp-29}
+        ISOLATION_APT_PACKAGES: ${ISOLATION_APT_PACKAGES:-}
+        ISOLATION_ENV: ${ISOLATION_ENV:-}
+        ISOLATION_STORAGE_DIR: ${ISOLATION_STORAGE_DIR:-/var/lib/ex_sandbox/sandboxes}
+        ISOLATION_APP_DIR: ${ISOLATION_APP_DIR:-/app}
+        ISOLATION_SETUP: ${ISOLATION_SETUP:-}
+        ISOLATION_TESTS: ${ISOLATION_TESTS:-}
+        ISOLATION_INCLUDE: ${ISOLATION_INCLUDE:-isolation reclamation}
+        ISOLATION_CENSUS_KEY: ${ISOLATION_CENSUS_KEY:-isolation}
+        ISOLATION_CENSUS_BASELINE: ${ISOLATION_CENSUS_BASELINE:-docker/census-baseline.txt}
+        ISOLATION_PLAIN_TESTS: ${ISOLATION_PLAIN_TESTS:-}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
 
     # ⚠️ Pinned, because `Dockerfile.pastareclaim` says `FROM` this exact tag and
     # the default is not stable. compose names an image `<project>-<service>`, so
@@ -54,7 +124,7 @@ services:
     # image's base with a "pull access denied" that reads as a registry problem
     # rather than as a consequence of renaming the project. Naming the image here
     # decouples the two entirely.
-    image: ex-sandbox-isolation:latest
+    image: ${ISOLATION_IMAGE:-ex-sandbox-isolation:latest}
 
     # systemd needs a real PID 1 with cgroup delegation. Every setting below is
     # load-bearing for at least one capability probe; none is decoration.
@@ -168,13 +238,13 @@ services:
       # from one that never booted, which cost a full debugging cycle chasing a
       # boot failure that never happened. The unit tees to a file here so the
       # result is readable after the fact, whatever systemd decides to do.
-      - ./results:/var/log/ex_sandbox:rw
+      - ${ISOLATION_RESULTS_DIR:-./results}:/var/log/ex_sandbox:rw
       # `probe_disk_quota/0` asks `stat -f -c %T` and accepts only xfs, ext2/3/4,
       # or btrfs. The container's own root is `overlayfs`, which it rejects --
       # correctly, since overlayfs cannot carry a quota. A *named volume* is
       # backed by the VM's real ext4 and reports `ext2/ext3`, so the storage root
       # has to be a volume rather than an image directory.
-      - sandbox-storage:/var/lib/ex_sandbox/sandboxes
+      - sandbox-storage:${ISOLATION_STORAGE_DIR:-/var/lib/ex_sandbox/sandboxes}
 
     # ⚠️ Deliberately no bind mount of the source tree. The image COPYs it
     # instead: a macOS bind mount would shadow the compiled build and reintroduce

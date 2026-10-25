@@ -7,18 +7,14 @@
 # accidental change to that helper cannot silently reduce this run to the tests
 # that were already passing on the developer's machine.
 #
-# ## One phase, where Axonn's copy of this script has three
+# ## Phases
 #
-# The umbrella version runs a credentials conformance phase and a
-# production-path provisioning phase either side of this one, both from
-# `apps/axonn`, because both need a database and a host schema. Neither belongs
-# here: this library has no data store and `012-FR-001` says it must not grow
-# one. What that costs is visible rather than hidden -- the credentials group
-# reports `capability_unavailable`, the third outcome, and the census prints the
-# count.
-#
-# So there is no multi-phase verdict block at the foot of this file. The census
-# gate's status IS the container's status.
+# The variables come from `/etc/isolation.env` (see `compose.isolation.yml` for
+# the table and defaults). This library's own run is one census-gated phase.
+# A consumer with a database adds `ISOLATION_SETUP` (run first; failure stops
+# the run, since checks against a database that does not exist are refused for
+# that reason and read as containment) and `ISOLATION_PLAIN_TESTS`, an ordinary
+# `mix test` phase with no third outcome, run after the gated one.
 set -euo pipefail
 
 # The gate that decides whether a phase counts as passed lives in its own file
@@ -46,7 +42,7 @@ echo
 echo "== host facilities =="
 echo "kernel:        $(uname -sr)"
 echo "cgroup:        $(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo MISSING)"
-echo "storage fs:    $(stat -f -c %T /var/lib/ex_sandbox/sandboxes 2>/dev/null || echo MISSING)"
+echo "storage fs:    $(stat -f -c %T "$ISOLATION_STORAGE_DIR" 2>/dev/null || echo MISSING)"
 for bin in systemd-run setpriv bwrap pasta nsenter; do
   printf '%-14s %s\n' "$bin:" "$(command -v "$bin" || echo MISSING)"
 done
@@ -100,8 +96,50 @@ Read the census counts below as `passed` out of `ran`, never out of the total.\e
   end
 '
 
+# A diagnosis hatch. Probing the hardening path needs systemd as PID 1, which
+# `--entrypoint /bin/sh` displaces, so a diagnostic script runs here instead:
+#
+#     docker compose -f docker/compose.isolation.yml \
+#       run --rm -v "$PWD/probe.exs:/probe.exs:ro" \
+#       -e ISOLATION_SCRIPT=/probe.exs isolation
+#
+# ⚠️ Read from PID 1's environment: `-e` sets it on systemd, and a unit starts
+# with an empty environment. Only this one name is copied across.
+if [ -z "${ISOLATION_SCRIPT:-}" ] && [ -r /proc/1/environ ]; then
+  while IFS= read -r -d '' entry; do
+    case "$entry" in
+      ISOLATION_SCRIPT=*) ISOLATION_SCRIPT="${entry#ISOLATION_SCRIPT=}" ;;
+    esac
+  done < /proc/1/environ
+fi
+
+if [ -n "${ISOLATION_SCRIPT:-}" ]; then
+  echo
+  if [ ! -f "$ISOLATION_SCRIPT" ]; then
+    echo "ISOLATION_SCRIPT=$ISOLATION_SCRIPT is set but no such file is in the container."
+    echo "Mount it: -v \"\$PWD/probe.exs:$ISOLATION_SCRIPT:ro\""
+    exit 1
+  fi
+  echo "== running ${ISOLATION_SCRIPT} =="
+  exec mix run "$ISOLATION_SCRIPT"
+fi
+
+# ⚠️ A key absent from the baseline leaves the phase ungated: the ceiling is
+# skipped and the gate reports no defects. `census-gate-test.sh` can check this
+# library's key statically; a consumer's key is checked here.
+if [ -z "$(census_baseline "$ISOLATION_CENSUS_KEY")" ]; then
+  echo "ISOLATION_CENSUS_KEY=$ISOLATION_CENSUS_KEY has no line in census-baseline.txt."
+  exit 1
+fi
+
+if [ -n "$ISOLATION_SETUP" ]; then
+  echo
+  echo "== setup: ${ISOLATION_SETUP} =="
+  (cd "$ISOLATION_APP_DIR" && bash -c "$ISOLATION_SETUP")
+fi
+
 echo
-echo "== isolation + reclamation suites =="
+echo "== census-gated suite (${ISOLATION_INCLUDE}) =="
 
 # `012-FR-016a`: separate the third outcome from failure in the **exit code**.
 #
@@ -121,10 +159,17 @@ CENSUS=/var/log/ex_sandbox/census.txt
 export EX_SANDBOX_CENSUS_PATH="$CENSUS"
 rm -f "$CENSUS"
 
+include=()
+for tag in $ISOLATION_INCLUDE; do include+=(--include "$tag"); done
+
 set +e
-mix test --include isolation --include reclamation \
-  --formatter ExUnit.CLIFormatter \
-  --formatter ExSandbox.Conformance.Census "$@"
+# shellcheck disable=SC2086
+(
+  cd "$ISOLATION_APP_DIR"
+  mix test "${include[@]}" \
+    --formatter ExUnit.CLIFormatter \
+    --formatter ExSandbox.Conformance.Census $ISOLATION_TESTS "$@"
+)
 suite_status=$?
 set -e
 
@@ -136,7 +181,34 @@ echo "run id: $RUN_ID"
 # Every guard -- missing census, `ran=0`, unreadable counts, genuine failures --
 # lives in `census_gate` and is exercised by its own test.
 #
-# ⚠️ This IS the last statement, unlike in Axonn's copy where two further phases
-# follow and the gate has to capture rather than exit. Here the gate's verdict is
-# the container's verdict, so `exec`-like finality is correct.
-census_gate "$CENSUS" "isolation + reclamation" "$suite_status" "isolation"
+# ⚠️ Capture the status, then test it. `if ! census_gate ...; then exit $?; fi`
+# exits **0** on a failing phase: `!` inverts the status, so `$?` inside the
+# branch is the negation's 0. And capture rather than exit, so the plain phase
+# below still reports when the gated one fails.
+set +e
+census_gate "$CENSUS" "${ISOLATION_CENSUS_KEY:-isolation}" "$suite_status"
+gate_status=$?
+set -e
+
+[ -z "$ISOLATION_PLAIN_TESTS" ] && exit "$gate_status"
+
+echo
+echo "== plain suite: ${ISOLATION_PLAIN_TESTS} =="
+# No census formatter: these are ordinary checks where a failure is a failure,
+# and a census would invite a reader to look for an `unavailable=` line.
+set +e
+# shellcheck disable=SC2086
+(cd "$ISOLATION_APP_DIR" && mix test $ISOLATION_PLAIN_TESTS)
+plain_status=$?
+set -e
+
+echo
+echo "== run verdict =="
+echo "census gate: ${gate_status}"
+echo "plain suite: ${plain_status}"
+
+if [ "$gate_status" -ne 0 ]; then
+  exit "$gate_status"
+fi
+
+exit "$plain_status"

@@ -261,7 +261,9 @@ ran=204" 0
 # question. Measured: `unavailable=8` against a baseline of 7, exit 0.
 #
 # So this reads the REAL invocations out of the script rather than restating
-# them, and fails if any resolved key is absent from the baseline file. A phase
+# them, and fails if any resolved key is absent from the baseline file. A key
+# written `${VAR:-default}` resolves to its default, which is this library's own
+# run; a consumer's key is checked by the runner itself before its suite. A phase
 # deliberately left ungated is spelled out in `UNGATED` below, which makes
 # "not gated" a decision someone wrote down rather than a typo nobody can see.
 echo
@@ -298,7 +300,8 @@ while IFS=$'\t' read -r key label; do
   fi
 done <<EOF
 $(grep -oE 'census_gate "[^"]*" "[^"]*" "[^"]*"( "[^"]*")?' "$DIR/run-isolation-tests.sh" |
-  awk -F'"' '{ label = $4; key = (NF >= 8 && $8 != "" ? $8 : label); print key "\t" label }')
+  awk -F'"' '{ label = $4; key = (NF >= 8 && $8 != "" ? $8 : label)
+               sub(/^\$\{[A-Z_]+:-/, "", key); sub(/\}$/, "", key); print key "\t" label }')
 EOF
 
 echo

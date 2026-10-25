@@ -105,8 +105,33 @@ isolation test skips — the container exits 0 having verified nothing, which is
 this harness exists to eliminate. The suite runs as a systemd unit instead
 (`isolation-tests.service`).
 
-⚠️ **`.dockerignore` must exclude `_build` and `deps`.** The image compiles the dependency tree in
-its own cached layer and only then runs `COPY . .`. Without those two lines the copy lands the
-macOS-built artifacts on top of the Linux ones, and a Mach-O object dlopen'd by a Linux runtime
-fails with `invalid ELF header` — the image builds fine and the suite dies on load, which reads as
-a defect in the code under test rather than in how it got there.
+⚠️ **`.dockerignore` must exclude `_build` and `deps`.** The image runs `COPY . .` and then
+compiles. Without those two lines the copy lands the macOS-built artifacts in the tree, and a
+Mach-O object dlopen'd by a Linux runtime fails with `invalid ELF header` — the image builds fine
+and the suite dies on load, which reads as a defect in the code under test rather than in how it
+got there. A consumer's `.dockerignore` carries the same two lines.
+
+## Running it from a consumer
+
+A repository that depends on ex_sandbox as a git dependency runs this directory's files from its
+`deps/ex_sandbox/docker/`, with its own context, tests and baseline. The variables and their
+defaults are tabled at the head of `compose.isolation.yml`; every default is this repository's
+own run. A consumer with a database credential probe sets, for example:
+
+```bash
+harness="$(cd deps/ex_sandbox/docker && pwd -P)"
+export ISOLATION_PROJECT=my-app-isolation ISOLATION_IMAGE=my-app-isolation:latest \
+  ISOLATION_CONSUMER_DIR="$PWD" ISOLATION_HARNESS_DIR="$harness" \
+  ISOLATION_DOCKERFILE="$harness/Dockerfile.isolation" \
+  ISOLATION_RESULTS_DIR="$PWD/docker/results" \
+  COMPOSE_PROFILES=database ISOLATION_APT_PACKAGES=postgresql-client \
+  ISOLATION_ENV="MY_DB_HOST=postgres MY_DB_PORT=5432" \
+  ISOLATION_SETUP="mix ecto.setup" ISOLATION_TESTS="test/my_app/conformance_test.exs" \
+  ISOLATION_CENSUS_KEY=credentials
+docker compose -f "$harness/compose.isolation.yml" up --build \
+  --abort-on-container-exit --exit-code-from isolation isolation
+```
+
+The baseline (`ISOLATION_CENSUS_BASELINE`, default `docker/census-baseline.txt`) is read from the
+consumer's tree, and the runner refuses to start when `ISOLATION_CENSUS_KEY` has no line in it: an
+absent key would leave the phase ungated.
