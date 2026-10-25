@@ -322,7 +322,7 @@ defmodule ExSandbox.Hardening.Linux do
   end
 
   # ⚠️ `choom`, not `-p OOMScoreAdjust=`: a scope unit accepts no exec
-  # properties (systemd 255's `dbus-scope.c` takes only `OOMPolicy`), so the
+  # properties (systemd 255's dbus-scope.c takes only `OOMPolicy`), so the
   # property would fail every launch. Raising a score needs no privilege.
   defp oom_score_args do
     case beam_config(:oom_score_adjust) do
