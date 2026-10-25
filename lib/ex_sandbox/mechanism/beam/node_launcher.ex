@@ -73,10 +73,14 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   cannot confine must not run tenant code unconfined. Returns
   `{:error, :mechanism_error}` after recording *why*, so an operator reads the
   missing capability rather than a bare atom.
+
+  `exec_via:` (or `sandbox.context[:exec_via]`) runs the command through a
+  prefix, such as `ssh` to a gateway's launcher; see `via/2`.
   """
   @spec launch(Sandbox.t(), keyword()) :: {:ok, launched()} | {:error, atom()}
   def launch(%Sandbox{} = sandbox, opts \\ []) do
     granted_env = Keyword.get(opts, :granted_env, [])
+    exec_via = Keyword.get(opts, :exec_via) || context_exec_via(sandbox)
 
     with :ok <- require_hardening(),
          :ok <- prepare_storage(sandbox),
@@ -84,6 +88,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          :ok <- clear_stale_scope(sandbox),
          {:ok, exec} <- hardening().build_command(sandbox, granted_env),
          {:ok, exec, binding, plan} <- policed(sandbox, exec),
+         {:ok, exec} <- via_releasing(exec, exec_via, binding),
          {:ok, launched} <- start_peer_releasing(sandbox, exec, binding),
          # ⚠️ Between `start_peer_releasing/3` and here the tenant is running
          # and unpoliced. The window cannot be closed by reordering -- the
@@ -644,6 +649,42 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   def exec_from_plan(%ExSandbox.Egress.LaunchPlan{pasta_command: [prog | args]}) do
     {prog, args}
   end
+
+  @doc """
+  The command that runs `exec` through `exec_via`, or `exec` itself when
+  there is no prefix.
+
+  The argv travels as one base64 token of its newline-joined arguments after
+  the prefix, so a transport that joins words with spaces (`ssh`) carries it
+  intact, and the gateway's launcher (`priv/gateway/launcher`) decodes it
+  without a shell. An argument holding a newline or empty cannot travel that
+  way and is refused.
+  """
+  @spec via({String.t(), [String.t()]}, [String.t()] | nil) ::
+          {:ok, {String.t(), [String.t()]}} | {:error, :mechanism_error}
+  def via(exec, nil), do: {:ok, exec}
+  def via(exec, []), do: {:ok, exec}
+
+  def via({prog, args}, [via_prog | via_args]) do
+    argv = [prog | args]
+
+    if Enum.any?(argv, &(&1 == "" or String.contains?(&1, "\n"))) do
+      Logger.error("sandbox launch refused: an argument cannot travel through exec_via")
+      {:error, :mechanism_error}
+    else
+      {:ok, {via_prog, via_args ++ [Base.encode64(Enum.join(argv, "\n"))]}}
+    end
+  end
+
+  defp via_releasing(exec, exec_via, binding) do
+    with {:error, _reason} = error <- via(exec, exec_via) do
+      if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
+      error
+    end
+  end
+
+  defp context_exec_via(%Sandbox{context: %{exec_via: [_ | _] = exec_via}}), do: exec_via
+  defp context_exec_via(_sandbox), do: nil
 
   # ⚠️ A binding acquired but never launched is a leak, and the failure that
   # produces it -- `start_peer/2` refusing -- is the ordinary one, not the rare

@@ -1,0 +1,135 @@
+#!/bin/sh
+# The forced command of a gateway account's key:
+#   restrict,command="/usr/local/libexec/ex-sandbox-launcher [SLICE_DIR [SYSTEMD_RUN]]" ssh-ed25519 ...
+#
+# Verbs, read from SSH_ORIGINAL_COMMAND:
+#   ping                 answers "pong"
+#   sample               the sandbox slice's memory.current and memory.max
+#   launch ARGV64 ARG..  execs the base64, newline-joined argv when it has
+#                        ExSandbox.Hardening.Linux's shape; the trailing ARGs
+#                        are the ones :peer appends for the sandbox's BEAM
+set -eu
+set -f
+
+slice_dir=${1:-}
+systemd_run=${2:-/usr/bin/systemd-run}
+
+refuse() {
+  printf 'ex-sandbox-launcher: refused: %s\n' "$1" >&2
+  exit 64
+}
+
+sample() {
+  dir=$slice_dir
+  if [ -z "$dir" ]; then
+    for candidate in /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/axonn-sandbox.slice; do
+      dir=$candidate
+      break
+    done
+  fi
+  [ -r "$dir/memory.current" ] || refuse "no sandbox slice at $dir"
+  printf '%s %s\n' "$(cat "$dir/memory.current")" "$(cat "$dir/memory.max")"
+}
+
+# The argv must be: systemd-run with only the scope options Hardening.Linux
+# passes, then setpriv dropping to a non-root uid and gid with no new
+# privileges, then (in order) bwrap with --unshare-pid and --die-with-parent,
+# and env -i. Everything after setpriv runs as the dropped uid, so the rest
+# of bwrap's options can reach only what that uid could reach anyway.
+check_shape() {
+  [ "$#" -gt 0 ] || refuse "empty argv"
+  case "$1" in
+    */systemd-run | systemd-run) shift ;;
+    *) refuse "argv does not start with systemd-run" ;;
+  esac
+
+  scope=no
+  memory=no
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --scope) scope=yes ;;
+      --user | --quiet) ;;
+      --unit=sandbox-*.scope) ;;
+      -p)
+        [ "$#" -gt 1 ] || refuse "-p without a property"
+        case "$2" in
+          MemoryMax=*M) memory=yes ;;
+          CPUQuota=*% | MemorySwapMax=0) ;;
+          *) refuse "systemd-run property $2" ;;
+        esac
+        shift
+        ;;
+      setpriv) break ;;
+      *) refuse "systemd-run option $1" ;;
+    esac
+    shift
+  done
+  [ "$scope" = yes ] || refuse "no --scope"
+  [ "$memory" = yes ] || refuse "no MemoryMax"
+  [ "$#" -gt 0 ] || refuse "no setpriv"
+  shift
+
+  reuid=no
+  regid=no
+  clear=no
+  nnp=no
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --reuid=0 | --regid=0) refuse "setpriv to root" ;;
+      --reuid=*[!0-9]* | --regid=*[!0-9]*) refuse "setpriv id $1" ;;
+      --reuid=?*) reuid=yes ;;
+      --regid=?*) regid=yes ;;
+      --clear-groups) clear=yes ;;
+      --no-new-privs) nnp=yes ;;
+      -*) refuse "setpriv option $1" ;;
+      *) break ;;
+    esac
+    shift
+  done
+  [ "$reuid$regid$clear$nnp" = yesyesyesyes ] || refuse "setpriv does not drop every privilege"
+
+  want="bwrap --unshare-pid --die-with-parent env -i"
+  for arg in "$@"; do
+    next=${want%% *}
+    [ -n "$want" ] && [ "$arg" = "$next" ] || continue
+    case "$want" in
+      *" "*) want=${want#* } ;;
+      *) want="" ;;
+    esac
+  done
+  [ -z "$want" ] || refuse "missing ${want%% *} in the confinement"
+}
+
+launch() {
+  [ "$#" -gt 0 ] || refuse "launch without an argv"
+  payload=$1
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      *[!A-Za-z0-9_./:=@,+-]*) refuse "peer argument $arg" ;;
+    esac
+  done
+  decoded=$(printf '%s' "$payload" | base64 -d 2>/dev/null) || refuse "argv is not base64"
+  old_ifs=$IFS
+  IFS='
+'
+  # shellcheck disable=SC2086
+  set -- $decoded "$@"
+  IFS=$old_ifs
+  check_shape "$@"
+  shift
+  exec "$systemd_run" "$@"
+}
+
+# shellcheck disable=SC2086
+set -- ${SSH_ORIGINAL_COMMAND:-}
+[ "$#" -gt 0 ] || refuse "no verb"
+verb=$1
+shift
+
+case "$verb" in
+  ping) echo pong ;;
+  sample) sample ;;
+  launch) launch "$@" ;;
+  *) refuse "unknown verb $verb" ;;
+esac
