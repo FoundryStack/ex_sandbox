@@ -5,6 +5,9 @@
 # Verbs, read from SSH_ORIGINAL_COMMAND:
 #   ping                 answers "pong"
 #   sample               the sandbox slice's memory.current and memory.max
+#   conform              the Mechanism.Beam capability groups this host
+#                        fails, one per line, probed as ExSandbox.Capability
+#                        probes them; no output when it can confine
 #   launch ARGV64 ARG..  execs the base64, newline-joined argv when it has
 #                        ExSandbox.Hardening.Linux's shape; the trailing ARGs
 #                        are the ones :peer appends for the sandbox's BEAM
@@ -29,6 +32,20 @@ sample() {
   fi
   [ -r "$dir/memory.current" ] || refuse "no sandbox slice at $dir"
   printf '%s %s\n' "$(cat "$dir/memory.current")" "$(cat "$dir/memory.max")"
+}
+
+quiet() {
+  "$@" >/dev/null 2>&1
+}
+
+conform() {
+  quiet "$systemd_run" --user --scope --quiet -p MemoryMax=64M true ||
+    quiet "$systemd_run" --scope --quiet -p MemoryMax=64M true ||
+    echo resource_limits
+  quiet bwrap --unshare-user --ro-bind / / true || echo filesystem_confinement
+  quiet setpriv --reuid=65534 --regid=65534 --clear-groups true || echo privilege_separation
+  { quiet bwrap --unshare-user --unshare-net --ro-bind / / true && quiet command -v pasta; } ||
+    echo network_restriction
 }
 
 # The argv must be: systemd-run with only the scope options Hardening.Linux
@@ -130,6 +147,7 @@ shift
 case "$verb" in
   ping) echo pong ;;
   sample) sample ;;
+  conform) conform ;;
   launch) launch "$@" ;;
   *) refuse "unknown verb $verb" ;;
 esac

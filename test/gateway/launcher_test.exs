@@ -117,9 +117,33 @@ defmodule ExSandbox.Gateway.LauncherTest do
       assert {"1048576 max\n", 0} = run_launcher("sample", tmp_dir, tmp_dir)
     end
 
+    test "conform names the groups a host without user namespaces fails", %{tmp_dir: tmp_dir} do
+      assert conform(tmp_dir, bwrap_status: 1) == "filesystem_confinement\nnetwork_restriction\n"
+      assert conform(tmp_dir, bwrap_status: 0) == ""
+    end
+
     test "refuses an unknown verb", %{tmp_dir: tmp_dir} do
       assert {_out, 64} = run_launcher("shell", tmp_dir)
     end
+  end
+
+  # The host's tools as stand-ins: bwrap answers `bwrap_status`, the rest succeed.
+  defp conform(tmp_dir, bwrap_status: bwrap_status) do
+    bin = Path.join(tmp_dir, "bin")
+    File.mkdir_p!(bin)
+
+    for {tool, status} <- [bwrap: bwrap_status, setpriv: 0, pasta: 0] do
+      path = Path.join(bin, to_string(tool))
+      File.write!(path, "#!/bin/sh\nexit #{status}\n")
+      File.chmod!(path, 0o755)
+    end
+
+    {out, 0} =
+      System.cmd("sh", [@launcher, "/nonexistent", echo_systemd_run(tmp_dir)],
+        env: [{"SSH_ORIGINAL_COMMAND", "conform"}, {"PATH", bin <> ":/usr/bin:/bin"}]
+      )
+
+    out
   end
 
   defp swap(args, match?, replacement) do
