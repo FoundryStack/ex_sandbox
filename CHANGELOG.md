@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.8.0 — 2026-10-26
+
+### Added: a Beam sandbox's soft limit, bounded swap and floor
+
+`config :ex_sandbox, :beam` takes `memory_high_ratio:` (a number above 0 and below 1; the scope
+gets `MemoryHigh=` at that share of its `MemoryMax`, so a sandbox nearing its cap is throttled and
+reclaimed before it is killed) and `swap_max_mb:` (a positive integer; replaces `MemorySwapMax=0`
+with a bounded swap). A sandbox whose `context` map carries `memory_low_mb:` gets `MemoryLow=` at
+that size. All three default to unset, which emits the 1.7.0 argv.
+
 ## 1.7.0 — 2026-10-25
 
 ### Added: a consumer runs the isolation harness from its dependency checkout

@@ -306,13 +306,47 @@ defmodule ExSandbox.Hardening.Linux do
         "MemoryMax=#{limits.memory_mb}M",
         "-p",
         "CPUQuota=#{limits.cpu_percent}%",
-        # `MemorySwapMax=0`: without it a sandbox at its memory cap swaps instead
-        # of being killed, so the cap bounds RSS rather than consumption and one
-        # tenant can still exhaust the host's IO.
+        # `MemorySwapMax=0` unless `swap_max_mb:` is set: without a bound a
+        # sandbox at its memory cap swaps instead of being killed, so the cap
+        # bounds RSS rather than consumption and one tenant can still exhaust
+        # the host's IO.
         "-p",
-        "MemorySwapMax=0"
-      ]
+        "MemorySwapMax=#{swap_max()}"
+      ] ++ memory_high_args(limits) ++ memory_low_args(sandbox)
   end
+
+  defp swap_max do
+    case beam_config(:swap_max_mb) do
+      nil ->
+        "0"
+
+      mb when is_integer(mb) and mb > 0 ->
+        "#{mb}M"
+
+      other ->
+        raise ArgumentError,
+              "config :ex_sandbox, :beam, swap_max_mb: expected a positive integer, got #{inspect(other)}"
+    end
+  end
+
+  defp memory_high_args(limits) do
+    case beam_config(:memory_high_ratio) do
+      nil ->
+        []
+
+      ratio when is_number(ratio) and ratio > 0 and ratio < 1 ->
+        ["-p", "MemoryHigh=#{max(trunc(limits.memory_mb * ratio), 1)}M"]
+
+      other ->
+        raise ArgumentError,
+              "config :ex_sandbox, :beam, memory_high_ratio: expected a number above 0 and below 1, got #{inspect(other)}"
+    end
+  end
+
+  defp memory_low_args(%{context: %{memory_low_mb: mb}}) when is_integer(mb) and mb > 0,
+    do: ["-p", "MemoryLow=#{mb}M"]
+
+  defp memory_low_args(_sandbox), do: []
 
   defp slice_args do
     case beam_config(:slice) do
