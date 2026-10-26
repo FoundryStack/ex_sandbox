@@ -117,6 +117,37 @@ defmodule ExSandbox.Gateway.LauncherTest do
       assert {"1048576 max\n", 0} = run_launcher("sample", tmp_dir, tmp_dir)
     end
 
+    test "samples a sandbox's peak and resets it", %{tmp_dir: tmp_dir} do
+      scope = Path.join(tmp_dir, "sandbox-abc-1.scope")
+      File.mkdir_p!(scope)
+      File.write!(Path.join(tmp_dir, "memory.current"), "1048576\n")
+      File.write!(Path.join(scope, "memory.peak"), "3145728\n")
+      File.write!(Path.join(scope, "memory.current"), "2097152\n")
+
+      assert {"3145728\n", 0} = run_launcher("sample abc-1", tmp_dir, tmp_dir)
+      assert File.read!(Path.join(scope, "memory.peak")) == "0"
+    end
+
+    test "samples memory.current where the peak cannot be reset", %{tmp_dir: tmp_dir} do
+      scope = Path.join(tmp_dir, "sandbox-abc-1.scope")
+      File.mkdir_p!(scope)
+      File.write!(Path.join(tmp_dir, "memory.current"), "1048576\n")
+      File.write!(Path.join(scope, "memory.peak"), "3145728\n")
+      File.write!(Path.join(scope, "memory.current"), "2097152\n")
+      File.chmod!(Path.join(scope, "memory.peak"), 0o444)
+
+      assert {"2097152\n", 0} = run_launcher("sample abc-1", tmp_dir, tmp_dir)
+
+      File.rm!(Path.join(scope, "memory.peak"))
+      assert {"2097152\n", 0} = run_launcher("sample abc-1", tmp_dir, tmp_dir)
+    end
+
+    test "refuses a sandbox id that could leave the slice", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "memory.current"), "1048576\n")
+      assert {out, 64} = run_launcher("sample ../x", tmp_dir, tmp_dir)
+      assert out =~ "sandbox id"
+    end
+
     test "conform names the groups a host without user namespaces fails", %{tmp_dir: tmp_dir} do
       assert conform(tmp_dir, bwrap_status: 1) == "filesystem_confinement\nnetwork_restriction\n"
       assert conform(tmp_dir, bwrap_status: 0) == ""

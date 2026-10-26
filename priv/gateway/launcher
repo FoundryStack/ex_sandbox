@@ -5,6 +5,9 @@
 # Verbs, read from SSH_ORIGINAL_COMMAND:
 #   ping                 answers "pong"
 #   sample               the sandbox slice's memory.current and memory.max
+#   sample ID            sandbox ID's scope peak since the last sample, in
+#                        bytes, resetting memory.peak; memory.current where
+#                        the kernel has no resettable memory.peak
 #   conform              the Mechanism.Beam capability groups this host
 #                        fails, one per line, probed as ExSandbox.Capability
 #                        probes them; no output when it can confine
@@ -22,7 +25,7 @@ refuse() {
   exit 64
 }
 
-sample() {
+slice() {
   dir=$slice_dir
   if [ -z "$dir" ]; then
     for candidate in /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/axonn-sandbox.slice; do
@@ -31,7 +34,24 @@ sample() {
     done
   fi
   [ -r "$dir/memory.current" ] || refuse "no sandbox slice at $dir"
-  printf '%s %s\n' "$(cat "$dir/memory.current")" "$(cat "$dir/memory.max")"
+}
+
+sample() {
+  slice
+  if [ "$#" -eq 0 ]; then
+    printf '%s %s\n' "$(cat "$dir/memory.current")" "$(cat "$dir/memory.max")"
+    return
+  fi
+  case "$1" in
+    "" | *[!A-Za-z0-9-]*) refuse "sandbox id $1" ;;
+  esac
+  scope="$dir/sandbox-$1.scope"
+  [ -r "$scope/memory.current" ] || refuse "no scope for sandbox $1"
+  if peak=$(cat "$scope/memory.peak" 2>/dev/null) && (printf '0' >"$scope/memory.peak") 2>/dev/null; then
+    printf '%s\n' "$peak"
+  else
+    cat "$scope/memory.current"
+  fi
 }
 
 quiet() {
@@ -146,7 +166,7 @@ shift
 
 case "$verb" in
   ping) echo pong ;;
-  sample) sample ;;
+  sample) sample "$@" ;;
   conform) conform ;;
   launch) launch "$@" ;;
   *) refuse "unknown verb $verb" ;;
