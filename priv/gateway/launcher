@@ -1,6 +1,6 @@
 #!/bin/sh
 # The forced command of a gateway account's key:
-#   restrict,command="/usr/local/libexec/ex-sandbox-launcher [SLICE_DIR [SYSTEMD_RUN]]" ssh-ed25519 ...
+#   restrict,command="/usr/local/libexec/ex-sandbox-launcher [SLICE_DIR [SYSTEMD_RUN [SOCKET [SOCAT]]]]" ssh-ed25519 ...
 #
 # Verbs, read from SSH_ORIGINAL_COMMAND:
 #   ping                 answers "pong"
@@ -14,11 +14,15 @@
 #   launch ARGV64 ARG..  execs the base64, newline-joined argv when it has
 #                        ExSandbox.Hardening.Linux's shape; the trailing ARGs
 #                        are the ones :peer appends for the sandbox's BEAM
+#   connect              relays stdin and stdout to the gateway's socket,
+#                        SOCKET or $XDG_RUNTIME_DIR/ex-sandbox/gateway.sock
 set -eu
 set -f
 
 slice_dir=${1:-}
 systemd_run=${2:-/usr/bin/systemd-run}
+gateway_socket=${3:-${XDG_RUNTIME_DIR:-/nonexistent}/ex-sandbox/gateway.sock}
+socat=${4:-socat}
 
 refuse() {
   printf 'ex-sandbox-launcher: refused: %s\n' "$1" >&2
@@ -158,6 +162,12 @@ launch() {
   exec "$systemd_run" "$@"
 }
 
+connect() {
+  [ "$#" -eq 0 ] || refuse "connect takes no arguments"
+  [ -S "$gateway_socket" ] || refuse "no gateway socket at $gateway_socket"
+  exec "$socat" STDIO "UNIX-CONNECT:$gateway_socket"
+}
+
 # shellcheck disable=SC2086
 set -- ${SSH_ORIGINAL_COMMAND:-}
 [ "$#" -gt 0 ] || refuse "no verb"
@@ -169,5 +179,6 @@ case "$verb" in
   sample) sample "$@" ;;
   conform) conform ;;
   launch) launch "$@" ;;
+  connect) connect "$@" ;;
   *) refuse "unknown verb $verb" ;;
 esac

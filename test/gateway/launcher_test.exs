@@ -177,6 +177,49 @@ defmodule ExSandbox.Gateway.LauncherTest do
     out
   end
 
+  describe "connect" do
+    @describetag :tmp_dir
+
+    setup %{tmp_dir: tmp_dir} do
+      socket = "/tmp/exsg-launch-#{System.unique_integer([:positive])}.sock"
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, ifaddr: {:local, socket}])
+
+      on_exit(fn ->
+        :gen_tcp.close(listen)
+        File.rm(socket)
+      end)
+
+      socat = Path.join(tmp_dir, "socat")
+      File.write!(socat, ~s(#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done\n))
+      File.chmod!(socat, 0o755)
+      %{socket: socket, socat: socat}
+    end
+
+    test "relays to the gateway socket", %{tmp_dir: tmp_dir, socket: socket, socat: socat} do
+      assert {out, 0} = run_connect("connect", tmp_dir, socket, socat)
+      assert String.split(out, "\n", trim: true) == ["STDIO", "UNIX-CONNECT:" <> socket]
+    end
+
+    test "refuses any argument after the verb", %{tmp_dir: tmp_dir, socket: socket, socat: socat} do
+      for extra <- ["connect /etc/passwd", "connect -", "connect EXEC:/bin/sh"] do
+        assert {out, 64} = run_connect(extra, tmp_dir, socket, socat)
+        assert out =~ "connect takes no arguments"
+      end
+    end
+
+    test "refuses when no gateway listens", %{tmp_dir: tmp_dir, socat: socat} do
+      assert {out, 64} = run_connect("connect", tmp_dir, Path.join(tmp_dir, "none.sock"), socat)
+      assert out =~ "no gateway socket"
+    end
+  end
+
+  defp run_connect(request, tmp_dir, socket, socat) do
+    System.cmd("sh", [@launcher, "/nonexistent", echo_systemd_run(tmp_dir), socket, socat],
+      env: [{"SSH_ORIGINAL_COMMAND", request}],
+      stderr_to_stdout: true
+    )
+  end
+
   defp swap(args, match?, replacement) do
     Enum.map(args, &if(match?.(&1), do: replacement, else: &1))
   end

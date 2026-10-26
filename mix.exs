@@ -108,7 +108,8 @@ defmodule ExSandbox.MixProject do
       description: description(),
       package: package(),
       docs: docs(),
-      source_url: @source_url
+      source_url: @source_url,
+      releases: [ex_sandbox_gateway: [applications: [ex_sandbox: :permanent]]]
     ]
   end
 
