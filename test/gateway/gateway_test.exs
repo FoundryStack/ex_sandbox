@@ -216,6 +216,10 @@ defmodule ExSandbox.GatewayTest do
       assert {:tagged, runner} = provisioned.context.probe.(:tagged)
       assert runner != self()
       refute Process.alive?(runner)
+
+      assert {:ok, started} = ExSandbox.Mechanism.Gateway.start(provisioned)
+      assert {:again, other} = started.context.probe.(:again)
+      assert other != self()
     end
   end
 

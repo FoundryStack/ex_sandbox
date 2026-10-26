@@ -177,7 +177,7 @@ defmodule ExSandbox.Gateway.Server do
 
   @doc false
   def run(verb, args, conn) do
-    verb |> dispatch(args, conn) |> ContextFuns.export(conn.funs)
+    verb |> dispatch(ContextFuns.restore(args, conn.funs), conn) |> ContextFuns.export(conn.funs)
   rescue
     error -> {:error, {:gateway_raised, Exception.message(error)}}
   catch

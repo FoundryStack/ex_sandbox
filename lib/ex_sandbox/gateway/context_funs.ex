@@ -43,12 +43,50 @@ defmodule ExSandbox.Gateway.ContextFuns do
 
   def import(result, _request), do: result
 
-  @doc "Drops context functions from a sandbox the client sends."
+  @doc "Replaces context functions in a sandbox the client sends with markers."
   @spec strip(term()) :: term()
-  def strip(%Sandbox{context: context} = sandbox) when is_map(context),
-    do: %{sandbox | context: Map.reject(context, fn {_key, value} -> is_function(value) end)}
+  def strip(%Sandbox{context: context} = sandbox) when is_map(context) do
+    stripped =
+      Map.new(context, fn
+        {key, fun} when is_function(fun) ->
+          {:arity, arity} = Function.info(fun, :arity)
+          {key, {:gateway_context_function, key, arity}}
+
+        pair ->
+          pair
+      end)
+
+    %{sandbox | context: stripped}
+  end
 
   def strip(other), do: other
+
+  @doc "Puts the stored functions back in place of the markers in a request's sandboxes."
+  @spec restore(term(), :ets.tid()) :: term()
+  def restore(args, table) when is_tuple(args) do
+    args |> Tuple.to_list() |> Enum.map(&restore_sandbox(&1, table)) |> List.to_tuple()
+  end
+
+  def restore(args, _table), do: args
+
+  defp restore_sandbox(%Sandbox{context: context, id: id} = sandbox, table)
+       when is_map(context) do
+    restored =
+      Enum.flat_map(context, fn
+        {key, {:gateway_context_function, key, _arity}} ->
+          case :ets.lookup(table, {id, key}) do
+            [{_key, fun}] -> [{key, fun}]
+            [] -> []
+          end
+
+        pair ->
+          [pair]
+      end)
+
+    %{sandbox | context: Map.new(restored)}
+  end
+
+  defp restore_sandbox(other, _table), do: other
 
   defp export_sandbox(%Sandbox{context: context, id: id} = sandbox, table)
        when is_map(context) and is_binary(id) do
