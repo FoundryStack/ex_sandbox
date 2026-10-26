@@ -386,6 +386,14 @@ defmodule ExSandbox.Hardening.Linux do
   end
 
   @doc """
+  `systemctl` arguments that address the manager the launcher's scopes live
+  in: `--user` when scopes are user units, so a query or `reset-failed` reaches
+  the same unit `systemd-run` created.
+  """
+  @spec systemctl_args([String.t()]) :: [String.t()]
+  def systemctl_args(args), do: scope_kind_args() ++ args
+
+  @doc """
   The systemd scope unit a sandbox runs in.
 
   Public because `provision_failure_reason/1` must name the same unit to read

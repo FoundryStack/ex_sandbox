@@ -727,13 +727,22 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # either abort a launch would break hosts that this never concerned.
   defp clear_stale_scope(sandbox) do
     if function_exported?(hardening(), :scope_unit_name, 1) do
-      unit = hardening().scope_unit_name(sandbox)
-      _ = System.cmd("systemctl", ["reset-failed", unit], stderr_to_stdout: true)
+      _ = System.cmd("systemctl", reset_failed_args(sandbox), stderr_to_stdout: true)
     end
 
     :ok
   rescue
     _ -> :ok
+  end
+
+  @doc false
+  @spec reset_failed_args(ExSandbox.Sandbox.t()) :: [String.t()]
+  def reset_failed_args(sandbox) do
+    args = ["reset-failed", hardening().scope_unit_name(sandbox)]
+
+    if function_exported?(hardening(), :systemctl_args, 1),
+      do: hardening().systemctl_args(args),
+      else: args
   end
 
   defp require_hardening do

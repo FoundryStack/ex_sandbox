@@ -400,29 +400,17 @@ defmodule ExSandbox.Mechanism.Beam do
     _ -> :unknown
   end
 
-  # ⚠️ A **system** query, matching the scope the launcher actually creates.
-  #
-  # `systemd_run_args/2` passes no `--user`, so the scope is a system unit. This
-  # read was `--user` and therefore asked the wrong manager: it returned
-  # `LoadState=not-found` with `Result=success` for every sandbox, live or dead.
-  #
-  # That pairing is the whole reason `scope_result/1` guards on `LoadState`. A
-  # missing unit reports `Result=success` -- indistinguishable from a clean exit
-  # -- so without the guard this mismatch would have silently reported "no cap
-  # breach" for every OOM kill, and the memory cap would have looked enforced on
-  # a host where nothing was ever attributed. Measured against a live breach:
-  #
-  #     systemctl --user show sandbox-<id>.scope   =>  LoadState=not-found
-  #                                                    Result=success
-  #     systemctl        show sandbox-<id>.scope   =>  LoadState=loaded
-  #                                                    Result=oom-kill
-  #                                                    ActiveState=failed
-  #
-  # If the launcher ever moves to `--user`, this must move with it; the guard
-  # will turn the disagreement into `:mechanism_error` rather than a false pass,
-  # but a cap that cannot be attributed is still a cap that is not demonstrated.
-  defp systemctl_scope_args(unit),
-    do: ["show", unit, "-p", "LoadState", "-p", "Result"]
+  # ⚠️ The query must reach the manager the launcher's scope lives in. Asking
+  # the wrong one returns `LoadState=not-found` with `Result=success`, which the
+  # `LoadState` guard turns into `:unknown` instead of a false "no cap breach".
+  defp systemctl_scope_args(unit) do
+    args = ["show", unit, "-p", "LoadState", "-p", "Result"]
+    hardening = Application.get_env(:ex_sandbox, :hardening_module, ExSandbox.Hardening.Linux)
+
+    if function_exported?(hardening, :systemctl_args, 1),
+      do: hardening.systemctl_args(args),
+      else: args
+  end
 
   defp parse_properties(output) do
     output

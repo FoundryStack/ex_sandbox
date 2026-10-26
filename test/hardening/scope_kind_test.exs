@@ -93,4 +93,20 @@ defmodule ExSandbox.Hardening.ScopeKindTest do
     seed(nil)
     assert ["--scope", "--quiet" | _] = args()
   end
+
+  test "a stale failed user scope is reset in the user manager, so its name can be reused" do
+    seed(:user)
+    sb = sandbox()
+
+    assert ExSandbox.Mechanism.Beam.NodeLauncher.reset_failed_args(sb) ==
+             ["--user", "reset-failed", Linux.scope_unit_name(sb)]
+  end
+
+  test "a stale failed system scope is reset in the system manager" do
+    seed(:system)
+    sb = sandbox()
+
+    assert ExSandbox.Mechanism.Beam.NodeLauncher.reset_failed_args(sb) ==
+             ["reset-failed", Linux.scope_unit_name(sb)]
+  end
 end
