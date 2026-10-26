@@ -312,7 +312,7 @@ defmodule ExSandbox.Hardening.Linux do
         # the host's IO.
         "-p",
         "MemorySwapMax=#{swap_max()}"
-      ] ++ memory_high_args(limits) ++ memory_low_args(sandbox)
+      ] ++ memory_high_args(limits, sandbox) ++ memory_low_args(sandbox)
   end
 
   defp swap_max do
@@ -329,7 +329,11 @@ defmodule ExSandbox.Hardening.Linux do
     end
   end
 
-  defp memory_high_args(limits) do
+  defp memory_high_args(limits, %{context: %{memory_high_mb: mb}})
+       when is_integer(mb) and mb > 0,
+       do: ["-p", "MemoryHigh=#{min(mb, limits.memory_mb)}M"]
+
+  defp memory_high_args(limits, _sandbox) do
     case beam_config(:memory_high_ratio) do
       nil ->
         []

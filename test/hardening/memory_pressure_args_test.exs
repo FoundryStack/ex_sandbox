@@ -1,7 +1,7 @@
 defmodule ExSandbox.Hardening.MemoryPressureArgsTest do
   @moduledoc """
   `config :ex_sandbox, :beam` `memory_high_ratio:` and `swap_max_mb:`, and the
-  sandbox context's `memory_low_mb:`, set a scope's soft limit, bounded swap and
+  sandbox context's `memory_low_mb:` and `memory_high_mb:`, set a scope's soft limit, bounded swap and
   floor; unset, the argv is unchanged.
   """
   use ExUnit.Case, async: false
@@ -62,6 +62,15 @@ defmodule ExSandbox.Hardening.MemoryPressureArgsTest do
   test "a context floor sets MemoryLow", %{original: original} do
     put(original, [])
     assert "MemoryLow=256M" in properties(%{memory_low_mb: 256})
+  end
+
+  test "a context soft limit replaces the ratio, never above the cap", %{original: original} do
+    put(original, memory_high_ratio: 0.85)
+    props = properties(%{memory_high_mb: 400})
+    assert "MemoryHigh=400M" in props
+    refute "MemoryHigh=1305M" in props
+
+    assert "MemoryHigh=1536M" in properties(%{memory_high_mb: 4096})
   end
 
   test "values outside their range raise", %{original: original} do

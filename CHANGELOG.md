@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.10.0 — 2026-10-27
+
+### Added: a sandbox VM sized to its CPU limit
+
+`config :ex_sandbox, :beam, size_vm_to_cpu: true` boots each Beam sandbox with as many
+schedulers and dirty CPU schedulers as its CPU limit has whole cores, rounded up, and with
+scheduler busy-waiting off (`+sbwt none`, `+sbwtdcpu none`, `+sbwtdio none`). Without it a VM
+starts one scheduler per host CPU and its idle schedulers spin. Unset, the argv is unchanged.
+`NodeLauncher.vm_flags/1` answers the flags.
+
+### Added: a per-sandbox soft memory limit
+
+`memory_high_mb` in a sandbox's `context` sets its scope's `MemoryHigh`, never above its
+`MemoryMax`, in place of `memory_high_ratio`. A host that knows a sandbox's usage can put
+reclaim where that sandbox actually runs rather than at one ratio of every cap.
+
 ## 1.9.0 — 2026-10-26
 
 ### Added: launching a Beam sandbox through a gateway's restricted launcher

@@ -778,7 +778,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       # before `erlexec` and clears the environment (verified at `peer.erl:1151`).
       # Charlists again, per `verify_args/1`.
       exec: to_exec(exec),
-      args: args(cookie),
+      args: args(cookie, sandbox),
       # ⚠️ `env: []` does NOT clear the environment (R3, verified in `peer.erl`).
       # `:peer`'s `env` is *additive* — it adds to what the origin already has.
       # The empty list is documentation that this channel grants nothing, and a
@@ -878,11 +878,32 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # Charlists, not binaries: `peer.erl:858` rejects anything failing
   # `io_lib:char_list/1`, so an Elixir string here raises `{:invalid_arg, ...}`
   # at launch rather than at compile time.
-  defp args(cookie) do
+  defp args(cookie, sandbox) do
     ["-setcookie", Atom.to_string(cookie), "-hidden", "-connect_all", "false"]
+    |> Kernel.++(vm_flags(sandbox))
     |> Kernel.++(elixir_code_path())
     |> Enum.map(&String.to_charlist/1)
   end
+
+  @doc """
+  The emulator flags `config :ex_sandbox, :beam, size_vm_to_cpu: true` adds:
+  as many schedulers and dirty CPU schedulers as the sandbox's CPU limit has
+  whole cores, rounded up, and no scheduler busy-waiting. Unset, or with no
+  CPU limit, none.
+  """
+  @spec vm_flags(Sandbox.t()) :: [String.t()]
+  def vm_flags(%Sandbox{cpu_limit: millicores}) when is_integer(millicores) and millicores > 0 do
+    if Keyword.get(beam_config(), :size_vm_to_cpu, false) do
+      cores = max(div(millicores + 999, 1000), 1)
+
+      ["+S", "#{cores}:#{cores}", "+SDcpu", "#{cores}:#{cores}"] ++
+        ["+sbwt", "none", "+sbwtdcpu", "none", "+sbwtdio", "none"]
+    else
+      []
+    end
+  end
+
+  def vm_flags(_sandbox), do: []
 
   # ⚠️ Elixir's stdlib, made loadable inside the sandbox (R7d).
   #
