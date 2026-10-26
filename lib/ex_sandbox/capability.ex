@@ -564,59 +564,17 @@ defmodule ExSandbox.Capability do
       # available on the strength of `--unshare-net` describes a boundary this
       # library will not build.
       #
-      # ⚠️ It also *disagreed with the other probe for the same capability*.
-      # `Hardening.Linux.probe_network_policy/0` has required pasta and the tap
-      # device since T060a; this one did not. Because
-      # `Conformance.Helpers.host_capability/1` consults **this** probe to
-      # explain a third outcome, a host with bwrap and no pasta launched nothing
-      # (hardening refused) while the census reported an undemonstrable check
-      # with no cause attached -- the cause being known to the other probe, in
-      # the same library, at the same moment.
-      not executable?("pasta") ->
-        unavailable(
-          :network_restriction,
-          "bubblewrap can unshare the network but `pasta` is not installed; " <>
-            "`--unshare-net` gives isolation (a namespace with no route out) " <>
-            "and not policy (a route leading somewhere the allowlist is " <>
-            "enforced), so egress could be denied entirely but never permitted " <>
-            "selectively (005 T060a)"
-        )
-
-      not File.exists?("/dev/net/tun") ->
-        unavailable(
-          :network_restriction,
-          "`pasta` is installed but `/dev/net/tun` is absent; pasta needs the " <>
-            "tap device to build the sandbox's route, and without it fails " <>
-            "with `Failed to open() /dev/net/tun` at launch rather than here"
-        )
-
-      # ⚠️ The third condition, and the one that keeps this probe in step with
-      # `Hardening.Linux.probe_network_policy/0`. The comment above warns about
-      # exactly this class of disagreement -- and it recurred: once that probe
-      # started testing whether a policed launch can be *composed*, this one
-      # still reported `available` on the strength of pasta being installed.
-      #
-      # The consequence was not a wrong answer in isolation; it was 30 failed
-      # conformance checks. `ExSandbox.provision/2` consults **this** probe,
-      # found the capability available, and proceeded -- then `require_hardening/0`
-      # consulted the *other* probe, found it missing, and refused with a bare
-      # `:mechanism_error`. Every group scored that as a `guarantee_failure`,
-      # so "this host cannot police egress" was reported as "halting the host
-      # from inside the sandbox was not refused".
-      #
-      # Measured: `pasta` and `bwrap` do not compose. `pasta` starts its child
-      # with `CapEff=0` in a user namespace whose mappings it could not write,
-      # and `bwrap` then cannot create the mount namespace that is its entire
-      # purpose. See `egress-path-measurements.md`.
+      # ⚠️ This probe must agree with `Hardening.Linux.probe_network_policy/0`.
+      # `ExSandbox.provision/2` consults **this** probe and `require_hardening/0`
+      # the other; when they disagreed, 30 conformance checks scored "this host
+      # cannot police egress" as a `guarantee_failure`.
       not policed_launch_composable?() ->
         unavailable(
           :network_restriction,
-          "`pasta` and `/dev/net/tun` are both present but a policed launch " <>
-            "cannot be composed: `pasta` starts its child with no capabilities " <>
-            "in a user namespace it could not map, and `bwrap` then fails with " <>
-            "`No permissions to create new namespace`. Egress could be denied " <>
-            "entirely but never permitted selectively, and the tenant could not " <>
-            "be confined either (005 T060a, egress-path-measurements.md)"
+          "a policed launch cannot be composed: either `bwrap` cannot confine " <>
+            "a tenant in a fresh network namespace, or that namespace cannot be " <>
+            "entered to install its redirect. Egress could be denied entirely " <>
+            "but never permitted selectively (005 T060a)"
         )
 
       true ->
@@ -1114,8 +1072,6 @@ defmodule ExSandbox.Capability do
   # like the honest third outcome) and would have made the capability appear
   # permanently absent on the very host that could run it.
   #
-  # The same trap, one layer down, is why `ExSandbox.Egress.Pasta` polls for
-  # pasta's tenant instead of checking once.
   defp await_foreign_netns(_pid, 0), do: false
 
   defp await_foreign_netns(pid, attempts) do
@@ -1136,46 +1092,23 @@ defmodule ExSandbox.Capability do
     end
   end
 
-  # ⚠️ `-U` is load-bearing: `-n` alone is REFUSED.
+  # ⚠️ `-n` alone, never `-U` (D6 of `let-sandboxes-outlive-a-deploy`). The
+  # holder's user namespace is bwrap's, created after `setpriv`, and maps only
+  # the sandbox uid. Measured against such a holder from a root caller:
   #
-  # ⚠️ `--preserve-credentials` was REMOVED here in lockstep with
-  # `Egress.Netns.nsenter/2`, and the two MUST stay in lockstep -- a probe that
-  # answers about a different command than the mechanism runs reports the wrong
-  # capability while looking entirely correct, which is the `005` R9b shape and
-  # what `capability_test.exs` asserts against.
+  #     nsenter -t <holder> -n nft add table ip nat                         -> OK
+  #     nsenter -t <holder> -n -U nft ...       -> setgid() failed: Invalid argument
+  #     nsenter -t <holder> -n -U --preserve-credentials [--keep-caps] nft ... -> EPERM
   #
-  # Why it changed: under the split launch ordering (T060a4e) `pasta` runs after
-  # `setpriv`, so the namespace it creates is owned by the **sandbox uid** rather
-  # than root. Preserving our own credentials into that namespace leaves us with
-  # no capabilities there (`nft` -> `Operation not permitted`); omitting the flag
-  # remaps us to root inside the target userns, which is where the
-  # `CAP_NET_ADMIN` must come from. Measured; see
-  # `egress-path-measurements.md`.
+  # Entering takes `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over the netns, which
+  # the caller holds from the initial user namespace, as `Egress.NetnsSocket`'s
+  # `setns` does.
   #
-  # `setns()` into a netns requires `CAP_SYS_ADMIN` in the user namespace that
-  # **owns** it. The platform holds that capability inside the userns it created,
-  # but a process that has not joined that userns holds nothing there -- so
-  # entering the netns without also entering its owning userns fails, even
-  # though the very same process created both. Measured, same host, same pid:
-  #
-  #     nsenter -t <pid> -n ip link                          -> EPERM
-  #     nsenter -t <pid> -n -U --preserve-credentials ip link -> OK
-  #
-  # ⚠️ This is the constraint that makes the whole design work rather than a
-  # detail: the BEAM runs **outside** the sandbox userns, so every namespace
-  # operation the platform performs -- attaching `pasta`, installing the `nft`
-  # redirect -- must join the userns as well. An earlier shell probe appeared to
-  # prove entry worked while running its `nsenter` *inside* the userns, which is
-  # not the position the platform is actually in.
-  #
-  # `--preserve-credentials` keeps the caller's uid rather than remapping to
-  # root, which is what `util-linux` requires when joining a userns this process
-  # is not already privileged in. RootlessKit passes the same pair for the same
-  # reason.
+  # The probe runs the form `Egress.Netns.nsenter/2` runs.
   defp nsenter_succeeds?(pid) do
     case System.cmd(
            "nsenter",
-           ["-t", "#{pid}", "-n", "-U", "ip", "link"],
+           ["-t", "#{pid}", "-n", "ip", "link"],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true

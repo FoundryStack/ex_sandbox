@@ -102,10 +102,10 @@ defmodule ExSandbox.Egress.Relay do
   # ⚠️ **`SO_MARK`, and without it the permitted half of the allowlist cannot
   # work at all.**
   #
-  # This connect happens *inside the sandbox's own network namespace*, which is
-  # the namespace whose `nat output` hook redirects **all** outbound TCP to this
-  # very acceptor. So the relay's upstream connect is caught by the redirect it
-  # exists to serve, and the acceptor talks to itself.
+  # A connect made *inside the sandbox's own network namespace* (the inbound
+  # forward's leg to the tenant's port) passes the `nat output` hook that
+  # redirects **all** outbound TCP to the acceptor; unmarked, it is caught by
+  # that redirect and the acceptor talks to itself.
   #
   # `Netns.redirect_commands/2` already installs the exemption --
   # `meta mark 42 return`, placed first so it is evaluated before the redirect --
@@ -173,13 +173,9 @@ defmodule ExSandbox.Egress.Relay do
     end
   end
 
-  # ⚠️ `nil` is not a fallback for a namespace that could not be entered -- it
-  # is "there is no namespace", which is only true on a host with no sandbox
-  # netns at all. No redirect exists there, so there is nothing for a mark to
-  # escape and setting one would be cargo. The production caller always supplies
-  # a namespace; a caller that could silently pass `nil` instead would turn a
-  # missing namespace into a host-namespace connection, which is the
-  # enforcement-point-that-enforces-nothing shape this subsystem keeps finding.
+  # `nil` dials from the gateway's own namespace: a permitted egress
+  # destination (D6 of `let-sandboxes-outlive-a-deploy`). The sandbox's
+  # namespace holds only loopback, so nothing reaches out from inside it.
   defp upstream_connect(address, port, nil, timeout) do
     :gen_tcp.connect(address, port, [:binary, {:active, false}], timeout)
   end

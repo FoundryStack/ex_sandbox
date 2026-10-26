@@ -108,11 +108,14 @@ defmodule ExSandbox.Egress.Decision do
         # tenant's verdict, which is the cross-tenant shape
         # `ExSandbox.Egress.Registry`'s moduledoc already guards in the
         # allowlist itself.
-        if Policy.permits?(allowed, destination, Registry.resolutions(key, registry)) do
-          :permitted
-        else
-          {:refused, :not_permitted}
+        cond do
+          smtp_relay?(destination) -> {:refused, :not_permitted}
+          Policy.permits?(allowed, destination, Registry.resolutions(key, registry)) -> :permitted
+          true -> {:refused, :not_permitted}
         end
     end
   end
+
+  defp smtp_relay?({_host, 25}), do: true
+  defp smtp_relay?(_destination), do: false
 end

@@ -271,31 +271,17 @@ defmodule ExSandbox.Egress.ProbeComposabilityTest do
       end
     end
 
-    test "entering the netns also joins the userns that owns it", %{sources: sources} do
+    test "entering the netns does not join bwrap's user namespace", %{sources: sources} do
       for source <- sources do
         [_, nsenter] = String.split(source, "defp nsenter_succeeds?(pid) do", parts: 2)
         body = nsenter |> String.split("\n  end", parts: 2) |> hd()
 
-        # Measured, same host, same pid:
-        #   nsenter -t <pid> -n ip link                          -> EPERM
-        #   nsenter -t <pid> -n -U ...                          -> OK
-        #
-        # The BEAM runs OUTSIDE the sandbox userns, so it holds nothing there
-        # until it joins. Dropping `-U` does not weaken the probe subtly -- it
-        # makes it answer `false` everywhere.
-        assert body =~ "\"-U\"",
-               "the BEAM is outside the sandbox userns; entering the netns " <>
-                 "without joining its owning userns is refused"
+        # The mechanism's holder lives in bwrap's user namespace, which maps
+        # only the sandbox uid: `-U` there fails with `setgid() failed`.
+        refute body =~ "\"-U\"",
+               "the probe must run the form Egress.Netns.nsenter/2 runs (-n alone)"
 
-        # ⚠️ The flag must be ABSENT, and asserting its absence is the point.
-        # Under the split launch ordering (T060a4e) `pasta` runs after `setpriv`,
-        # so the namespace it creates is owned by the sandbox uid; preserving our
-        # own credentials into it leaves us with no capabilities there and `nft`
-        # fails with `Operation not permitted`. Re-adding the flag would restore
-        # a command that reads correctly and cannot install the redirect.
-        refute body =~ "--preserve-credentials",
-               "credentials must be remapped to the target userns's root, not " <>
-                 "preserved -- the holder is owned by the sandbox uid now"
+        assert body =~ "\"-n\""
       end
     end
   end

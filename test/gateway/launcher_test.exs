@@ -163,7 +163,7 @@ defmodule ExSandbox.Gateway.LauncherTest do
     bin = Path.join(tmp_dir, "bin")
     File.mkdir_p!(bin)
 
-    for {tool, status} <- [bwrap: bwrap_status, setpriv: 0, pasta: 0] do
+    for {tool, status} <- [bwrap: bwrap_status, setpriv: 0, nft: 0] do
       path = Path.join(bin, to_string(tool))
       File.write!(path, "#!/bin/sh\nexit #{status}\n")
       File.chmod!(path, 0o755)

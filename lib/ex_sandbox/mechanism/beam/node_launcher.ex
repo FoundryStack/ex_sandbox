@@ -58,7 +58,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
           #
           # `nil` on a host with no egress path, as with `binding`.
           acceptor_pid: pid() | nil,
-          # `{host_port, ns_port}` pairs published on host loopback by `pasta`,
+          # `{host_port, ns_port}` pairs published on host loopback by the acceptor,
           # the `service_port` pair first, read by `Beam.address/1,2`. `nil`
           # when the sandbox names no service port or the launch took no egress
           # path. ⚠️ A row persisted by an older version carries one bare pair
@@ -92,7 +92,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          {:ok, launched} <- start_peer_releasing(sandbox, exec, binding),
          # ⚠️ Between `start_peer_releasing/3` and here the tenant is running
          # and unpoliced. The window cannot be closed by reordering -- the
-         # namespace does not exist until `pasta` starts the tenant in it -- so
+         # namespace does not exist until the tenant starts in it -- so
          # it is closed by failing toward termination instead. See `police/2`.
          {:ok, acceptor_pid} <- police_or_terminate(plan, launched, binding, sandbox),
          :ok <- verify_or_terminate(launched, sandbox) do
@@ -134,15 +134,15 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   end
 
   @doc """
-  Whether a launch goes through `pasta`, and with which allowlist.
+  Whether a launch is policed, and with which allowlist.
 
   `{:police, allowed}` when the sandbox has an allowlist, **or** when it names a
   service port and its command confines the network. `:passthrough` otherwise.
 
-  ⚠️ **A service port is a reason to start `pasta` on its own.** The forward that
-  publishes the port on host loopback is a `pasta` flag, so a sandbox that
-  skipped `pasta` because its allowlist was `[]` got no forward and
-  `Beam.address/1` answered nil for it: a sandbox that serves nothing anyone can
+  ⚠️ **A service port is a reason to police on its own.** The acceptor is what
+  publishes the port on host loopback, so a sandbox left unpoliced because its
+  allowlist was `[]` would get no forward and `Beam.address/1` would answer nil
+  for it: a sandbox that serves nothing anyone can
   reach. It is policed with the empty allowlist instead, which denies every
   destination through the acceptor -- the same reach `--unshare-net` alone gave
   it, now with the one inbound port it asked for.
@@ -182,11 +182,11 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # launch path cannot run.
   #
   # Each service port is published on a host loopback port picked here. The pick
-  # races: another process could take the port between this close and `pasta`'s bind.
+  # races: another process could take the port between this close and the acceptor's bind.
   #
   # ⚠️ Every listener is held open until all ports are picked. Closing each one
   # before opening the next lets the kernel hand the same ephemeral port back,
-  # and two pairs on one host port make `pasta` fail to bind the second.
+  # and two pairs on one host port make the acceptor fail to bind the second.
   def forward(%Sandbox{service_port: port, extra_service_ports: extra})
       when is_integer(port) and port > 0 do
     ns_ports = Enum.uniq([port | Enum.filter(extra, &(is_integer(&1) and &1 > 0))])
@@ -269,17 +269,9 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     end
   end
 
-  # ⚠️ `exec` is `{prog, args}` -- what `Hardening.Linux.compose/3` returns and
+  # `exec` is `{prog, args}` -- what `Hardening.Linux.compose/3` returns and
   # what `:peer` needs -- while `LaunchPlan.build/4` works on a flat command
-  # list, because the flag it removes and the prefix it adds can appear at any
-  # position. So the tuple is flattened on the way in and reassembled on the way
-  # out, with the plan's own head becoming the new program.
-  #
-  # The reassembly matters because the plan may change which binary runs first.
-  # Rebuilding the tuple from the plan's own head rather than keeping the
-  # original `prog` is what keeps that correct as the ordering changes: under
-  # the split ordering the head is `systemd-run` again, but it was `pasta` while
-  # pasta wrapped the whole command, and neither is hardcoded here.
+  # list; the plan's own head becomes the program again.
   defp build_plan(binding, {prog, args}, forward) do
     flat = [prog | args]
 
@@ -287,18 +279,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
            forward: forward
          ) do
       {:ok, plan} ->
-        # ⚠️ Nothing is *run* here any more, and that inversion is the whole of
-        # the T060a3 rework. The old code executed `setup_steps` at this point,
-        # creating and configuring a namespace before the tenant existed. That
-        # order is not reachable: `pasta` cannot attach to a namespace made by
-        # `ip netns add` (measured -- `Failed to join network namespace:
-        # Permission denied`), and a tenant inside `pasta`'s namespace has no
-        # `CAP_NET_ADMIN` to configure it from within.
-        #
-        # So the namespace is created *by starting the tenant in it*, and the
-        # policy is installed afterwards by `police/2`. See
-        # `egress-path-measurements.md` defects 3 and 4.
-        _ = clear_stale_pidfile(plan)
+        # Nothing is run here: the namespace is created by starting the tenant
+        # in it, and `police/2` installs the policy afterwards.
         {:ok, exec_from_plan(plan), plan}
 
       {:error, reason} ->
@@ -327,13 +309,12 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   Installs the redirect into a launched tenant's namespace.
 
   ⚠️ This runs **after** the tenant is already executing, and that is forced by
-  the mechanism rather than chosen: the namespace does not exist until `pasta`
-  creates it, and `pasta` creates it by starting the tenant inside it. There is
-  a real window in which the tenant runs unpoliced.
+  the mechanism rather than chosen: the namespace does not exist until `bwrap`
+  creates it by starting the tenant inside it. There is a window in which the
+  tenant runs, and in it the namespace holds only loopback, so nothing leaves.
 
-  The window fails *closed*. Until the redirect lands there is no NAT rule
-  sending the tenant's traffic anywhere, and the acceptor it would be sent to
-  is not listening -- so a connection attempted in the window reaches nothing.
+  The window fails *closed*. Until the route lands last there is no route out
+  of the namespace, so a connection attempted in the window reaches nothing.
   That is asserted rather than assumed: a failure here **terminates the
   tenant**, because the alternative is a running sandbox whose allowlist is not
   enforced, and which passes every denial check in the conformance suite.
@@ -341,17 +322,21 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   Public because it is the ordering rule that cannot be exercised off Linux --
   left private it would be verified only where the whole launch works, which is
   the arrangement that let the context-discard defect survive.
+
+  `holder_pid:` is a process inside the namespace (the confined BEAM); one in
+  this VM's own namespace is refused, because the redirect would land in the
+  host's namespace and succeed silently.
   """
   @spec police(ExSandbox.Egress.LaunchPlan.t(), keyword()) ::
           {:ok, integer() | nil} | {:error, atom()}
   def police(%ExSandbox.Egress.LaunchPlan{} = plan, opts \\ []) do
-    pasta_pid = Keyword.fetch!(opts, :pasta_pid)
-    finder = Keyword.get(opts, :finder, &ExSandbox.Egress.Pasta.find/2)
+    holder_pid = Keyword.fetch!(opts, :holder_pid)
+    finder = Keyword.get(opts, :finder, &confined_holder/2)
     runner = Keyword.get(opts, :runner, &run_steps/1)
 
     starter = Keyword.get(opts, :acceptor_starter, &start_acceptor/3)
 
-    case finder.(pasta_pid, opts) do
+    case finder.(holder_pid, opts) do
       {:ok, holder_pid} ->
         # ⚠️ The acceptor starts BEFORE the redirect, and the order is the whole
         # of it. A redirect installed first points at a port nothing is
@@ -368,21 +353,34 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         end
 
       {:error, reason} ->
-        # ⚠️ Refused, never defaulted to `pasta_pid`. That fallback is available,
-        # reads as robustness, and installs the sandbox's redirect into the HOST
-        # namespace -- succeeding, warning about nothing, and leaving the tenant
-        # unpoliced. See `ExSandbox.Egress.Pasta`.
         Logger.error("""
         egress: could not identify the sandbox's namespace holder (#{inspect(reason)}).
 
         The tenant is running but unpoliced and must not be left that way.
-        Falling back to pasta's own pid would install the redirect into the
-        host's network namespace, which succeeds silently.
+        Installing the redirect through a process in the host's namespace
+        would succeed silently and police nothing.
         """)
 
         {:error, :mechanism_error}
     end
   end
+
+  @doc false
+  @spec confined_holder(term(), keyword()) :: {:ok, pos_integer()} | {:error, atom()}
+  def confined_holder(pid, opts \\ [])
+
+  def confined_holder(pid, opts) when is_integer(pid) and pid > 0 do
+    proc = Keyword.get(opts, :proc_root, "/proc")
+
+    with {:ok, own} <- File.read_link(Path.join([proc, "self", "ns", "net"])),
+         {:ok, ns} <- File.read_link(Path.join([proc, "#{pid}", "ns", "net"])) do
+      if ns == own, do: {:error, :host_namespace}, else: {:ok, pid}
+    else
+      _ -> {:error, :unreadable_namespace}
+    end
+  end
+
+  def confined_holder(_pid, _opts), do: {:error, :no_holder}
 
   # ⚠️ A tenant that could not be policed is **terminated**, not left running.
   #
@@ -398,7 +396,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     # `owner_ref` and `sandbox_id` ride along so a refusal the acceptor emits
     # can be attributed without the host mapping a /30 back to a sandbox.
     case police(plan,
-           pasta_pid: pasta_pid(plan),
+           holder_pid: launched.os_pid,
            owner_ref: sandbox.owner_ref,
            sandbox_id: sandbox.id
          ) do
@@ -421,46 +419,6 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
         _ = terminate(launched.peer)
         if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
         {:error, reason}
-    end
-  end
-
-  # Removes a previous sandbox's pidfile before `pasta` tries to write one.
-  #
-  # ⚠️ **Not tidiness -- without it a recycled /30 cannot launch at all.** The
-  # pidfile is named from the source key, which the allocator *recycles*, while
-  # `sandbox_uid/1` hashes the sandbox **id**, which does not. So the second
-  # sandbox to hold a given /30 usually runs as a different uid, and `/tmp` is
-  # sticky: it cannot replace a file owned by someone else. Measured in the
-  # isolation phase, after the credentials phase had already used 10.0.0.0:
-  #
-  #     Couldn't open PID file /tmp/axonn-pasta-10-0-0-0.pid: Permission denied
-  #     [error] sandbox node failed to boot: {:boot_failed, {:exit_status, 1}}
-  #
-  # ⚠️ The removal is done by the **platform**, which is root, precisely because
-  # the launching uid cannot do it. And it must happen before every launch
-  # rather than only on destroy: a crashed run leaves the file behind, and the
-  # next sandbox on that /30 would inherit the failure with no way to clear it.
-  defp clear_stale_pidfile(%ExSandbox.Egress.LaunchPlan{pidfile: pidfile}) do
-    case File.rm(pidfile) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> Logger.warning("egress: stale pidfile #{pidfile}: #{inspect(reason)}")
-    end
-  end
-
-  # `pasta` writes its host-side pid here. ⚠️ That pid is NOT the namespace
-  # holder -- `police/2` searches its children for the one whose network
-  # namespace differs from ours. See `ExSandbox.Egress.Pasta`.
-  defp pasta_pid(%ExSandbox.Egress.LaunchPlan{pidfile: pidfile}) do
-    case File.read(pidfile) do
-      {:ok, contents} ->
-        case Integer.parse(String.trim(contents)) do
-          {pid, _} -> pid
-          :error -> 0
-        end
-
-      {:error, _} ->
-        0
     end
   end
 
@@ -508,6 +466,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
       # the resolver cannot end up bound somewhere the rule does not point.
       # Reading the config key a second time here is exactly that drift.
       resolver: plan.resolver,
+      forward: plan.forward,
       registry: Keyword.get(opts, :registry, ExSandbox.Egress.Registry),
       owner_ref: Keyword.get(opts, :owner_ref),
       sandbox_id: Keyword.get(opts, :sandbox_id)
@@ -629,24 +588,10 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   def egress_allowlist(_sandbox), do: []
 
   @doc """
-  Rebuilds `{prog, args}` from a plan's `pasta_command`.
-
-  ⚠️ Always the plan's own head, never the original program. Keeping the
-  original while taking the plan's arguments produces a command that reads
-  correctly in a log line and execs the wrong binary -- and because the
-  arguments still *contain* every hardening flag, a test that greps the joined
-  string for `--unshare-net` or the scope name would pass.
-
-  ⚠️ Which binary that head names **changed** with the split ordering, and the
-  change is invisible here on purpose. `pasta` used to wrap the whole command,
-  so the head was `pasta`; it is now inserted after `setpriv`, so the head is
-  `systemd-run` once more. Reading the head off the plan rather than deciding
-  it here is what let that move without this function knowing -- and a version
-  that hardcoded either name would have been correct when written and silently
-  wrong afterwards.
+  Rebuilds `{prog, args}` from a plan's `tenant_command`, head first.
   """
   @spec exec_from_plan(ExSandbox.Egress.LaunchPlan.t()) :: {String.t(), [String.t()]}
-  def exec_from_plan(%ExSandbox.Egress.LaunchPlan{pasta_command: [prog | args]}) do
+  def exec_from_plan(%ExSandbox.Egress.LaunchPlan{tenant_command: [prog | args]}) do
     {prog, args}
   end
 

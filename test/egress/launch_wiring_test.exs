@@ -49,23 +49,12 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
     "erlexec"
   ]
 
-  describe "the plan replaces network isolation rather than adding to it" do
-    test "a confined command is rewritten to join the policed namespace" do
+  describe "the plan keeps network isolation and polices it" do
+    test "a confined command runs unchanged in its loopback-only namespace" do
       {:ok, plan} = LaunchPlan.build({10, 0, 0, 0}, 9999, @confined)
 
-      refute "--unshare-net" in plan.tenant_command,
-             "the tenant would unshare a fresh empty namespace while the policy sat on the configured one"
-
-      # The tenant runs *under* pasta rather than joining a pre-built namespace.
-      # ⚠️ pasta is mid-chain, not at the head: it is inserted after `setpriv`
-      # so the drop happens in the host's fully mapped namespace rather than
-      # inside pasta's empty one (T060a4e, measured).
-      pasta = Enum.find(plan.pasta_command, &(Path.basename(&1) == "pasta"))
-      assert pasta, "the tenant must run under pasta"
-      assert String.starts_with?(pasta, "/"), "must be a path that can be exec'd"
-
-      tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
-      assert List.last(tenant) == List.last(plan.tenant_command)
+      assert plan.tenant_command == @confined
+      assert "--unshare-net" in plan.tenant_command
     end
 
     test "an unconfined command is refused rather than policed" do
@@ -106,13 +95,9 @@ defmodule ExSandbox.Egress.LaunchWiringTest do
       {:ok, plan} = LaunchPlan.build(source_key, 9999, @confined)
 
       assert plan.source_key == source_key
-      assert plan.pidfile == LaunchPlan.default_pidfile(source_key)
 
-      # ⚠️ The address is no longer configured by us -- `pasta --config-net`
-      # assigns it, copying the host's default-route interface. What must still
-      # hold is that the acceptor decides using the key this plan was built for.
-      # `Acceptor.verdict/3` reconstructs the sandbox address from the key, so
-      # the two cannot drift apart the way a separately-configured address could.
+      # `route_commands/2` puts this address on the namespace's `lo`, and
+      # `Acceptor.verdict/3` reconstructs it from the same key.
       %{sandbox: sandbox} = ExSandbox.Egress.Netns.addresses(source_key)
       {:ok, parsed} = :inet.parse_address(String.to_charlist(sandbox))
 

@@ -3,44 +3,30 @@ defmodule ExSandbox.Egress.Netns do
   The commands that turn a sandbox's network namespace into its only path out
   (005 T060a3, `contracts/egress.md`).
 
-  ## The shape, and why it is inverted from the obvious one
+  ## The shape (D6 of `let-sandboxes-outlive-a-deploy`)
 
-  The obvious design — create a named namespace, configure it, attach `pasta`,
-  then have the tenant join it — **is not reachable**. Measured, in
-  `egress-path-measurements.md`: `pasta` cannot join a namespace made by
-  `ip netns add` here, failing with `Failed to join network namespace:
-  Permission denied`. It works only when it *spawns* the namespace itself.
+  1. `bwrap --unshare-net` starts the tenant in a namespace holding only
+     loopback,
+  2. the **host** installs the redirect into it with
+     `nsenter -t <holder-pid> -n nft …` (`redirect_commands/4`),
+  3. then gives it a source address and a default route over `lo`
+     (`route_commands/2`), last, so no connect leaves loopback unpoliced.
 
-  So the order inverts:
+  The redirect sends every outbound TCP connect to the acceptor's listener
+  inside the namespace; the acceptor reads `SO_ORIGINAL_DST`, judges it, and
+  dials a permitted destination from the host. Nothing else carries traffic
+  out: there is no interface but `lo`.
 
-  1. `pasta --config-net --runas 0 -P <pidfile> -- <tenant>` creates the
-     namespace, configures its interface and default route, and starts the
-     tenant inside it,
-  2. the **host** then installs the redirect into that namespace with
-     `nsenter -t <holder-pid> -n nft …`.
+  ⚠️ Steps 2 and 3 cannot be done from inside. The tenant has no
+  `CAP_NET_ADMIN` there, which is desirable — a tenant able to edit the ruleset
+  would defeat `FR-011b` by reconfiguration rather than by connection.
 
-  ⚠️ Step 2 cannot be done from inside. `pasta`'s namespace is unprivileged, so
-  the tenant has no `CAP_NET_ADMIN` and `nft` there fails with `Operation not
-  permitted`. That is *desirable* — a tenant able to edit the ruleset would
-  defeat `FR-011b` by reconfiguration rather than by connection — but it means
-  the policy is installed from outside, by us, after the tenant is running.
-
-  ## What `pasta` configures, and what this module therefore does not
-
-  `pasta --config-net` brings up the interface, assigns the address, and
-  installs the default route. An earlier version of this module emitted
-  `ip addr add`, `ip link set`, and `ip route add` steps of its own; all three
-  failed with `Cannot find device "sb0"`, because nothing had created the
-  device and `pasta` had not yet run. They were not merely redundant — they ran
-  *before* the thing that makes them possible.
-
-  ⚠️ **The default route is still load-bearing, it is simply not ours to
-  install.** Without it the kernel rejects an outbound connect with
-  `enetunreach` *before* the nat hook runs, and the sandbox is merely
-  *isolated* — the state `--unshare-net` already gave, which passes every
-  denial check while enforcing no policy at all. `pasta` provides it; this
-  module's job is to not get in the way, and `verify_route/1` exists so its
-  absence is caught rather than assumed.
+  ⚠️ **The default route is load-bearing.** Without it the kernel rejects an
+  outbound connect with `enetunreach` *before* the nat hook runs, and the
+  sandbox is merely *isolated*, which passes every denial check while
+  enforcing no policy at all. A bare `default dev lo` gives the tenant source
+  `0.0.0.0`; the `/32` on `lo` and `src` give it the address its policy is
+  filed under.
 
   ## Why the redirect is `output` rather than `prerouting`
 
@@ -133,9 +119,8 @@ defmodule ExSandbox.Egress.Netns do
 
   ⚠️ Retained because `Policy.source_key/1` masks the address the pool sees
   back to the key its allowlist is filed under — the join between a namespace
-  and its policy. `pasta` assigns the namespace's address from the host
-  interface it copies, so this is the *addressing scheme*, not a claim about
-  what `pasta` will hand out.
+  and its policy. `route_commands/2` puts the sandbox address on the
+  namespace's `lo` as the tenant's source.
   """
   @spec addresses(Policy.source_key()) :: %{gateway: String.t(), sandbox: String.t()}
   def addresses({a, b, c, d}) do
@@ -156,26 +141,14 @@ defmodule ExSandbox.Egress.Netns do
 
   `holder_pid` is the pid of the process **inside** the namespace.
 
-  ⚠️ It is not `pasta`'s own pid, and the difference is a silent catastrophe
-  rather than an error. `pasta -P` writes its **host-side** pid; the tenant
-  runs in a child. Measured:
-
-      pidfile pid = 10 -> ns net:[4026534462]   <- the HOST namespace
-      tenant  pid = 11 -> ns net:[4026534599]   <- the sandbox namespace
-
-  `nsenter -t 10 -n nft …` installs the sandbox's redirect **into the host
-  namespace**: it succeeds, warns about nothing, and leaves the tenant
-  unpoliced while the host acquires a stray NAT rule. `ExSandbox.Egress.Pasta`
-  finds the holder by comparing namespace inodes for exactly this reason.
+  ⚠️ A pid in the **host** namespace is a silent catastrophe rather than an
+  error: `nsenter -t <host pid> -n nft …` installs the sandbox's redirect into
+  the host namespace, succeeds, and leaves the tenant unpoliced.
+  `NodeLauncher.police/2` refuses a holder whose namespace is its own.
   """
   # Marks the acceptor's own upstream sockets so the redirect can skip them.
   # Any non-zero value works; this one is arbitrary and stable.
   @acceptor_mark 42
-
-  # Where `pasta` lives on the target base image (verified at `/usr/bin/pasta`).
-  # Used only when `PATH` lookup fails, so a misconfigured host fails naming a
-  # path it looked for. See `pasta_path/0`.
-  @pasta_fallback "/usr/bin/pasta"
 
   @typedoc """
   The one UDP destination a sandbox may reach, or `nil` for none.
@@ -251,9 +224,8 @@ defmodule ExSandbox.Egress.Netns do
         "#{@acceptor_mark}",
         "return"
       ]),
-      # Namespace loopback stays in the namespace: pasta runs with `-T none`
-      # and `--no-map-gw`, so `127.0.0.0/8` here reaches nothing but the
-      # sandbox. Redirecting it made the acceptor refuse the tenant's own
+      # Namespace loopback stays in the namespace, so `127.0.0.0/8` here
+      # reaches nothing but the sandbox. Redirecting it made the acceptor refuse the tenant's own
       # servers -- a test endpoint on `127.0.0.1:<ephemeral>` -- as egress.
       # OBSERVED 2026-09-25 on staging: refusals for 127.0.0.1:55205 and
       # 127.0.0.1:58963 from an application's own test run.
@@ -305,12 +277,10 @@ defmodule ExSandbox.Egress.Netns do
       ] ++ udp_commands(holder_pid, resolver)
   end
 
-  # pasta delivers a connection from host loopback by connecting to
-  # 127.0.0.1:<ns_port> from INSIDE the namespace, so the TCP redirect below
-  # catches it as egress and the acceptor refuses it. OBSERVED 2026-09-21 on
-  # production: `egress: refused (:not_permitted)` and the host connection
-  # closed. Only the forwarded ports are exempt, one rule each: the connection stays on the
-  # namespace's loopback, which reaches nothing outside the sandbox.
+  # The acceptor delivers an inbound connection by connecting to
+  # 127.0.0.1:<ns_port> from INSIDE the namespace; were the redirect to catch
+  # it, the acceptor would refuse it as egress (OBSERVED 2026-09-21 on
+  # production). Only the forwarded ports are exempt, one rule each.
   defp forward_exemption(holder_pid, forward) do
     for {_host_port, ns_port} <- forward_pairs(forward) do
       nsenter(holder_pid, [
@@ -408,7 +378,7 @@ defmodule ExSandbox.Egress.Netns do
 
   ⚠️ **Exists so the refusal lands at plan-build time rather than at
   rule-install time.** `resolver_exemption/2` also raises, but it runs *after*
-  `pasta` has started the tenant, so a bad address there terminates a running
+  the tenant has started, so a bad address there terminates a running
   sandbox instead of refusing a launch. Both raise; this one raises early, and
   the two share `parse_resolver_address/1` so they cannot disagree about what
   is readable.
@@ -555,207 +525,34 @@ defmodule ExSandbox.Egress.Netns do
   @spec acceptor_mark() :: pos_integer()
   def acceptor_mark, do: @acceptor_mark
 
-  # ⚠️ `route_command/1` and `default_route?/1` stood here until 2026-08-29, and
-  # what they were for is worth a line so the hazard is not read as deleted with
-  # them. They existed to verify `pasta` had installed a default route before
-  # the tenant mattered -- without one, every connect fails `enetunreach` before
-  # the nat hook runs, and the sandbox is isolated rather than policed, which
-  # passes every denial check.
-  #
-  # That hazard is real and is stated in this module's own moduledoc, where it
-  # belongs. The two functions were not: nothing ever called either of them, and
-  # a verification helper that no launch path invokes is not a check, it is a
-  # comment with a `@spec`. The three tests that kept `default_route?/1` alive
-  # asserted `String.contains?/2` against strings the tests themselves wrote.
-
   @doc """
-  The `pasta` invocation that creates a namespace and starts the tenant in it.
+  The commands that give the loopback-only namespace a source address and a
+  default route, so an outbound connect reaches the `nat` hook instead of
+  failing `enetunreach` (D6 of `let-sandboxes-outlive-a-deploy`).
 
-  ⚠️ `--runas 0` is required and is not a hardening choice. Without it `pasta`
-  drops to `nobody`, then cannot re-enter the namespace it just made:
-
-      Started as root, will change to nobody.
-      Failed to join network namespace: Permission denied
-
-  ⚠️ `--config-net` is what makes this work without a host capability. Its one
-  real prerequisite is the `/dev/net/tun` **device**, not a capability, which is
-  why `probe_network_policy/0` checks for the device and `compose.isolation.yml`
-  declares it.
-
-  ⚠️ There is deliberately no `--interface` flag. An earlier version passed
-  `--interface sb0`, believing it named the namespace-side device; `-i` selects
-  the **host** interface to copy addresses and routes *from*, and the
-  namespace-side name is `-I/--ns-ifname`. Measured:
-  `pasta --config-net --interface sb0 …` fails with `Invalid interface name
-  sb0: No such device`. Neither is needed — `pasta` picks the host's default
-  route interface, which is the one with a route out.
-
-  ## The four flags that close the host off (`029-FR-015`, `029-FR-018`)
-
-  `pasta`'s defaults are built for convenience — it *wants* the namespace to
-  reach the host and the host to reach the namespace. Every one of the flags
-  below turns a default off, and none of them is a hardening extra.
-
-  | flag | what the default does |
-  |---|---|
-  | `--no-map-gw` | maps the namespace's default gateway to the **host**, so the host is reachable at the gateway address |
-  | `-t none` | `-t auto` forwards **inbound TCP**: a tenant binding `0.0.0.0:8080` binds `0.0.0.0:8080` *on the host* (`FR-018`). With a `forward`, one `-t 127.0.0.1/<host>:<ns>` per pair instead: named ports, host loopback only |
-  | `-T none` | the same for TCP in the outbound-to-host direction |
-  | `-u none` | `-u auto` forwards inbound **UDP** |
-  | `-U none` | the same for UDP in the outbound-to-host direction |
-
-  ⚠️ **`--no-map-gw` alone closes half the doors and reads as complete.** The
-  namespace reaches host `127.0.0.1` by **two independent paths**, and that flag
-  closes one of them: the gateway-address mapping. The other is the port
-  forwarding that `-t/-T/-u/-U` default to `auto`. A build that passes
-  `--no-map-gw` and stops has a *narrower* hole rather than no hole, and it
-  presents identically to one that has none — `curl` to the gateway address
-  gets nothing, which is exactly what a correct configuration looks like.
-
-  ⚠️ **`-t none` deliberately disables inbound forwarding, and `forward`
-  narrows it rather than re-widening it.** Given `{host_port, ns_port}`, `-t
-  none` becomes `-t 127.0.0.1/<host_port>:<ns_port>`: named ports instead of
-  every port the tenant chooses to bind, bound on host loopback only. Measured
-  on the production host (2026-09-21): `ss -ltn` showed `127.0.0.1:<host_port>`
-  and nothing else, and a host `curl` reached the server in the namespace.
-  `-T`, `-u`, `-U` and `--no-map-gw` do not change, so the tenant still cannot
-  reach the host. `nil` is today's `-t none`, byte for byte.
-
-  ⚠️ **Several pairs are several `-t` flags, not one comma list.** `pasta(1)`
-  documents `-t` as repeatable, and a comma list shares one address prefix and
-  one host-to-namespace mapping across its ports, which cannot say "host 52111
-  to 4000 and host 52112 to 4001". Each pair is exempted from the egress
-  redirect on its own (`redirect_commands/4`): pasta splices every forwarded
-  port through namespace loopback, so a pair published here and missing there
-  answers the host with a closed connection.
-
-  ⚠️ This function builds a command. That the flags are **passed** is all a
-  command-string assertion can show; that they **close the doors** is a
-  different claim needing a live namespace, and it belongs to `T012`/`T014`'s
-  probe set, not here.
+  ⚠️ Run **after** `redirect_commands/4`: from the moment the route exists a
+  connect leaves loopback, and before the redirect is in place nothing would
+  judge it.
   """
-  @spec pasta_command(String.t(), [String.t()], String.t(), forward()) :: [String.t()]
-  def pasta_command(pidfile, [_ | _] = tenant_command, runas \\ "0", forward \\ nil) do
+  @spec route_commands(pos_integer(), String.t()) :: [[String.t()]]
+  def route_commands(holder_pid, address) do
     [
-      pasta_path(),
-      "--config-net",
-      "--runas",
-      runas,
-      "--no-map-gw"
-    ] ++
-      inbound_tcp(forward_pairs(forward)) ++
-      [
-        "-T",
-        "none",
-        "-u",
-        "none",
-        "-U",
-        "none",
-        "-P",
-        pidfile,
-        "--"
-      ] ++ tenant_command
+      nsenter(holder_pid, ["ip", "addr", "add", "#{address}/32", "dev", "lo"]),
+      nsenter(holder_pid, ["ip", "route", "add", "default", "dev", "lo", "src", address])
+    ]
   end
 
-  defp inbound_tcp([]), do: ["-t", "none"]
-
-  defp inbound_tcp(pairs), do: Enum.flat_map(pairs, &inbound_tcp_pair/1)
-
-  defp inbound_tcp_pair({host_port, ns_port})
-       when is_integer(host_port) and host_port > 0 and is_integer(ns_port) and ns_port > 0,
-       do: ["-t", "127.0.0.1/#{host_port}:#{ns_port}"]
-
-  @doc """
-  The `--runas` value for a uid, as `pasta` spells it.
-
-  ⚠️ `--runas 0` is correct only when `pasta` runs **as root**. Under the split
-  ordering (`LaunchPlan.build/4`) it runs after `setpriv` has already dropped to
-  the sandbox uid, and there `--runas 0` fails outright:
-
-      Can't set GID to 0: Operation not permitted
-
-  and `--runas 0:0` **hangs** rather than erroring, which is worse -- a launch
-  that never returns rather than one that fails. A matching non-zero
-  `uid:gid` pair is the only value measured to work after the drop, and it
-  produces `uid_map = 0 <uid> 1` (see `egress-path-measurements.md`).
-  """
-  @spec runas_for_uid(non_neg_integer()) :: String.t()
-  def runas_for_uid(0), do: "0"
-  def runas_for_uid(uid) when is_integer(uid) and uid > 0, do: "#{uid}:#{uid}"
-
-  # ⚠️ An **absolute path**, and the bare name `"pasta"` was a real defect
-  # (005 T060a).
+  # ⚠️ `-n` alone, never `-U` (D6 of `let-sandboxes-outlive-a-deploy`). The
+  # holder's user namespace is bwrap's, created after `setpriv`, and maps only
+  # the sandbox uid. Measured against such a holder from a root caller:
   #
-  # This list becomes the head of `LaunchPlan.tenant_command`, which
-  # `NodeLauncher` hands to `:peer` as the program to spawn. `:peer` uses
-  # `:erlang.open_port({:spawn_executable, prog}, ...)`, and
-  # **`spawn_executable` does no `PATH` lookup** -- it wants a path to a file.
-  # With a bare name every policed launch died with:
+  #     nsenter -t <holder> -n nft add table ip nat                         -> OK
+  #     nsenter -t <holder> -n -U nft ...       -> setgid() failed: Invalid argument
+  #     nsenter -t <holder> -n -U --preserve-credentials [--keep-caps] nft ... -> EPERM
   #
-  #     ** (ErlangError) Erlang error: :enoent:
-  #        * 1st argument: invalid port name
-  #        :erlang.open_port({:spawn_executable, ~c"pasta"}, ...)
-  #
-  # ⚠️ Why every probe missed it. `docker/wired-egress-e2e.sh`,
-  # `netns-first-e2e.sh` and the rest run the emitted commands **through a
-  # shell**, and a shell resolves `PATH`. So the mechanism's own commands were
-  # correct everywhere they had been measured, and wrong on the one path that
-  # actually launches a tenant. It surfaced only when the conformance suite
-  # gained an allowlist and started taking the policed branch -- the permit
-  # direction again, which is where every defect in this feature has hidden.
-  #
-  # `Hardening.Linux.systemd_run_path/0` already resolves its program this way
-  # for the same reason; the pasta prefix was added later and missed the rule.
-  # The fallback keeps the failure naming a path that was looked for rather than
-  # a bare name that says nothing about where it was sought.
-  defp pasta_path, do: System.find_executable("pasta") || @pasta_fallback
-
-  # ⚠️ `-U --preserve-credentials` is load-bearing and `-n` alone is REFUSED
-  # from the BEAM's vantage. Measured on `docker-isolation:latest` under plain
-  # unprivileged `docker run --device /dev/net/tun`, both forms from both
-  # vantage points in one run:
-  #
-  #     caller OUTSIDE the platform userns (this is where the BEAM stands):
-  #       nsenter -t <holder> -n ip link                          -> REFUSED
-  #       nsenter -t <holder> -n -U --preserve-credentials ip link -> OK
-  #
-  # The netns is a descendant of the platform's user namespace, so entering it
-  # requires `CAP_SYS_ADMIN` *in that userns*. The BEAM is not in it --
-  # `/proc/self/ns/user` reads `user:[4026531837]` while the holder's reads
-  # `user:[4026534472]` -- so the netns must be joined together with the userns
-  # that owns it. `--preserve-credentials` keeps the caller's uid rather than
-  # remapping to the target's root.
-  #
-  # ⚠️ A shell probe run *inside* the platform userns measures the opposite
-  # (bare `-n` OK, `-U` refused, because it is already in that userns) and that
-  # is the reading this call site originally encoded. It is not the BEAM's
-  # position. `ExSandbox.Capability.can_enter_foreign_netns?/0` probes the form
-  # written here, so probe and mechanism cannot drift apart again silently.
-  # ⚠️ **`--preserve-credentials` was REMOVED, and the measurement above is not
-  # wrong -- its subject moved.** That measurement was taken against a holder
-  # whose user namespace was **root-owned**, which is what `pasta` produced while
-  # it wrapped the whole command and therefore ran as root. Under the split
-  # ordering (T060a4e) `pasta` runs after `setpriv`, so the namespace it creates
-  # is owned by the **sandbox uid**, and carrying our own credentials in lands us
-  # there with no capabilities at all:
-  #
-  #     holder uid: 112526, holder userns: user:[4026534623]
-  #     nsenter -t <holder> -n -U --preserve-credentials nft add table ip nat
-  #       -> Error: Could not process rule: Operation not permitted   rc=1
-  #     nsenter -t <holder> -n -U nft add table ip nat
-  #       -> rc=0
-  #
-  # Without the flag we are remapped to root *inside the target userns*, which is
-  # where the `CAP_NET_ADMIN` for `nft` has to come from. The `-U` itself is
-  # still load-bearing for the original reason: the netns is a descendant of that
-  # userns, so it cannot be joined without joining its owner.
-  #
-  # ⚠️ **This form is measured to fail from a non-root caller**
-  # (`nsenter: setgroups failed: Operation not permitted`), and that matters for
-  # `013-FR-006b`, which requires an unprivileged execution plane. It is recorded
-  # rather than papered over: the privileged container this runs in today would
-  # certify a fix that the unprivileged deployment cannot use, so the remaining
-  # gap is a known one with a measurement attached rather than a surprise later.
+  # Entering takes `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over the netns, which
+  # the caller holds from the initial user namespace, as `Egress.NetnsSocket`'s
+  # `setns` does.
   defp nsenter(pid, command),
-    do: ["nsenter", "-t", "#{pid}", "-n", "-U"] ++ command
+    do: ["nsenter", "-t", "#{pid}", "-n"] ++ command
 end

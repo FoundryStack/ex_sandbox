@@ -25,8 +25,8 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncherForwardTest do
     @confined {"systemd-run", ["--unshare-net", "erl"]}
     @unconfined {"erl", []}
 
-    test "a service port goes through pasta even with an empty allowlist" do
-      # Without pasta there is no forward, and `Beam.address/1` answers nil.
+    test "a service port is policed even with an empty allowlist" do
+      # Unpoliced there is no forward, and `Beam.address/1` answers nil.
       served = sandbox(service_port: 4000, context: %{network_allowlist: []})
       assert NodeLauncher.egress_route(served, @confined) == {:police, []}
     end

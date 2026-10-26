@@ -53,34 +53,21 @@ defmodule ExSandbox.Egress.NetnsTest do
       # sandbox's redirect there -- it succeeds, warns about nothing, and
       # leaves the tenant unpoliced while the host acquires a stray NAT rule.
       for command <- commands do
-        assert Enum.take(command, 5) ==
-                 ["nsenter", "-t", "4242", "-n", "-U"],
+        assert Enum.take(command, 4) ==
+                 ["nsenter", "-t", "4242", "-n"],
                "a policy command that does not enter the namespace configures the host: " <>
                  Enum.join(command, " ")
       end
     end
 
-    test "entry joins the userns that owns the netns, not the netns alone", %{
+    test "entry joins the netns alone, never bwrap's user namespace", %{
       commands: commands
     } do
-      # ⚠️ Regression guard for a mechanism/probe divergence that ran the other
-      # way from the one `probe_composability_test.exs` catches. There the probe
-      # measured a sequence the mechanism never ran; here the mechanism ran a
-      # sequence the probe never measured, so `network_restriction` reported
-      # `ok` while every real `nsenter` would have been refused at runtime.
-      #
-      # Measured on `docker-isolation:latest`, unprivileged, both forms from
-      # both vantage points in one run:
-      #
-      #   caller OUTSIDE the platform userns (the BEAM's position):
-      #     nsenter -t <holder> -n ...                          -> REFUSED
-      #     nsenter -t <holder> -n -U ... -> OK
-      #
-      # A bare `-n` here fails closed in the worst way: the redirect is never
-      # installed, so the tenant runs unpoliced while every denial check passes.
+      # bwrap's user namespace maps no root, so `-U` fails with
+      # `setgid() failed: Invalid argument` and no redirect is installed.
       for command <- commands do
-        assert "-U" in command,
-               "bare `-n` is refused from outside the owning userns: " <>
+        refute "-U" in command,
+               "joining a userns that maps only the sandbox uid is refused: " <>
                  Enum.join(command, " ")
       end
     end
@@ -148,29 +135,22 @@ defmodule ExSandbox.Egress.NetnsTest do
     end
 
     test "no command configures an interface or a route", %{commands: commands} do
-      # ⚠️ `pasta --config-net` does this, and an earlier version of this module
-      # emitted `ip addr add`/`ip link set`/`ip route add` of its own. All three
-      # failed with `Cannot find device "sb0"`: nothing had created the device,
-      # because the thing that creates it had not run yet. They were not merely
-      # redundant -- they ran *before* what makes them possible.
+      # The route is `route_commands/2`'s, run after these.
       # ⚠️ Checks the *program*, not membership. `"ip" in command` is true of
       # every rule here -- `nft add table ip nat` names the address family --
       # so a membership test fails against correct commands and would be
       # "fixed" by deleting it.
-      # ⚠️ The program is *located*, not read from a fixed offset. This assertion
-      # was `Enum.at(command, 4)` and broke when the userns-join flags
-      # (`-U`) were added ahead of it -- a correct change
-      # failing a correct test because the test encoded an argument position.
-      # Dropping the `nsenter` flags finds the first real program either way.
+      # ⚠️ The program is *located*, not read from a fixed offset, so a change
+      # to the `nsenter` flags does not fail a correct test.
       for command <- commands do
         program =
           command
-          |> Enum.drop_while(&(&1 != "-U"))
+          |> Enum.drop_while(&(&1 != "-n"))
           |> Enum.drop(1)
           |> List.first()
 
         assert program == "nft",
-               "pasta configures the namespace; this must only police it: " <>
+               "the redirect must only police the namespace: " <>
                  Enum.join(command, " ")
       end
     end
@@ -376,7 +356,7 @@ defmodule ExSandbox.Egress.NetnsTest do
       # Same reason as the redirect: an `nft` command without `nsenter -t <pid> -n`
       # configures the HOST, succeeds, and warns about nothing.
       for command <- commands do
-        assert Enum.take(command, 5) == ["nsenter", "-t", "4242", "-n", "-U"],
+        assert Enum.take(command, 4) == ["nsenter", "-t", "4242", "-n"],
                "a policy command that does not enter the namespace configures the host: " <>
                  Enum.join(command, " ")
       end
@@ -399,190 +379,48 @@ defmodule ExSandbox.Egress.NetnsTest do
     defp drop_rule(commands), do: Enum.find(commands, &("drop" in &1))
   end
 
-  describe "pasta_command/2" do
-    test "uses --config-net, the flag measured to need no host capability" do
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-      assert "--config-net" in command
+  describe "route_commands/2 (D6 of let-sandboxes-outlive-a-deploy)" do
+    setup do
+      %{commands: Netns.route_commands(4242, "10.0.0.2")}
     end
 
-    test "runs as root, without which pasta cannot enter the namespace it made" do
-      # ⚠️ Not a hardening choice. Measured: without `--runas 0`, pasta drops to
-      # `nobody` and then fails with `Failed to join network namespace:
-      # Permission denied` -- it cannot re-enter the namespace it just created.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-      assert Enum.chunk_every(command, 2, 1, :discard) |> Enum.member?(["--runas", "0"])
-    end
-
-    test "does not pass --interface, which names a HOST device" do
-      # ⚠️ An earlier version passed `--interface sb0` believing it named the
-      # namespace-side device. `-i` selects the **host** interface to copy
-      # addresses and routes *from*; the namespace-side name is `-I`. Measured:
-      # `pasta --config-net --interface sb0 ...` fails with
-      # `Invalid interface name sb0: No such device`.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-      refute "--interface" in command
-      refute "-i" in command
-    end
-
-    test "the tenant command follows the argument separator" do
-      # Everything after `--` is the tenant. Without the separator, a tenant
-      # flag that happens to match one of pasta's own would be consumed by
-      # pasta instead of reaching the tenant.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "--die-with-parent", "erlexec"])
-      [_pasta | rest] = command
-      tenant = rest |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
-      assert tenant == ["bwrap", "--die-with-parent", "erlexec"]
+    test "puts the sandbox address on lo, then routes default over lo from it", %{
+      commands: commands
+    } do
+      assert [
+               [
+                 "nsenter",
+                 "-t",
+                 "4242",
+                 "-n",
+                 "ip",
+                 "addr",
+                 "add",
+                 "10.0.0.2/32",
+                 "dev",
+                 "lo"
+               ],
+               [
+                 "nsenter",
+                 "-t",
+                 "4242",
+                 "-n",
+                 "ip",
+                 "route",
+                 "add",
+                 "default",
+                 "dev",
+                 "lo",
+                 "src",
+                 "10.0.0.2"
+               ]
+             ] == commands
     end
   end
 
-  describe "the flags that close the host off (029-FR-015, 029-FR-018)" do
-    # ⚠️ **What this describe block can and cannot prove.** Every assertion here
-    # reads a list of strings. It shows the flags are *passed*; it does not show
-    # they *close* anything. The claim that the netns can no longer reach the
-    # host needs a live namespace and a probe that watches for bytes, and that
-    # evidence is `T012`/`T014`'s. Do not read a green run here as `FR-015`
-    # demonstrated -- that reading is exactly the "confirm a flag was passed"
-    # failure `012-FR-012a` and `029-FR-016` exist to forbid.
-
+  describe "the redirect with forwards" do
     setup do
-      %{command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])}
-    end
-
-    test "the gateway address is not mapped to the host", %{command: command} do
-      # Without this, pasta maps the namespace's default gateway to the host,
-      # and the host answers on it.
-      assert "--no-map-gw" in command
-    end
-
-    test "inbound and outbound TCP forwarding are both off", %{command: command} do
-      # ⚠️ `-t auto` is `FR-018` directly: MEASURED under the default, a tenant
-      # binding `0.0.0.0:8080` binds `0.0.0.0:8080` **on the host**.
-      assert flag_value(command, "-t") == "none"
-      assert flag_value(command, "-T") == "none"
-    end
-
-    test "inbound and outbound UDP forwarding are both off", %{command: command} do
-      assert flag_value(command, "-u") == "none"
-      assert flag_value(command, "-U") == "none"
-    end
-
-    test "--no-map-gw is not passed alone", %{command: command} do
-      # ⚠️ **The whole reason this test is written as a set rather than as four
-      # independent ones.** The netns reaches host `127.0.0.1` by two
-      # independent paths; `--no-map-gw` closes one. A build passing only that
-      # flag has a narrower hole, not no hole -- and it looks identical from
-      # outside, because a `curl` to the gateway address gets nothing either
-      # way. A regression that drops the port-forwarding flags while keeping
-      # `--no-map-gw` is the shape this asserts against.
-      assert "--no-map-gw" in command
-
-      for flag <- ~w(-t -T -u -U) do
-        assert flag_value(command, flag) == "none",
-               "#{flag} must be none: --no-map-gw closes only one of the two paths to the host"
-      end
-    end
-
-    test "the closing flags precede the argument separator", %{command: command} do
-      # A flag emitted after `--` is not pasta's -- it is handed to the tenant,
-      # which ignores it, and the door stays open while the command string reads
-      # correct.
-      before_separator = Enum.take_while(command, &(&1 != "--"))
-
-      for flag <- ~w(--no-map-gw -t -T -u -U) do
-        assert flag in before_separator, "#{flag} must reach pasta, not the tenant"
-      end
-    end
-
-    test "the flags do not disturb the runas pair or the pidfile" do
-      # Regression guard for the callers that locate `--runas` and `-P` by
-      # scanning for the flag and taking the next element.
-      command = Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "4242:4242")
-
-      assert flag_value(command, "--runas") == "4242:4242"
-      assert flag_value(command, "-P") == "/run/p.pid"
-    end
-
-    defp flag_value(command, flag) do
-      command |> Enum.drop_while(&(&1 != flag)) |> Enum.at(1)
-    end
-  end
-
-  describe "pasta_command/4 with a forward" do
-    setup do
-      %{
-        command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "0", {52_111, 4000}),
-        plain: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "0", nil)
-      }
-    end
-
-    test "publishes the one named port on host loopback in place of -t none", %{command: command} do
-      pairs = Enum.chunk_every(command, 2, 1, :discard)
-
-      assert ["-t", "127.0.0.1/52111:4000"] in pairs
-      refute ["-t", "none"] in pairs
-    end
-
-    test "leaves every door from the tenant to the host closed", %{command: command} do
-      pairs = Enum.chunk_every(command, 2, 1, :discard)
-
-      assert "--no-map-gw" in command
-
-      for flag <- ~w(-T -u -U) do
-        assert [flag, "none"] in pairs, "#{flag} must stay none with a forward"
-      end
-    end
-
-    test "precedes the argument separator", %{command: command} do
-      assert "127.0.0.1/52111:4000" in Enum.take_while(command, &(&1 != "--"))
-    end
-
-    test "a nil forward is today's argv", %{plain: plain} do
-      assert plain == Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"])
-    end
-
-    test "differs from the unforwarded argv only in the -t value", %{command: c, plain: p} do
-      assert length(c) == length(p)
-
-      assert c |> Enum.zip(p) |> Enum.reject(fn {a, b} -> a == b end) == [
-               {"127.0.0.1/52111:4000", "none"}
-             ]
-    end
-  end
-
-  describe "pasta_command/4 with several forwards" do
-    setup do
-      pairs = [{52_111, 4000}, {52_112, 4001}]
-
-      %{
-        command: Netns.pasta_command("/run/p.pid", ["bwrap", "erlexec"], "0", pairs),
-        pairs: pairs
-      }
-    end
-
-    test "publishes each pair with its own -t, primary first", %{command: command} do
-      published =
-        command
-        |> Enum.chunk_every(2, 1, :discard)
-        |> Enum.filter(&match?(["-t", _], &1))
-
-      assert published == [["-t", "127.0.0.1/52111:4000"], ["-t", "127.0.0.1/52112:4001"]]
-    end
-
-    test "all of them precede the argument separator", %{command: command} do
-      head = Enum.take_while(command, &(&1 != "--"))
-
-      assert "127.0.0.1/52111:4000" in head
-      assert "127.0.0.1/52112:4001" in head
-    end
-
-    test "a one-pair list is the legacy tuple's argv" do
-      assert Netns.pasta_command("/run/p.pid", ["erlexec"], "0", [{52_111, 4000}]) ==
-               Netns.pasta_command("/run/p.pid", ["erlexec"], "0", {52_111, 4000})
-    end
-
-    test "an empty list is today's -t none" do
-      assert Netns.pasta_command("/run/p.pid", ["erlexec"], "0", []) ==
-               Netns.pasta_command("/run/p.pid", ["erlexec"])
+      %{pairs: [{52_111, 4000}, {52_112, 4001}]}
     end
 
     test "exempts every forwarded ns port from the redirect, ahead of it", %{pairs: pairs} do

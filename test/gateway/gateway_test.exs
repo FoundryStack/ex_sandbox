@@ -203,7 +203,12 @@ defmodule ExSandbox.GatewayTest do
       start_gateway(path, allowed_uids: [PeerCred.own_uid() + 1])
       socket = connect(path)
 
-      send_request(socket, 1, :hello, %{versions: Protocol.versions()})
+      _ =
+        :gen_tcp.send(
+          socket,
+          Protocol.encode({:request, 1, :hello, %{versions: Protocol.versions()}})
+        )
+
       assert {:error, :closed} = :gen_tcp.recv(socket, 0, 5_000)
     end
 

@@ -1300,8 +1300,8 @@ defmodule ExSandbox.Mechanism.Beam do
 
   defp emit_output(result, _sink), do: result
 
-  # `"127.0.0.1:<host_port>"`, the loopback port `pasta` publishes the sandbox's
-  # `service_port` on (`NodeLauncher.launch/2`, `Netns.pasta_command/4`).
+  # `"127.0.0.1:<host_port>"`, the loopback port the acceptor publishes the sandbox's
+  # `service_port` on (`NodeLauncher.launch/2`, `Egress.Acceptor`).
   # `address/2` answers the same for any port in `extra_service_ports`.
   #
   # `nil` when the sandbox names no service port, and also when it is not

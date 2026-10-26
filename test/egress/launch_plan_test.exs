@@ -15,7 +15,7 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
 
   ## Why the order inverted
 
-  The plan no longer configures a namespace before launch. It cannot: `pasta`
+  The plan no longer configures a namespace before launch. It cannot: `bwrap`
   creates the namespace *by starting the tenant in it*, so the policy is
   installed afterwards, against a running tenant's pid. See the module.
   """
@@ -30,7 +30,7 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
   # included. The earlier fixture omitted it, and that omission is why the
   # unbootable ordering survived every one of these tests: a plan built from a
   # command with no privilege drop cannot exhibit the defect that only appears
-  # when a drop lands inside pasta's namespace. `LaunchDecisionsTest` pins the
+  # when a drop lands inside a helper's namespace. `LaunchDecisionsTest` pins the
   # fixture against the real composer so it cannot drift back.
   @confined [
     "/usr/bin/systemd-run",
@@ -55,59 +55,24 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       %{plan: plan}
     end
 
-    test "the tenant launch no longer unshares the network", %{plan: plan} do
-      # ⚠️ `--unshare-net` is a namespace with **no interfaces**. Keeping it
-      # would put the tenant in a *fresh empty* namespace while `pasta`
-      # configured a different one -- isolation restored silently, policy
-      # discarded, and every denial check still green.
-      refute "--unshare-net" in plan.tenant_command
-      refute "--unshare-net" in plan.pasta_command
+    test "the tenant runs the composed command unchanged, in a loopback-only namespace",
+         %{plan: plan} do
+      # D6 of `let-sandboxes-outlive-a-deploy`: no network helper wraps the
+      # tenant; `--unshare-net` gives it a namespace holding only `lo`, and
+      # `police/2` makes that namespace's only way out the acceptor.
+      assert plan.tenant_command == @confined
     end
 
-    test "pasta runs the tenant rather than the tenant joining a namespace", %{plan: plan} do
-      # The inversion. An earlier design had the tenant `ip netns exec` into a
-      # pre-built namespace; `pasta` cannot attach to one made that way
-      # (measured: `Failed to join network namespace: Permission denied`).
-      pasta = Enum.find(plan.pasta_command, &(Path.basename(&1) == "pasta"))
-      assert pasta, "the command must run the tenant under pasta"
+    test "the route is installed last, after every redirect rule", %{plan: plan} do
+      # ⚠️ From the moment the default route exists a connect leaves loopback.
+      # Installed before the redirect, it would leave unjudged.
+      steps = Enum.map(LaunchPlan.redirect_steps(plan, 4242), &Enum.join(&1, " "))
+      route = Enum.find_index(steps, &String.contains?(&1, "ip route add default dev lo"))
+      redirect = Enum.find_index(steps, &String.contains?(&1, "meta l4proto tcp redirect"))
 
-      assert String.starts_with?(pasta, "/"),
-             "must be a path :peer can spawn, not a bare name"
-
-      tenant = plan.pasta_command |> Enum.drop_while(&(&1 != "--")) |> Enum.drop(1)
-      assert List.last(tenant) == List.last(plan.tenant_command)
-    end
-
-    test "pasta is inserted AFTER the privilege drop, not wrapped around it", %{plan: plan} do
-      # ⚠️ The whole of T060a4e. Wrapping the command in `pasta` puts `setpriv`
-      # inside pasta's spawn-mode userns, whose `uid_map` is empty -- so
-      # `setresuid` fails with EINVAL for any uid and the tenant never boots.
-      # Measured; it is not a theoretical ordering preference.
-      pasta_at = Enum.find_index(plan.pasta_command, &(Path.basename(&1) == "pasta"))
-      setpriv_at = Enum.find_index(plan.pasta_command, &(&1 == "setpriv"))
-      scope_at = Enum.find_index(plan.pasta_command, &(Path.basename(&1) == "systemd-run"))
-
-      assert scope_at < setpriv_at,
-             "systemd-run must stay outermost or the scope's caps are never applied"
-
-      assert setpriv_at < pasta_at,
-             "setpriv must run BEFORE pasta or setresuid fails inside an empty uid_map"
-    end
-
-    test "pasta's --runas names the same uid setpriv drops to", %{plan: plan} do
-      # A mismatch here does not fail loudly: pasta would map a uid the tenant
-      # never becomes, and the namespace comes up owned by nobody in particular.
-      # ⚠️ `--runas 0` after a drop is measured to fail outright, and `--runas
-      # 0:0` as root **hangs** rather than erroring -- a launch that never
-      # returns is worse than one that fails.
-      assert "--reuid=4242" in plan.pasta_command
-
-      runas_value =
-        plan.pasta_command
-        |> Enum.drop_while(&(&1 != "--runas"))
-        |> Enum.at(1)
-
-      assert runas_value == "4242:4242"
+      assert route == length(steps) - 1
+      assert redirect < route
+      assert Enum.at(steps, route) =~ "src 10.0.0.2"
     end
 
     test "a command with no privilege drop is refused rather than prefixed" do
@@ -119,18 +84,10 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       assert {:error, :no_privilege_drop} = LaunchPlan.build(@key, @port, no_drop)
     end
 
-    test "the pidfile pasta writes is the one the plan names", %{plan: plan} do
-      # The holder is found by searching this pid's children, so a plan whose
-      # pidfile disagrees with pasta's would search the wrong process -- and
-      # find nothing, which reads as an architectural refusal.
-      assert plan.pidfile in plan.pasta_command
-    end
-
-    test "the redirect targets the pid it is given, not pasta's own", %{plan: plan} do
-      # ⚠️ THE trap on this path. `pasta -P` records pasta's HOST-side pid; the
-      # tenant runs in a child. `nsenter -t <pasta pid> -n nft ...` installs the
-      # sandbox's redirect into the HOST namespace: it succeeds, warns about
-      # nothing, and leaves the tenant unpoliced.
+    test "the redirect targets the pid it is given", %{plan: plan} do
+      # ⚠️ `nsenter -t <host pid> -n nft ...` installs the sandbox's redirect
+      # into the HOST namespace: it succeeds, warns about nothing, and leaves
+      # the tenant unpoliced.
       for step <- LaunchPlan.redirect_steps(plan, 4242) do
         assert Enum.take(step, 4) == ["nsenter", "-t", "4242", "-n"]
       end
@@ -152,25 +109,21 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
   end
 
   describe "the service-port forward" do
-    test "is recorded on the plan and reaches pasta" do
+    test "is recorded on the plan for the acceptor to publish" do
       {:ok, plan} = LaunchPlan.build(@key, @port, @confined, forward: {52_111, 4000})
 
       assert plan.forward == {52_111, 4000}
-      assert "127.0.0.1/52111:4000" in plan.pasta_command
-      refute Enum.chunk_every(plan.pasta_command, 2, 1, :discard) |> Enum.member?(["-t", "none"])
     end
 
     test "is absent by default, leaving inbound TCP off" do
       {:ok, plan} = LaunchPlan.build(@key, @port, @confined)
 
       assert plan.forward == nil
-      assert Enum.chunk_every(plan.pasta_command, 2, 1, :discard) |> Enum.member?(["-t", "none"])
     end
 
-    # OBSERVED 2026-09-21 on production: pasta splices a connection from host
-    # loopback by connecting to 127.0.0.1:<ns_port> from INSIDE the namespace,
-    # which the nat output redirect sent to the acceptor. The acceptor refused it
-    # (`:not_permitted`) and the host saw the connection close.
+    # OBSERVED 2026-09-21 on production: a connection from host loopback,
+    # spliced to 127.0.0.1:<ns_port> from INSIDE the namespace, was sent to the
+    # acceptor by the nat output redirect and refused (`:not_permitted`).
     test "exempts the forwarded port on namespace loopback, ahead of the redirect" do
       {:ok, plan} = LaunchPlan.build(@key, @port, @confined, forward: {52_111, 4000})
       steps = Enum.map(LaunchPlan.redirect_steps(plan, 4242), &Enum.join(&1, " "))
@@ -192,8 +145,6 @@ defmodule ExSandbox.Egress.LaunchPlanTest do
       steps = Enum.map(LaunchPlan.redirect_steps(plan, 4242), &Enum.join(&1, " "))
 
       assert plan.forward == forward
-      assert "127.0.0.1/52111:4000" in plan.pasta_command
-      assert "127.0.0.1/52112:4001" in plan.pasta_command
 
       for ns_port <- [4000, 4001] do
         assert Enum.any?(steps, &String.ends_with?(&1, "tcp dport #{ns_port} return"))

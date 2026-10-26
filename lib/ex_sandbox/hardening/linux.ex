@@ -1015,24 +1015,7 @@ defmodule ExSandbox.Hardening.Linux do
     # correct one under a suite that only tests denial, so an over-claiming
     # probe converts "we cannot do this" into "we demonstrated this".
     executable_present?("bwrap") and can_unshare?("--unshare-net") and
-      pasta_usable?() and policed_launch_composable?()
-  end
-
-  # `pasta` needs one thing this host may not have, and it is a **device**
-  # rather than a capability.
-  #
-  # ⚠️ Measured 2026-08-17: with `/dev/net/tun` absent, `pasta --config-net`
-  # fails `Failed to open() /dev/net/tun` -> `Failed to set up tap device in
-  # namespace`, rc=1. With it present, pasta brings up a genuinely separate
-  # netns (different `/proc/self/ns/net` inode) while holding
-  # `CapEff=0000000000000000` -- no capability in the host netns at all.
-  #
-  # ⚠️ That last property is why `pasta` was chosen and also why it cannot
-  # carry a confined tenant: the same empty capability set that makes it
-  # rootless-safe is what stops `bwrap` creating its mount namespace. See
-  # `policed_launch_composable?/0`.
-  defp pasta_usable? do
-    executable_present?("pasta") and File.exists?("/dev/net/tun")
+      policed_launch_composable?()
   end
 
   # Whether a network-policed tenant can *also* be confined.
@@ -1226,8 +1209,6 @@ defmodule ExSandbox.Hardening.Linux do
   # like the honest third outcome) and would have made the capability appear
   # permanently absent on the very host that could run it.
   #
-  # The same trap, one layer down, is why `ExSandbox.Egress.Pasta` polls for
-  # pasta's tenant instead of checking once.
   defp await_foreign_netns(_pid, 0), do: false
 
   defp await_foreign_netns(pid, attempts) do
@@ -1248,39 +1229,23 @@ defmodule ExSandbox.Hardening.Linux do
     end
   end
 
-  # ⚠️ `-U --preserve-credentials` is load-bearing: `-n` alone is REFUSED.
+  # ⚠️ `-n` alone, never `-U` (D6 of `let-sandboxes-outlive-a-deploy`). The
+  # holder's user namespace is bwrap's, created after `setpriv`, and maps only
+  # the sandbox uid. Measured against such a holder from a root caller:
   #
-  # `setns()` into a netns requires `CAP_SYS_ADMIN` in the user namespace that
-  # **owns** it. The platform holds that capability inside the userns it created,
-  # but a process that has not joined that userns holds nothing there -- so
-  # entering the netns without also entering its owning userns fails, even
-  # though the very same process created both. Measured, same host, same pid:
+  #     nsenter -t <holder> -n nft add table ip nat                         -> OK
+  #     nsenter -t <holder> -n -U nft ...       -> setgid() failed: Invalid argument
+  #     nsenter -t <holder> -n -U --preserve-credentials [--keep-caps] nft ... -> EPERM
   #
-  #     nsenter -t <pid> -n ip link                          -> EPERM
-  #     nsenter -t <pid> -n -U --preserve-credentials ip link -> OK
+  # Entering takes `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` over the netns, which
+  # the caller holds from the initial user namespace, as `Egress.NetnsSocket`'s
+  # `setns` does.
   #
-  # ⚠️ This is the constraint that makes the whole design work rather than a
-  # detail: the BEAM runs **outside** the sandbox userns, so every namespace
-  # operation the platform performs -- attaching `pasta`, installing the `nft`
-  # redirect -- must join the userns as well. An earlier shell probe appeared to
-  # prove entry worked while running its `nsenter` *inside* the userns, which is
-  # not the position the platform is actually in.
-  #
-  # ⚠️ `--preserve-credentials` was REMOVED here in lockstep with
-  # `Capability`'s copy, `Egress.Netns.nsenter/2` and `Egress.Acceptor`. This is
-  # the **fourth** site carrying these flags, and `ProbeComposabilityTest` is
-  # what found the last two -- exactly the "two independent implementations
-  # disagreeing" defect it was written for (005 T060a5c).
-  #
-  # Why it changed: under the split launch ordering (T060a4e) `pasta` runs after
-  # `setpriv`, so the namespace is owned by the **sandbox uid**. Preserving our
-  # own credentials into it leaves us with none there; omitting the flag remaps
-  # us to root inside the target userns, which is where `CAP_NET_ADMIN` comes
-  # from. Measured -- see `egress-path-measurements.md`.
+  # The probe runs the form `Egress.Netns.nsenter/2` runs.
   defp nsenter_succeeds?(pid) do
     case System.cmd(
            "nsenter",
-           ["-t", "#{pid}", "-n", "-U", "ip", "link"],
+           ["-t", "#{pid}", "-n", "ip", "link"],
            stderr_to_stdout: true
          ) do
       {_output, 0} -> true
