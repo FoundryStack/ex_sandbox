@@ -6,6 +6,7 @@ defmodule ExSandbox.Gateway.ContextFuns do
   `let-sandboxes-outlive-a-deploy`).
   """
 
+  alias ExSandbox.Gateway.Protocol
   alias ExSandbox.Sandbox
 
   @doc "Stores `result`'s context functions in `table` and replaces them with markers."
@@ -32,7 +33,8 @@ defmodule ExSandbox.Gateway.ContextFuns do
     imported =
       Map.new(context, fn
         {key, {:gateway_context_function, key, arity}} ->
-          {key, client_fun(arity, &request.({:context, sandbox.id, key, &1}))}
+          call = &Protocol.unwrap(request.({:context, sandbox.id, key, Protocol.opaque(&1)}))
+          {key, client_fun(arity, call)}
 
         pair ->
           pair

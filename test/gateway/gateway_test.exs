@@ -126,12 +126,14 @@ defmodule ExSandbox.GatewayTest do
             socket,
             id,
             :call,
-            {:call, sb, __MODULE__, :after_ms, [delay, value], 5_000}
+            {:call, sb, Protocol.opaque({__MODULE__, :after_ms, [delay, value]}), 5_000}
           )
         end
 
         replies =
-          for _ <- requests, into: %{}, do: (fn {:reply, id, r} -> {id, r} end).(recv(socket))
+          for _ <- requests,
+              into: %{},
+              do: (fn {:reply, id, r} -> {id, Protocol.unwrap(r)} end).(recv(socket))
 
         assert replies == Map.new(requests, fn {id, {_delay, value}} -> {id, {:ok, value}} end)
       end
@@ -155,6 +157,47 @@ defmodule ExSandbox.GatewayTest do
       assert recv(socket) == {:reply, 8, {:ok, ["local-a"]}}
     end
 
+    test "a call's arguments and result may name atoms this VM does not know" do
+      path = socket_path()
+      start_gateway(path)
+      socket = hello(connect(path))
+
+      name = "zz_argument_#{System.unique_integer([:positive])}"
+      placeholder = String.duplicate("q", byte_size(name))
+      {:opaque, template} = Protocol.opaque({Function, :identity, [String.to_atom(placeholder)]})
+      mfa = {:opaque, :binary.replace(template, placeholder, name)}
+
+      send_request(socket, 1, :call, {:call, sandbox(), mfa, 5_000})
+      assert {:reply, 1, {:opaque, _} = result} = recv(socket)
+      assert Protocol.unwrap(result) == {:ok, String.to_existing_atom(name)}
+    end
+
+    test "a hello carrying a setting this VM does not know is answered and the rest apply" do
+      path = socket_path()
+      start_gateway(path)
+      socket = connect(path)
+
+      known = :"gw_hello_probe_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        egress = Application.get_env(:ex_sandbox, :egress, [])
+        Application.put_env(:ex_sandbox, :egress, Keyword.delete(egress, known))
+      end)
+
+      name = "zz_setting_#{System.unique_integer([:positive])}"
+      placeholder = String.duplicate("q", byte_size(name))
+      template = Protocol.encode({String.to_atom(placeholder), 1})
+
+      config = [
+        egress: [Protocol.encode({known, "kept"}), :binary.replace(template, placeholder, name)]
+      ]
+
+      send_request(socket, 1, :hello, %{versions: Protocol.versions(), config: config})
+      assert {:reply, 1, {:ok, %{version: 1}}} = recv(socket)
+      assert Application.get_env(:ex_sandbox, :egress)[known] == "kept"
+      assert_raise ArgumentError, fn -> String.to_existing_atom(name) end
+    end
+
     test "a peer whose uid is not allowed is disconnected" do
       path = socket_path()
       start_gateway(path, allowed_uids: [PeerCred.own_uid() + 1])
@@ -173,7 +216,8 @@ defmodule ExSandbox.GatewayTest do
         socket,
         1,
         :call,
-        {:call, sandbox(), __MODULE__, :notify_after, [200, self(), :done], 5_000}
+        {:call, sandbox(), Protocol.opaque({__MODULE__, :notify_after, [200, self(), :done]}),
+         5_000}
       )
 
       :ok = :gen_tcp.close(socket)

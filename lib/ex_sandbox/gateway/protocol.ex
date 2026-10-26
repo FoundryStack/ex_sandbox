@@ -35,6 +35,24 @@ defmodule ExSandbox.Gateway.Protocol do
   @spec encode(term()) :: binary()
   def encode(term), do: :erlang.term_to_binary(term)
 
+  @doc """
+  A term the gateway forwards without reading -- a call's `{module,
+  function, args}` and its result -- carried as its own binary, so a frame
+  stays decodable when the term names atoms only the far side knows.
+  """
+  @spec opaque(term()) :: {:opaque, binary()}
+  def opaque(term), do: {:opaque, encode(term)}
+
+  @doc "The term inside `opaque/1`, its atoms created; anything else as it is."
+  @spec unwrap(term()) :: term()
+  def unwrap({:opaque, binary}) when is_binary(binary) do
+    :erlang.binary_to_term(binary)
+  rescue
+    ArgumentError -> {:error, :bad_frame}
+  end
+
+  def unwrap(term), do: term
+
   @doc "Decodes one frame, refusing new atoms and external funs."
   @spec decode(binary()) :: {:ok, term()} | {:error, :bad_frame}
   def decode(binary) when is_binary(binary) do

@@ -163,8 +163,16 @@ defmodule ExSandbox.Gateway.Server do
   defp hello(_args, conn), do: {{:error, :bad_request}, conn}
 
   defp apply_config(config) when is_list(config) do
-    for {key, value} <- config, key in @config_keys, Keyword.keyword?(value) do
-      merged = Keyword.merge(Application.get_env(:ex_sandbox, key, []), value)
+    for {key, encoded} <- config, key in @config_keys, is_list(encoded) do
+      {known, unknown} = encoded |> Enum.map(&decode_entry/1) |> Enum.split_with(&is_tuple/1)
+
+      if unknown != [],
+        do:
+          Logger.warning(
+            "ex_sandbox gateway: skipped #{length(unknown)} #{key} setting(s) it does not know"
+          )
+
+      merged = Keyword.merge(Application.get_env(:ex_sandbox, key, []), known)
       Application.put_env(:ex_sandbox, key, merged)
     end
 
@@ -172,6 +180,15 @@ defmodule ExSandbox.Gateway.Server do
   end
 
   defp apply_config(_config), do: :ok
+
+  defp decode_entry(binary) when is_binary(binary) do
+    case Protocol.decode(binary) do
+      {:ok, {name, _value} = entry} when is_atom(name) -> entry
+      _unknown -> :unknown
+    end
+  end
+
+  defp decode_entry(_other), do: :unknown
 
   defp vsn, do: to_string(Application.spec(:ex_sandbox, :vsn))
 
@@ -216,13 +233,24 @@ defmodule ExSandbox.Gateway.Server do
 
   defp dispatch(:list, _args, conn), do: ExSandbox.list_running(conn.mechanism)
 
-  defp dispatch(:call, {:call, sandbox, m, f, a, timeout}, conn),
-    do: conn.mechanism.call(sandbox, m, f, a, timeout)
+  defp dispatch(:call, {:call, sandbox, {:opaque, _} = mfa, timeout}, conn) do
+    with {m, f, a} <- Protocol.unwrap(mfa),
+         do: Protocol.opaque(conn.mechanism.call(sandbox, m, f, a, timeout))
+  end
 
-  defp dispatch(:call, {:cast, sandbox, m, f, a}, conn), do: conn.mechanism.cast(sandbox, m, f, a)
+  defp dispatch(:call, {:cast, sandbox, {:opaque, _} = mfa}, conn) do
+    with {m, f, a} <- Protocol.unwrap(mfa), do: conn.mechanism.cast(sandbox, m, f, a)
+  end
 
-  defp dispatch(:call, {:context, id, key, args}, conn) when is_list(args),
-    do: ContextFuns.apply_stored(conn.funs, id, key, args)
+  defp dispatch(:call, {:context, id, key, {:opaque, _} = args}, conn) do
+    case Protocol.unwrap(args) do
+      args when is_list(args) ->
+        Protocol.opaque(ContextFuns.apply_stored(conn.funs, id, key, args))
+
+      refused ->
+        refused
+    end
+  end
 
   defp dispatch(:call, {:execute, sandbox, command, opts}, conn),
     do: ExSandbox.execute(conn.mechanism, sandbox, command, opts)

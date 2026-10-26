@@ -78,12 +78,20 @@ defmodule ExSandbox.Mechanism.Gateway do
   @spec call(Sandbox.t(), module(), atom(), [term()], timeout()) ::
           {:ok, term()} | {:error, term()}
   def call(%Sandbox{} = sandbox, module, function, args, timeout \\ 10_000),
-    do: request(:call, {:call, sandbox, module, function, args, timeout}, timeout + 5_000)
+    do:
+      Protocol.unwrap(
+        request(
+          :call,
+          {:call, sandbox, Protocol.opaque({module, function, args}), timeout},
+          timeout + 5_000
+        )
+      )
 
   @doc "As `ExSandbox.Mechanism.Beam.cast/4`."
   @spec cast(Sandbox.t(), module(), atom(), [term()]) :: :ok | {:error, term()}
   def cast(%Sandbox{} = sandbox, module, function, args),
-    do: request(:call, {:cast, sandbox, module, function, args})
+    do:
+      Protocol.unwrap(request(:call, {:cast, sandbox, Protocol.opaque({module, function, args})}))
 
   @doc "As `ExSandbox.Mechanism.Beam.host_pid/1`."
   @spec host_pid(Sandbox.t()) :: {:ok, pos_integer()} | {:error, term()}
@@ -201,7 +209,10 @@ defmodule ExSandbox.Mechanism.Gateway do
         hello = %{
           versions: Protocol.versions(),
           config:
-            for(key <- state.config_keys, do: {key, Application.get_env(:ex_sandbox, key, [])})
+            for key <- state.config_keys do
+              entries = Application.get_env(:ex_sandbox, key, [])
+              {key, Enum.map(entries, &Protocol.encode/1)}
+            end
         }
 
         id = state.next_id
