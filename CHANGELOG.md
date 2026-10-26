@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.9.0 — 2026-10-26
+
+### Added: launching a Beam sandbox through a gateway's restricted launcher
+
+`NodeLauncher` takes `exec_via:` (or `exec_via` in the sandbox's `context`) and sends the hardened
+argv as one base64 token after that prefix, so a sandbox can start on another host over a key
+whose forced command is `priv/gateway/launcher`. The launcher answers `ping`; `sample` (the
+sandbox slice's `memory.current` and `memory.max`); `sample ID` (sandbox `ID`'s scope peak since
+the last sample, in bytes, resetting `memory.peak`, or `memory.current` where the kernel cannot
+reset it); `conform` (the `Mechanism.Beam` capability groups the host fails); and `launch`, which
+execs only an argv of `ExSandbox.Hardening.Linux`'s shape and refuses anything else with exit 64.
+
 ## 1.8.0 — 2026-10-26
 
 ### Added: a Beam sandbox's soft limit, bounded swap and floor
