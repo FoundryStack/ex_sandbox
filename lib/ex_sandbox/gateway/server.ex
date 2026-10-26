@@ -9,6 +9,7 @@ defmodule ExSandbox.Gateway.Server do
   require Logger
 
   alias ExSandbox.Gateway.AllowlistStore
+  alias ExSandbox.Gateway.ContextFuns
   alias ExSandbox.Gateway.PeerCred
   alias ExSandbox.Gateway.Protocol
 
@@ -44,7 +45,8 @@ defmodule ExSandbox.Gateway.Server do
       tasks: Keyword.fetch!(opts, :tasks),
       mechanism: Keyword.get(opts, :mechanism, ExSandbox.Mechanism.Beam),
       allowed_uids: Keyword.get_lazy(opts, :allowed_uids, fn -> [PeerCred.own_uid()] end),
-      store_dir: Keyword.get(opts, :store_dir)
+      store_dir: Keyword.get(opts, :store_dir),
+      funs: :ets.new(:ex_sandbox_gateway_funs, [:set, :public])
     }
 
     server = self()
@@ -175,7 +177,7 @@ defmodule ExSandbox.Gateway.Server do
 
   @doc false
   def run(verb, args, conn) do
-    dispatch(verb, args, conn)
+    verb |> dispatch(args, conn) |> ContextFuns.export(conn.funs)
   rescue
     error -> {:error, {:gateway_raised, Exception.message(error)}}
   catch
@@ -192,7 +194,11 @@ defmodule ExSandbox.Gateway.Server do
 
   defp dispatch(:stop, {:destroy, sandbox}, conn) do
     with :ok <- ExSandbox.destroy(conn.mechanism, sandbox) do
-      if is_binary(sandbox.id), do: AllowlistStore.delete(conn.store_dir, sandbox.id)
+      if is_binary(sandbox.id) do
+        AllowlistStore.delete(conn.store_dir, sandbox.id)
+        ContextFuns.forget(conn.funs, sandbox.id)
+      end
+
       :ok
     end
   end
@@ -214,6 +220,9 @@ defmodule ExSandbox.Gateway.Server do
     do: conn.mechanism.call(sandbox, m, f, a, timeout)
 
   defp dispatch(:call, {:cast, sandbox, m, f, a}, conn), do: conn.mechanism.cast(sandbox, m, f, a)
+
+  defp dispatch(:call, {:context, id, key, args}, conn) when is_list(args),
+    do: ContextFuns.apply_stored(conn.funs, id, key, args)
 
   defp dispatch(:call, {:execute, sandbox, command, opts}, conn),
     do: ExSandbox.execute(conn.mechanism, sandbox, command, opts)

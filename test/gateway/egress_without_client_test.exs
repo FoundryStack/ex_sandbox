@@ -41,7 +41,8 @@ defmodule ExSandbox.Gateway.EgressWithoutClientTest do
     refute Process.alive?(client)
 
     {refused_host, refused_port} = refused
-    assert sandbox.context.connect.(host, port) == :connected
-    refute sandbox.context.connect.(refused_host, refused_port) == :connected
+    on_gateway = ExSandbox.Mechanism.Beam.context_for(sandbox)
+    assert on_gateway.connect.(host, port) == :connected
+    refute on_gateway.connect.(refused_host, refused_port) == :connected
   end
 end

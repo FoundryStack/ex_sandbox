@@ -21,6 +21,7 @@ defmodule ExSandbox.Mechanism.Gateway do
 
   require Logger
 
+  alias ExSandbox.Gateway.ContextFuns
   alias ExSandbox.Gateway.Protocol
   alias ExSandbox.Sandbox
 
@@ -120,13 +121,21 @@ defmodule ExSandbox.Mechanism.Gateway do
         wait = Keyword.get(config(), :connect_wait_ms, @connect_wait_ms)
 
         try do
-          GenServer.call(client, {:request, verb, args, wait}, wait + timeout)
+          client
+          |> GenServer.call({:request, verb, outbound(args), wait}, wait + timeout)
+          |> ContextFuns.import(&request(:call, &1))
         catch
           :exit, {:timeout, _} -> {:error, :timeout}
           :exit, _ -> {:error, :host_unreachable}
         end
     end
   end
+
+  defp outbound(args) when is_tuple(args) do
+    args |> Tuple.to_list() |> Enum.map(&ContextFuns.strip/1) |> List.to_tuple()
+  end
+
+  defp outbound(args), do: args
 
   defp config, do: Application.get_env(:ex_sandbox, :gateway_client, [])
 

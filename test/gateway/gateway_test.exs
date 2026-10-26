@@ -16,7 +16,11 @@ defmodule ExSandbox.GatewayTest do
     @impl true
     def required_capabilities, do: []
     @impl true
-    def provision(sandbox), do: {:ok, %{sandbox | mechanism_ref: "local-" <> sandbox.id}}
+    def provision(sandbox) do
+      context = %{probe: fn tag -> {tag, self()} end}
+      {:ok, %{sandbox | mechanism_ref: "local-" <> sandbox.id, context: context}}
+    end
+
     @impl true
     def start(sandbox), do: {:ok, sandbox}
     @impl true
@@ -201,6 +205,17 @@ defmodule ExSandbox.GatewayTest do
       start_gateway(path)
 
       assert Task.await(task, 10_000) == {:ok, ["local-a"]}
+    end
+
+    test "a context function in a reply runs on the gateway, not in the client" do
+      path = socket_path()
+      start_gateway(path)
+      start_supervised!({ExSandbox.Mechanism.Gateway, socket_path: path})
+
+      assert {:ok, provisioned} = ExSandbox.Mechanism.Gateway.provision(sandbox())
+      assert {:tagged, runner} = provisioned.context.probe.(:tagged)
+      assert runner != self()
+      refute Process.alive?(runner)
     end
   end
 
