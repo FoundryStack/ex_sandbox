@@ -51,6 +51,7 @@ measured against, never as a dependency.
 | `ExSandbox.LoopFormatter` | ExUnit formatter emitting the machine-readable run report `mix verify.change` grades. Public because the gate must be able to name it, and it lives here rather than in `axonn` because `ex_sandbox` is the umbrella's universal ancestor -- every app's suite has to be able to emit the report, and only a module every app already depends on can do that | Public |
 | `ExSandbox.Mechanism.Beam` | The reference mechanism (`005-sandbox-beam`) | Public — see mechanism-specific surface below |
 | `ExSandbox.Mechanism.Docker` | Confines a sandbox inside a container instead of the host kernel (`host-sandbox-and-agent-workspace`) | Public — see mechanism-specific surface below |
+| `ExSandbox.Mechanism.Gateway` | Asks a host's sandbox gateway over its socket, so sandboxes outlive the platform release (`sandbox/FR-294`) | Public — child spec `{ExSandbox.Mechanism.Gateway, socket_path: path, on_hello: mfa}` |
 | `ExSandbox.Proxy` | Forwards a request to a running sandbox's address | Public |
 | `ExSandbox.Telemetry` | The events both libraries emit, and their metadata | Public |
 | `ExSandbox.Conformance.{Lifecycle,Reachability,Reconciliation,Credentials,Isolation,Network,ResourceLimits,Execution,Helpers,Group,CapabilityUnavailable}` | Reached by the suite `use` generates | Public by consequence |
