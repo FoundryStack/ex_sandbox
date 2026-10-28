@@ -115,7 +115,7 @@ defmodule ExSandbox.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :crypto],
       mod: {ExSandbox.Application, []}
     ]
   end

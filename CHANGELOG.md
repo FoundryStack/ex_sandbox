@@ -10,6 +10,12 @@ modules lazily) refused the whole frame under `[:safe]` and dropped it, so the c
 its full timeout with nothing logged. A version 1 peer still gets plain results. The client now
 logs a frame it cannot read and a reply to no request.
 
+### Fixed: the gateway release ships `crypto`
+
+`ex_sandbox_gateway` ships only the applications the app spec reaches, and `:crypto` was not
+among them, so every launch through it raised `module :crypto is not available`. A test now
+holds the app spec to every OTP application ex_sandbox's modules import.
+
 ## 1.10.0 — 2026-10-27
 
 ### Added: a sandbox VM sized to its CPU limit
