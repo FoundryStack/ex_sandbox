@@ -5,9 +5,11 @@ defmodule ExSandbox.Gateway.Protocol do
 
   A request is `{:request, id, verb, args}` and its answer
   `{:reply, id, result}`. Replies may arrive in any order; the id pairs them.
+  From version 2 every result after `hello` is `opaque/1`, so a result naming
+  an atom the client has not loaded still reaches its caller.
   """
 
-  @versions [1]
+  @versions [1, 2]
   @verbs [:hello, :start, :stop, :status, :list, :call, :allowlist, :sample]
 
   @type id :: non_neg_integer()
@@ -52,6 +54,11 @@ defmodule ExSandbox.Gateway.Protocol do
   end
 
   def unwrap(term), do: term
+
+  @doc "A reply's result as `version` carries it."
+  @spec result(pos_integer() | nil, term()) :: term()
+  def result(version, result) when is_integer(version) and version >= 2, do: opaque(result)
+  def result(_version, result), do: result
 
   @doc "Decodes one frame, refusing new atoms and external funs."
   @spec decode(binary()) :: {:ok, term()} | {:error, :bad_frame}

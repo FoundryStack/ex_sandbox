@@ -189,8 +189,15 @@ defmodule ExSandbox.Mechanism.Gateway do
     :ok = :inet.setopts(socket, active: :once)
 
     case Protocol.decode(frame) do
-      {:ok, {:reply, id, result}} -> {:noreply, answer(state, id, result)}
-      _other -> {:noreply, state}
+      {:ok, {:reply, id, result}} ->
+        {:noreply, answer(state, id, Protocol.unwrap(result))}
+
+      unreadable ->
+        Logger.error(
+          "ex_sandbox gateway: dropped a frame it could not read: #{inspect(unreadable)}"
+        )
+
+        {:noreply, state}
     end
   end
 
@@ -242,6 +249,10 @@ defmodule ExSandbox.Mechanism.Gateway do
         hello_answered(%{state | pending: pending}, result)
 
       {nil, _pending} ->
+        Logger.error(
+          "ex_sandbox gateway: a reply to no request #{inspect(id)}: #{inspect(result)}"
+        )
+
         state
 
       {from, pending} ->

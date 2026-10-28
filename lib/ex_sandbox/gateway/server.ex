@@ -103,7 +103,7 @@ defmodule ExSandbox.Gateway.Server do
         serve(socket, handle_frame(socket, frame, conn))
 
       {:reply, id, result} ->
-        _ = :gen_tcp.send(socket, Protocol.encode({:reply, id, result}))
+        _ = reply(socket, id, Protocol.result(conn.version, result))
         serve(socket, conn)
 
       {:tcp_closed, ^socket} ->

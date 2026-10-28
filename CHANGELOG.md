@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: a gateway reply the client cannot read no longer vanishes
+
+Gateway protocol version 2 carries every result after `hello` as `Protocol.opaque/1`. A client
+that had not loaded the module naming an atom in a result (a release `eval`, which loads
+modules lazily) refused the whole frame under `[:safe]` and dropped it, so the caller waited out
+its full timeout with nothing logged. A version 1 peer still gets plain results. The client now
+logs a frame it cannot read and a reply to no request.
+
 ## 1.10.0 — 2026-10-27
 
 ### Added: a sandbox VM sized to its CPU limit

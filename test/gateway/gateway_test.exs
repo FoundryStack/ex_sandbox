@@ -81,17 +81,46 @@ defmodule ExSandbox.GatewayTest do
 
   defp recv(socket) do
     {:ok, frame} = :gen_tcp.recv(socket, 0, 5_000)
-    {:ok, term} = Protocol.decode(frame)
-    term
+    {:ok, {:reply, id, result}} = Protocol.decode(frame)
+    {:reply, id, Protocol.unwrap(result)}
   end
 
   defp hello(socket) do
     send_request(socket, 0, :hello, %{versions: Protocol.versions()})
-    assert {:reply, 0, {:ok, %{version: 1}}} = recv(socket)
+    assert {:reply, 0, {:ok, %{version: 2}}} = recv(socket)
     socket
   end
 
   describe "the protocol" do
+    test "from version 2 a result naming an atom this VM never made reaches its caller" do
+      name = "gw_unseen_#{System.unique_integer([:positive])}"
+      unseen = <<131, 119, byte_size(name), name::binary>>
+      assert {:error, :bad_frame} = Protocol.decode(unseen)
+
+      frame = Protocol.encode({:reply, 7, {:opaque, unseen}})
+      assert {:ok, {:reply, 7, carried}} = Protocol.decode(frame)
+      assert Atom.to_string(Protocol.unwrap(carried)) == name
+    end
+
+    test "a version 1 client still gets plain results" do
+      path = socket_path()
+      start_gateway(path)
+      socket = connect(path)
+
+      send_request(socket, 0, :hello, %{versions: [1]})
+      assert {:reply, 0, {:ok, %{version: 1}}} = recv(socket)
+
+      send_request(socket, 1, :list, nil)
+      {:ok, frame} = :gen_tcp.recv(socket, 0, 5_000)
+      assert Protocol.decode(frame) == {:ok, {:reply, 1, {:ok, ["local-a"]}}}
+
+      send_request(socket, 0, :hello, %{versions: [2, 1]})
+      assert {:reply, 0, {:ok, %{version: 2}}} = recv(socket)
+      send_request(socket, 2, :list, nil)
+      {:ok, frame} = :gen_tcp.recv(socket, 0, 5_000)
+      assert {:ok, {:reply, 2, {:opaque, _}}} = Protocol.decode(frame)
+    end
+
     test "hello negotiates the newest shared version, and nothing is served before it" do
       path = socket_path()
       start_gateway(path)
@@ -101,7 +130,7 @@ defmodule ExSandbox.GatewayTest do
       assert recv(socket) == {:reply, 1, {:error, :hello_first}}
 
       send_request(socket, 2, :hello, %{versions: [99]})
-      assert {:reply, 2, {:error, {:unsupported_versions, [1]}}} = recv(socket)
+      assert {:reply, 2, {:error, {:unsupported_versions, [2, 1]}}} = recv(socket)
 
       hello(socket)
       send_request(socket, 3, :list, nil)
@@ -193,7 +222,7 @@ defmodule ExSandbox.GatewayTest do
       ]
 
       send_request(socket, 1, :hello, %{versions: Protocol.versions(), config: config})
-      assert {:reply, 1, {:ok, %{version: 1}}} = recv(socket)
+      assert {:reply, 1, {:ok, %{version: 2}}} = recv(socket)
       assert Application.get_env(:ex_sandbox, :egress)[known] == "kept"
       assert_raise ArgumentError, fn -> String.to_existing_atom(name) end
     end
