@@ -90,13 +90,22 @@ defmodule ExSandbox.Egress.Relay do
         # reason denials are: at `debug` it is filtered out by every config
         # this project ships, and a permitted destination that cannot be
         # reached is precisely the event an operator needs to see.
-        Logger.warning(
-          "egress: permitted destination #{:inet.ntoa(address)}:#{port} unreachable (#{inspect(reason)})"
-        )
+        log_unreachable(Keyword.get(opts, :inbound, false), address, port, reason)
 
         :gen_tcp.close(sandbox_socket)
         {:error, reason}
     end
+  end
+
+  # An inbound forward refused is a sandbox whose application does not listen,
+  # which an idle or unbuilt project does by design; it is not egress.
+  defp log_unreachable(true, _address, port, reason),
+    do: Logger.debug("inbound: nothing listens on sandbox port #{port} (#{inspect(reason)})")
+
+  defp log_unreachable(false, address, port, reason) do
+    Logger.warning(
+      "egress: permitted destination #{:inet.ntoa(address)}:#{port} unreachable (#{inspect(reason)})"
+    )
   end
 
   # ⚠️ **`SO_MARK`, and without it the permitted half of the allowlist cannot

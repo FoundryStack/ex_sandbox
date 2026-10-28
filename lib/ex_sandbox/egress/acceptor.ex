@@ -289,7 +289,7 @@ defmodule ExSandbox.Egress.Acceptor do
         {:ok, pid} =
           Task.start(fn ->
             receive do
-              :owned -> Relay.splice(conn, {{127, 0, 0, 1}, ns_port}, netns: netns)
+              :owned -> Relay.splice(conn, {{127, 0, 0, 1}, ns_port}, netns: netns, inbound: true)
             after
               5_000 -> :gen_tcp.close(conn)
             end

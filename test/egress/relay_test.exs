@@ -144,6 +144,19 @@ defmodule ExSandbox.Egress.RelayTest do
     Task.shutdown(relay, :brutal_kill)
   end
 
+  test "an inbound forward to a port nothing listens on is not an egress warning" do
+    {client, sandbox_side} = client_pair()
+
+    log =
+      ExUnit.CaptureLog.capture_log([level: :warning], fn ->
+        assert {:error, :econnrefused} =
+                 Relay.splice(sandbox_side, {{127, 0, 0, 1}, 1}, inbound: true)
+      end)
+
+    assert {:error, :closed} = :gen_tcp.recv(client, 0, 5_000)
+    refute log =~ "egress"
+  end
+
   test "closing the destination closes the sandbox side" do
     # ⚠️ Without this the sandbox holds a socket to a destination that is gone,
     # and the pool holds the other end forever -- a descriptor leak whose only
