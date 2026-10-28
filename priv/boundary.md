@@ -52,6 +52,7 @@ measured against, never as a dependency.
 | `ExSandbox.Mechanism.Beam` | The reference mechanism (`005-sandbox-beam`) | Public — see mechanism-specific surface below |
 | `ExSandbox.Mechanism.Docker` | Confines a sandbox inside a container instead of the host kernel (`host-sandbox-and-agent-workspace`) | Public — see mechanism-specific surface below |
 | `ExSandbox.Mechanism.Gateway` | Asks a host's sandbox gateway over its socket, so sandboxes outlive the platform release (`sandbox/FR-294`) | Public — child spec `{ExSandbox.Mechanism.Gateway, socket_path: path, on_hello: mfa}` |
+| `ExSandbox.Gateway` | The per-host gateway the client above asks: it owns the host's sandboxes and answers their egress verdicts (`deployment/FR-091`) | Public — child spec `{ExSandbox.Gateway, socket_path: path, mechanism: module, store_dir: dir, name: name}` |
 | `ExSandbox.Proxy` | Forwards a request to a running sandbox's address | Public |
 | `ExSandbox.Telemetry` | The events both libraries emit, and their metadata | Public |
 | `ExSandbox.Conformance.{Lifecycle,Reachability,Reconciliation,Credentials,Isolation,Network,ResourceLimits,Execution,Helpers,Group,CapabilityUnavailable}` | Reached by the suite `use` generates | Public by consequence |

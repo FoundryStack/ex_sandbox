@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed: `ExSandbox.Gateway` is public
+
+The gateway server is listed in `priv/boundary.md`, so a host may start it in its own VM, as
+its tests do, under the same compatibility promise as the client.
+
 ### Fixed: a refused inbound forward is no longer an egress warning
 
 A connection to a sandbox's published port while its application does not listen logged
