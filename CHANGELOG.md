@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed: a refused inbound forward is no longer an egress warning
+
+A connection to a sandbox's published port while its application does not listen logged
+`egress: permitted destination 127.0.0.1:<port> unreachable` at `warning`, once a minute per
+idle or unbuilt sandbox under a liveness check. It now logs at `debug` as an inbound refusal,
+and the egress warning means an outbound destination again.
+
 ### Fixed: a gateway reply the client cannot read no longer vanishes
 
 Gateway protocol version 2 carries every result after `hello` as `Protocol.opaque/1`. A client
