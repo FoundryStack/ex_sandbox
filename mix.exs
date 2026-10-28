@@ -109,7 +109,12 @@ defmodule ExSandbox.MixProject do
       package: package(),
       docs: docs(),
       source_url: @source_url,
-      releases: [ex_sandbox_gateway: [applications: [ex_sandbox: :permanent]]]
+      releases: [
+        ex_sandbox_gateway: [
+          applications: [ex_sandbox: :permanent],
+          steps: [:assemble, &write_sandbox_boot/1]
+        ]
+      ]
     ]
   end
 
@@ -118,6 +123,31 @@ defmodule ExSandbox.MixProject do
       extra_applications: [:logger, :crypto],
       mod: {ExSandbox.Application, []}
     ]
+  end
+
+  # A sandbox node boots from `$ROOT/bin/start.boot`, which a release lacks;
+  # this writes a kernel-and-stdlib boot there (`start_clean` would start the gateway).
+  defp write_sandbox_boot(release) do
+    base = Path.join([release.path, "bin", "start"])
+
+    :ok = Mix.Release.make_boot_script(release, base, kernel: :permanent, stdlib: :permanent)
+
+    {:ok, [{:script, id, instructions}]} = :file.consult(~c"#{base}.script")
+
+    instructions =
+      Enum.map(instructions, fn
+        {:path, paths} -> {:path, Enum.map(paths, &root_relative/1)}
+        other -> other
+      end)
+
+    File.write!(base <> ".boot", :erlang.term_to_binary({:script, id, instructions}))
+    File.rm!(base <> ".script")
+    File.rm!(base <> ".rel")
+    release
+  end
+
+  defp root_relative(path) do
+    path |> to_string() |> String.replace_prefix("$RELEASE_LIB/", "$ROOT/lib/") |> to_charlist()
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]

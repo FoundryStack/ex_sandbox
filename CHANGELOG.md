@@ -16,6 +16,12 @@ logs a frame it cannot read and a reply to no request.
 among them, so every launch through it raised `module :crypto is not available`. A test now
 holds the app spec to every OTP application ex_sandbox's modules import.
 
+### Fixed: a sandbox launched through the gateway release boots
+
+A sandbox node runs the release's own `erlexec` with no `-boot`, so it looks for
+`$ROOT/bin/start.boot`, which a release does not have; every launch exited with
+`cannot get bootfile`. The release now writes a kernel-and-stdlib boot there.
+
 ## 1.10.0 — 2026-10-27
 
 ### Added: a sandbox VM sized to its CPU limit
