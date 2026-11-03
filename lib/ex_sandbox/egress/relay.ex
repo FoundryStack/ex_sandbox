@@ -53,7 +53,8 @@ defmodule ExSandbox.Egress.Relay do
 
   # Bounded rather than `:infinity`: a destination that accepts the connection
   # and then never speaks would otherwise pin one process and two descriptors
-  # per connection for the lifetime of the node.
+  # per connection for the lifetime of the node. The idle window bounds
+  # silence in both directions at once, never a connection's whole life.
   @connect_timeout_ms 5_000
   @idle_timeout_ms 120_000
 
@@ -208,19 +209,13 @@ defmodule ExSandbox.Egress.Relay do
   defp pump(sandbox_socket, destination_socket, idle_timeout) do
     parent = self()
 
-    outbound =
-      spawn_link(fn -> copy(sandbox_socket, destination_socket, idle_timeout, parent) end)
-
-    inbound = spawn_link(fn -> copy(destination_socket, sandbox_socket, idle_timeout, parent) end)
+    outbound = spawn_link(fn -> copy(sandbox_socket, destination_socket, parent) end)
+    inbound = spawn_link(fn -> copy(destination_socket, sandbox_socket, parent) end)
 
     # Either direction ending ends the connection. Waiting for *both* would hold
     # the pair open while one side is already gone, which is the descriptor leak
     # described in the moduledoc.
-    receive do
-      {:copy_done, _which} -> :ok
-    after
-      idle_timeout -> :ok
-    end
+    await_end(idle_timeout)
 
     Process.unlink(outbound)
     Process.unlink(inbound)
@@ -233,16 +228,35 @@ defmodule ExSandbox.Egress.Relay do
     :ok
   end
 
+  # ⚠️ The window restarts on every chunk in EITHER direction. It used to be a
+  # single `after` here plus a `recv` timeout in each copier, so it capped the
+  # connection's total life: a websocket heartbeating every 25 s through the
+  # inbound forward was cut at 120 s, and a stream flowing one way was cut once
+  # the quiet direction's `recv` timed out.
+  defp await_end(idle_timeout) do
+    receive do
+      :traffic -> await_end(idle_timeout)
+      {:copy_done, _which} -> :ok
+    after
+      idle_timeout -> :ok
+    end
+  end
+
   # ⚠️ No catch-all that continues. Every non-`{:ok, data}` outcome -- a closed
-  # socket, a timeout, an unexpected error -- ends this direction and therefore
-  # the connection. A `_ -> copy(...)` clause here would keep a connection alive
+  # socket, an unexpected error -- ends this direction and therefore the
+  # connection. A `_ -> copy(...)` clause here would keep a connection alive
   # through errors nobody enumerated, which is the "forwards on an error path"
   # shape the moduledoc rules out.
-  defp copy(from, to, idle_timeout, parent) do
-    case :gen_tcp.recv(from, 0, idle_timeout) do
+  #
+  # The `recv` has no timeout of its own: one direction falling quiet is not
+  # idle while the other carries bytes, and `await_end/1` owns the window.
+  defp copy(from, to, parent) do
+    case :gen_tcp.recv(from, 0) do
       {:ok, data} ->
+        send(parent, :traffic)
+
         case :gen_tcp.send(to, data) do
-          :ok -> copy(from, to, idle_timeout, parent)
+          :ok -> copy(from, to, parent)
           {:error, reason} -> send(parent, {:copy_done, reason})
         end
 

@@ -22,6 +22,14 @@ A failing accept retried with no delay, and so did a failing receive on the reso
 now wait from 100 ms up to 30 s. The gateway's accept exited on any error, and on `:emfile` the
 restart failed too, which shut down the application and the node. It now waits and keeps serving.
 
+### Fixed: a relayed connection closes when idle, not after two minutes
+
+The relay's 120 s idle window capped every forwarded connection's whole life, so a websocket
+through the inbound forward that heartbeated every 25 s was cut between 125 s and 150 s, and a
+stream carrying bytes one way was cut once the quiet direction's read timed out. The window
+now restarts on traffic in either direction; a connection with no bytes either way for the
+window still closes at both ends.
+
 ### Fixed: a refused inbound forward is no longer an egress warning
 
 A connection to a sandbox's published port while its application does not listen logged
