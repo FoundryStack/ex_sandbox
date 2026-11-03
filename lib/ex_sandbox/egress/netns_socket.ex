@@ -32,14 +32,15 @@ defmodule ExSandbox.Egress.NetnsSocket do
   exists to replace, and it would read as a working enforcement point while
   enforcing nothing.
 
-  ## ⚠️ Whoever adopts a descriptor closes it
+  ## ⚠️ A descriptor lives exactly as long as its port
 
   `:gen_tcp` and `:gen_udp` treat a socket adopted with `{:fd, fd}` as borrowed:
-  closing it, a refused connect, a peer's EOF and the owner's exit all release
-  the port and leave the descriptor open. `:erlang.ports/0` stays flat while the
-  process runs out of descriptors, and the kernel socket stays up with no FIN
-  sent. So an adopted socket goes through `close/1`, and a descriptor whose
-  adoption failed goes through `release/1`.
+  closing it, a refused connect, a peer's EOF and the owner's exit, `:kill`
+  included, all release the port and leave the descriptor open. `:erlang.ports/0`
+  stays flat while the process runs out of descriptors, and the kernel socket
+  stays up with no FIN sent. So every descriptor here is adopted through
+  `adopt/3`, whose keeper closes it when the port goes down by any of those
+  routes. Cleanup in the owner would miss the one where the owner is killed.
   """
 
   @typedoc "Path to a network namespace, e.g. `/var/run/netns/sandbox-7`."
@@ -129,21 +130,84 @@ defmodule ExSandbox.Egress.NetnsSocket do
   end
 
   @doc """
-  Closes a socket adopted from this module, port and descriptor both.
+  Opens a descriptor with `open`, adopts it with `adopt`, and hands the socket
+  to the caller.
 
-  Only for an adopted socket. An ordinary socket's port closes its own
-  descriptor, so a second close here would hit whatever now has that number.
+  `open` is one of `listen/2`, `socket/2` or `udp/2` behind a closure, and
+  `adopt` is the `module` call that takes the descriptor, such as
+  `&:gen_tcp.connect(address, port, [{:fd, &1}], timeout)`. Both run in a keeper
+  process, which owns the descriptor from the moment it exists and closes it
+  once the socket's port goes down. The caller owns the port and closes it the
+  ordinary way. A failed adoption returns `{:error, {:adopt, reason}}` with the
+  descriptor already closed.
   """
-  @spec close(:gen_tcp.socket() | :gen_udp.socket()) :: :ok | {:error, atom(), integer()}
-  def close(socket) do
-    {:ok, fd} = :inet.getfd(socket)
-    :ok = :inet.close(socket)
-    release(fd)
+  @spec adopt(
+          (-> {:ok, non_neg_integer()} | failure()),
+          :gen_tcp | :gen_udp,
+          (non_neg_integer() -> {:ok, socket} | {:error, term()})
+        ) :: {:ok, socket} | failure() | {:error, {:adopt, term()}}
+        when socket: :gen_tcp.socket() | :gen_udp.socket()
+  def adopt(open, module, adopt), do: adopt(open, module, adopt, &netns_close/1)
+
+  @doc false
+  # `release` is a parameter so `adopted_descriptor_test.exs` can run the keeper
+  # where the NIF does not load.
+  def adopt(open, module, adopt, release) do
+    caller = self()
+    reply = make_ref()
+
+    {_keeper, keeper_down} =
+      spawn_monitor(fn -> keep(caller, reply, open, module, adopt, release) end)
+
+    receive do
+      {^reply, result} ->
+        Process.demonitor(keeper_down, [:flush])
+        result
+
+      {:DOWN, ^keeper_down, :process, _keeper, reason} ->
+        exit(reason)
+    end
   end
 
-  @doc "Closes a descriptor from this module that no port holds."
-  @spec release(non_neg_integer()) :: :ok | {:error, atom(), integer()}
-  def release(fd) when is_integer(fd), do: netns_close(fd)
+  # ⚠️ The keeper adopts, and the caller only receives a socket that is already
+  # watched. Adopting in the caller and handing the keeper the descriptor after
+  # would leave a window, as long as a connect's timeout, in which killing the
+  # caller leaks it. The keeper is unlinked, so a kill does not reach it.
+  #
+  # The release waits for the port's `DOWN`, not the caller's, so it never runs
+  # while the port could still be using the descriptor. Nothing else closes
+  # one, so `release` runs exactly once, on one of two routes: the port going
+  # down, or an adoption that never made a port.
+  defp keep(caller, reply, open, module, adopt, release) do
+    case open.() do
+      {:ok, fd} -> keep_open(fd, adopt.(fd), caller, reply, module, release)
+      failure -> send(caller, {reply, failure})
+    end
+  end
+
+  defp keep_open(fd, {:ok, socket}, caller, reply, module, release) do
+    port_down = :erlang.monitor(:port, socket)
+
+    # Fails only when the caller is already gone, and then this process still
+    # owns the port and closes it.
+    case module.controlling_process(socket, caller) do
+      :ok ->
+        send(caller, {reply, {:ok, socket}})
+
+      {:error, reason} ->
+        module.close(socket)
+        send(caller, {reply, {:error, {:adopt, reason}}})
+    end
+
+    receive do
+      {:DOWN, ^port_down, :port, _socket, _reason} -> release.(fd)
+    end
+  end
+
+  defp keep_open(fd, {:error, reason}, caller, reply, _module, release) do
+    release.(fd)
+    send(caller, {reply, {:error, {:adopt, reason}}})
+  end
 
   # The NIF entry points. `ERL_NIF_INIT` replaces both at load time; these
   # bodies run only if something called them with the NIF absent, which

@@ -514,16 +514,15 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     # still holding the dead netns open, so a destroy that forgot it leaked both.
     #
     # The acceptor is now a process on this node, so reclamation is
-    # `GenServer.stop/3` and the listening socket is closed by `terminate/2`.
-    # There is no OS process to outlive anything, but the listener's descriptor
-    # is adopted, so the runtime does not close it when its owner dies:
-    # `terminate/2` is the only close it gets.
+    # `GenServer.stop/3`. There is no OS process to outlive anything, and the
+    # adopted listener and resolver descriptors are closed by their keepers in
+    # `NetnsSocket.adopt/3` once the acceptor's exit takes their ports down.
     if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     :ok
   catch
-    # Already gone, or did not stop in time. An acceptor that died without
-    # running `terminate/2` keeps its adopted descriptors, and logging that beats
-    # raising out of a destroy that has released everything else.
+    # Already gone, or did not stop in time. Whenever it exits, its descriptors
+    # go with its ports, and logging beats raising out of a destroy that has
+    # released everything else.
     :exit, reason ->
       Logger.warning("egress: could not stop acceptor #{inspect(pid)} (#{inspect(reason)})")
       :ok

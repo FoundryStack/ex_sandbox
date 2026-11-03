@@ -18,7 +18,8 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
   It holds a descriptor for a socket inside the sandbox's namespace rather than
   living in that namespace itself, so there is no OS process left to outlive
   anything. The descriptor is adopted, so the runtime does not close it when the
-  process dies; `terminate/2` does (`adopted_descriptor_test.exs`).
+  process dies; the keeper `NetnsSocket.adopt/3` starts does
+  (`adopted_descriptor_test.exs`).
 
   What is NOT gone is the wiring question. `destroy/1` must still stop it, and
   the four defects this file was written against were all correct code that

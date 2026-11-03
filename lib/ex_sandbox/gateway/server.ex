@@ -82,7 +82,8 @@ defmodule ExSandbox.Gateway.Server do
       # (`init/1` runs `id` through a port), so on `:emfile` it fails until the
       # restart intensity shuts down the application and every sandbox it owns.
       {:error, reason} ->
-        accept_loop(server, state, AcceptBackoff.wait("ex_sandbox gateway", reason, failures))
+        failures = AcceptBackoff.wait("ex_sandbox gateway accept", reason, failures)
+        accept_loop(server, state, failures)
     end
   end
 

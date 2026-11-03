@@ -12,14 +12,15 @@ its tests do, under the same compatibility promise as the client.
 A socket adopted with `{:fd, fd}` keeps its descriptor when it closes, so every inbound forward
 left one behind, refused or relayed, and a relayed connection never reached the tenant as a close.
 A liveness check once a minute took the gateway to its 1024 soft limit in about a day. Each stopped
-acceptor also left its listener and resolver sockets. `NetnsSocket.close/1` and `release/1` now
-close them.
+acceptor also left its listener and resolver sockets. Each adopted descriptor now belongs to a
+process that closes it once its socket closes, on every route, including a relay or an acceptor
+killed before its own cleanup runs.
 
 ### Fixed: an `:emfile` from accept no longer floods the log or stops the gateway
 
-A failing accept retried with no delay. It now waits from 100 ms up to 30 s. The gateway's accept
-exited on any error, and on `:emfile` the restart failed too, which shut down the application and
-the node. It now waits and keeps serving.
+A failing accept retried with no delay, and so did a failing receive on the resolver socket. Both
+now wait from 100 ms up to 30 s. The gateway's accept exited on any error, and on `:emfile` the
+restart failed too, which shut down the application and the node. It now waits and keeps serving.
 
 ### Fixed: a refused inbound forward is no longer an egress warning
 

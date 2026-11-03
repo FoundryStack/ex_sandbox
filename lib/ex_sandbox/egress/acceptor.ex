@@ -162,9 +162,20 @@ defmodule ExSandbox.Egress.Acceptor do
   end
 
   defp open_listener(state) do
-    case NetnsSocket.listen(state.netns, state.port) do
-      {:ok, fd} ->
-        adopt(fd, state)
+    open = fn -> NetnsSocket.listen(state.netns, state.port) end
+
+    # The port argument is ignored when `{:fd, _}` is given -- the bind already
+    # happened inside the namespace. `active: false` for the same reason the
+    # relay uses blocking `recv`: the sandbox controls when it reads, so
+    # anything else lets it make this node buffer on its behalf without bound.
+    listen = &:gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}, {:fd, &1}])
+
+    case NetnsSocket.adopt(open, :gen_tcp, listen) do
+      {:ok, listener} ->
+        open_forwards(%{state | listener: listener})
+
+      {:error, {:adopt, reason}} ->
+        {:stop, {:listen_failed, {:adopt, reason}}}
 
       # ⚠️ Stopped, not degraded. There is deliberately no path here that binds
       # the host namespace instead: that listener would come up, be supervised,
@@ -176,21 +187,6 @@ defmodule ExSandbox.Egress.Acceptor do
 
       {:error, stage, errno} ->
         {:stop, {:listen_failed, {stage, errno}}}
-    end
-  end
-
-  defp adopt(fd, state) do
-    # The port argument is ignored when `{:fd, _}` is given -- the bind already
-    # happened inside the namespace. `active: false` for the same reason the
-    # relay uses blocking `recv`: the sandbox controls when it reads, so
-    # anything else lets it make this node buffer on its behalf without bound.
-    case :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}, {:fd, fd}]) do
-      {:ok, listener} ->
-        open_forwards(%{state | listener: listener})
-
-      {:error, reason} ->
-        _ = NetnsSocket.release(fd)
-        {:stop, {:listen_failed, {:adopt, reason}}}
     end
   end
 
@@ -236,22 +232,17 @@ defmodule ExSandbox.Egress.Acceptor do
     # launch. No resolver means names do not resolve, which the tenant sees
     # immediately as a failure of its own request. One is a silent hole in the
     # boundary; the other is a loud missing feature.
-    case NetnsSocket.udp(state.netns, port) do
-      {:ok, fd} ->
-        case :gen_udp.open(0, [:binary, {:active, false}, {:fd, fd}]) do
-          {:ok, socket} ->
-            Task.start_link(fn -> resolver_loop(socket, state) end)
-            %{state | resolver_socket: socket}
+    open = fn -> NetnsSocket.udp(state.netns, port) end
+    adopt = &:gen_udp.open(0, [:binary, {:active, false}, {:fd, &1}])
 
-          {:error, reason} ->
-            _ = NetnsSocket.release(fd)
+    case NetnsSocket.adopt(open, :gen_udp, adopt) do
+      {:ok, socket} ->
+        Task.start_link(fn -> resolver_loop(socket, state) end)
+        %{state | resolver_socket: socket}
 
-            Logger.error(
-              "egress acceptor could not adopt the resolver socket: #{inspect(reason)}"
-            )
-
-            state
-        end
+      {:error, {:adopt, reason}} ->
+        Logger.error("egress acceptor could not adopt the resolver socket: #{inspect(reason)}")
+        state
 
       other ->
         Logger.error("egress acceptor could not bind the resolver socket: #{inspect(other)}")
@@ -259,7 +250,7 @@ defmodule ExSandbox.Egress.Acceptor do
     end
   end
 
-  defp resolver_loop(socket, state) do
+  defp resolver_loop(socket, state, failures \\ 0) do
     case :gen_udp.recv(socket, 0) do
       {:ok, {address, port, query}} ->
         # ⚠️ An ordinary call to the running resolver. This used to be a
@@ -285,13 +276,13 @@ defmodule ExSandbox.Egress.Acceptor do
         :ok
 
       {:error, reason} ->
-        Logger.warning("egress acceptor resolver recv failed: #{inspect(reason)}")
-        resolver_loop(socket, state)
+        failures = AcceptBackoff.wait("egress acceptor resolver recv", reason, failures)
+        resolver_loop(socket, state, failures)
     end
   end
 
   defp forward_loop(socket, ns_port, netns) do
-    serve(socket, "egress forward", fn conn ->
+    serve(socket, "egress forward accept", fn conn ->
       Relay.splice(conn, {{127, 0, 0, 1}, ns_port}, netns: netns, inbound: true)
     end)
   end
@@ -309,7 +300,7 @@ defmodule ExSandbox.Egress.Acceptor do
   # the sandbox useless.
   @spec accept_loop(map()) :: :ok
   def accept_loop(state) do
-    serve(state.listener, "egress acceptor", &handle_connection(&1, state))
+    serve(state.listener, "egress acceptor accept", &handle_connection(&1, state))
   end
 
   defp serve(listener, what, handler, failures \\ 0) do
@@ -460,8 +451,8 @@ defmodule ExSandbox.Egress.Acceptor do
   end
 
   defp close_all(state) do
-    if state[:listener], do: NetnsSocket.close(state.listener)
-    if state[:resolver_socket], do: NetnsSocket.close(state.resolver_socket)
+    if state[:listener], do: :gen_tcp.close(state.listener)
+    if state[:resolver_socket], do: :gen_udp.close(state.resolver_socket)
     for {socket, _ns_port} <- Map.get(state, :forwards, []), do: :gen_tcp.close(socket)
     :ok
   end
