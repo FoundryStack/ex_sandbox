@@ -2,8 +2,8 @@ defmodule ExSandbox.Egress.AdoptedDescriptorTest do
   @moduledoc """
   A socket adopted with `{:fd, fd}` keeps its descriptor when it is closed.
 
-  `inet_drv.c` marks such a socket `prebound` and `erl_inet_close/1` then skips
-  the real close, on every route: `:gen_tcp.close/1`, a refused connect, a peer's
+  OTP's inet driver (inet_drv.c, outside this tree) marks such a socket
+  `prebound` and `erl_inet_close/1` then skips the real close, on every route: `:gen_tcp.close/1`, a refused connect, a peer's
   EOF, the owner's exit. `:erlang.ports/0` therefore stays flat while
   `/proc/self/fd` climbs, so this file counts descriptors and not ports.
 

@@ -30,7 +30,8 @@ and the egress warning means an outbound destination again.
 
 ### Fixed: a gateway reply the client cannot read no longer vanishes
 
-Gateway protocol version 2 carries every result after `hello` as `Protocol.opaque/1`. A client
+Gateway protocol version 2 carries every result after `hello` as
+`ExSandbox.Gateway.Protocol.opaque/1`. A client
 that had not loaded the module naming an atom in a result (a release `eval`, which loads
 modules lazily) refused the whole frame under `[:safe]` and dropped it, so the caller waited out
 its full timeout with nothing logged. A version 1 peer still gets plain results. The client now
