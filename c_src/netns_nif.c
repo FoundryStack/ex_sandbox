@@ -223,10 +223,36 @@ static ERL_NIF_TERM netns_udp(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
   return run(env, argc, argv, udp_worker);
 }
 
+/*
+ * Closes a descriptor one of the workers above returned.
+ *
+ * inet_drv.c marks a socket adopted with `{:fd, Fd}` as `prebound` and never
+ * closes its descriptor, on any route, assuming it came from an external wrapper
+ * program. Here it came from this file, so the close is this file's too.
+ *
+ * On a normal scheduler: these sockets are non-blocking and set no SO_LINGER, so
+ * close(2) returns at once.
+ */
+static ERL_NIF_TERM netns_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+  int fd;
+
+  if (argc != 1 || !enif_get_int(env, argv[0], &fd) || fd < 0)
+    return enif_make_badarg(env);
+
+  if (close(fd) != 0)
+    return enif_make_tuple3(env,
+      enif_make_atom(env, "error"),
+      enif_make_atom(env, "close"),
+      enif_make_int(env, errno));
+
+  return enif_make_atom(env, "ok");
+}
+
 static ErlNifFunc funcs[] = {
   {"netns_listen", 2, netns_listen, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"netns_socket", 2, netns_socket, ERL_NIF_DIRTY_JOB_IO_BOUND},
-  {"netns_udp", 2, netns_udp, ERL_NIF_DIRTY_JOB_IO_BOUND}
+  {"netns_udp", 2, netns_udp, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"netns_close", 1, netns_close, 0}
 };
 
 ERL_NIF_INIT(Elixir.ExSandbox.Egress.NetnsSocket, funcs, NULL, NULL, NULL, NULL)

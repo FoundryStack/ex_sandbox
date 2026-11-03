@@ -83,6 +83,8 @@ defmodule ExSandbox.Egress.Relay do
           Keyword.get(opts, :idle_timeout_ms, @idle_timeout_ms)
         )
 
+        close_upstream(destination_socket, netns)
+
       {:error, reason} ->
         # ⚠️ Closed, not left open. `decide/3` permitted this destination, so
         # this is not a policy denial -- but the sandbox must still see a
@@ -172,7 +174,14 @@ defmodule ExSandbox.Egress.Relay do
   defp upstream_connect(address, port, netns, timeout) when is_binary(netns) do
     case NetnsSocket.socket(netns, upstream_mark()) do
       {:ok, fd} ->
-        :gen_tcp.connect(address, port, [:binary, {:active, false}, {:fd, fd}], timeout)
+        case :gen_tcp.connect(address, port, [:binary, {:active, false}, {:fd, fd}], timeout) do
+          {:ok, socket} ->
+            {:ok, socket}
+
+          {:error, _reason} = refused ->
+            _ = NetnsSocket.release(fd)
+            refused
+        end
 
       {:error, :unsupported} ->
         {:error, :netns_sockets_unavailable}
@@ -187,6 +196,13 @@ defmodule ExSandbox.Egress.Relay do
   # namespace holds only loopback, so nothing reaches out from inside it.
   defp upstream_connect(address, port, nil, timeout) do
     :gen_tcp.connect(address, port, [:binary, {:active, false}], timeout)
+  end
+
+  defp close_upstream(socket, nil), do: :gen_tcp.close(socket)
+
+  defp close_upstream(socket, netns) when is_binary(netns) do
+    _ = NetnsSocket.close(socket)
+    :ok
   end
 
   # Both directions are driven by two processes over blocking `recv`, rather
@@ -222,7 +238,6 @@ defmodule ExSandbox.Egress.Relay do
     Process.exit(inbound, :kill)
 
     :gen_tcp.close(sandbox_socket)
-    :gen_tcp.close(destination_socket)
 
     :ok
   end

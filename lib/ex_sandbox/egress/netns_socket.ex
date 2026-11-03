@@ -31,6 +31,15 @@ defmodule ExSandbox.Egress.NetnsSocket do
   listener that binds the host instead is precisely the silent no-op this module
   exists to replace, and it would read as a working enforcement point while
   enforcing nothing.
+
+  ## ⚠️ Whoever adopts a descriptor closes it
+
+  `:gen_tcp` and `:gen_udp` treat a socket adopted with `{:fd, fd}` as borrowed:
+  closing it, a refused connect, a peer's EOF and the owner's exit all release
+  the port and leave the descriptor open. `:erlang.ports/0` stays flat while the
+  process runs out of descriptors, and the kernel socket stays up with no FIN
+  sent. So an adopted socket goes through `close/1`, and a descriptor whose
+  adoption failed goes through `release/1`.
   """
 
   @typedoc "Path to a network namespace, e.g. `/var/run/netns/sandbox-7`."
@@ -119,6 +128,23 @@ defmodule ExSandbox.Egress.NetnsSocket do
     if available?(), do: netns_socket(netns, mark), else: {:error, :unsupported}
   end
 
+  @doc """
+  Closes a socket adopted from this module, port and descriptor both.
+
+  Only for an adopted socket. An ordinary socket's port closes its own
+  descriptor, so a second close here would hit whatever now has that number.
+  """
+  @spec close(:gen_tcp.socket() | :gen_udp.socket()) :: :ok | {:error, atom(), integer()}
+  def close(socket) do
+    {:ok, fd} = :inet.getfd(socket)
+    :ok = :inet.close(socket)
+    release(fd)
+  end
+
+  @doc "Closes a descriptor from this module that no port holds."
+  @spec release(non_neg_integer()) :: :ok | {:error, atom(), integer()}
+  def release(fd) when is_integer(fd), do: netns_close(fd)
+
   # The NIF entry points. `ERL_NIF_INIT` replaces both at load time; these
   # bodies run only if something called them with the NIF absent, which
   # `listen/2` and `socket/2` prevent. They raise rather than return a value so
@@ -132,4 +158,7 @@ defmodule ExSandbox.Egress.NetnsSocket do
 
   @doc false
   def netns_udp(_netns, _port), do: :erlang.nif_error(:netns_nif_not_loaded)
+
+  @doc false
+  def netns_close(_fd), do: :erlang.nif_error(:netns_nif_not_loaded)
 end

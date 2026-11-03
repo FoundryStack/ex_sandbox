@@ -8,6 +8,7 @@ defmodule ExSandbox.Gateway.Server do
 
   require Logger
 
+  alias ExSandbox.AcceptBackoff
   alias ExSandbox.Gateway.AllowlistStore
   alias ExSandbox.Gateway.ContextFuns
   alias ExSandbox.Gateway.PeerCred
@@ -60,7 +61,7 @@ defmodule ExSandbox.Gateway.Server do
     :ok
   end
 
-  defp accept_loop(server, state) do
+  defp accept_loop(server, state, failures \\ 0) do
     case :gen_tcp.accept(state.listen) do
       {:ok, socket} ->
         {:ok, pid} =
@@ -74,8 +75,14 @@ defmodule ExSandbox.Gateway.Server do
         send(pid, :go)
         accept_loop(server, state)
 
+      {:error, :closed} ->
+        exit({:accept_failed, :closed})
+
+      # Waits rather than exits. A restart needs descriptors this VM does not have
+      # (`init/1` runs `id` through a port), so on `:emfile` it fails until the
+      # restart intensity shuts down the application and every sandbox it owns.
       {:error, reason} ->
-        exit({:accept_failed, reason})
+        accept_loop(server, state, AcceptBackoff.wait("ex_sandbox gateway", reason, failures))
     end
   end
 

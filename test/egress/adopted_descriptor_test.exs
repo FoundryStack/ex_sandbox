@@ -102,6 +102,27 @@ defmodule ExSandbox.Egress.AdoptedDescriptorTest do
       GenServer.stop(acceptor)
     end
 
+    test "a connection the tenant closes first gives its descriptor back too",
+         %{host_port: host_port} do
+      {:ok, tenant} = :gen_tcp.listen(0, [:binary, active: false, ip: @loopback])
+      {:ok, ns_port} = :inet.port(tenant)
+      {:ok, acceptor} = start_acceptor(forward: [{host_port, ns_port}])
+
+      before = descriptors()
+
+      for _ <- 1..@connections do
+        {:ok, client} = :gen_tcp.connect(@loopback, host_port, [:binary, active: false])
+        {:ok, server} = :gen_tcp.accept(tenant, 5_000)
+
+        :ok = :gen_tcp.close(server)
+        assert :gen_tcp.recv(client, 0, 2_000) == {:error, :closed}
+        :ok = :gen_tcp.close(client)
+      end
+
+      assert_flat(before, "after #{@connections} forwards the tenant closed")
+      GenServer.stop(acceptor)
+    end
+
     test "stopping the acceptor gives back its listener and resolver descriptors" do
       before = descriptors()
 

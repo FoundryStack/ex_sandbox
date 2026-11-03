@@ -56,19 +56,23 @@ defmodule ExSandbox.Gateway.AcceptEmfileTest do
     hog = :peer.call(peer, DescriptorHog, :start, [])
     Process.sleep(500)
 
-    {:ok, client} =
-      :gen_tcp.connect({:local, path}, 0, [:binary, packet: 4, active: false], 1_000)
+    {:ok, _refused} = connect(path)
 
     Process.sleep(1_000)
     assert server_pid(peer) == server
 
     :peer.call(peer, :erlang, :send, [hog, :release])
 
+    # A fresh connection: Linux keeps the first one queued, macOS drops it.
+    {:ok, client} = connect(path)
     hello = {:request, 1, :hello, %{versions: Protocol.versions()}}
     :ok = :gen_tcp.send(client, Protocol.encode(hello))
     assert {:ok, frame} = :gen_tcp.recv(client, 0, 10_000)
     assert {:ok, {:reply, 1, {:ok, %{version: _}}}} = Protocol.decode(frame)
   end
+
+  defp connect(path),
+    do: :gen_tcp.connect({:local, path}, 0, [:binary, packet: 4, active: false], 1_000)
 
   defp server_pid(peer) do
     peer

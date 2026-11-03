@@ -515,15 +515,15 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     #
     # The acceptor is now a process on this node, so reclamation is
     # `GenServer.stop/3` and the listening socket is closed by `terminate/2`.
-    # The leak that measurement found is no longer expressible: there is no OS
-    # process to outlive anything, and a descriptor held by a dead BEAM process
-    # is closed by the runtime.
+    # There is no OS process to outlive anything, but the listener's descriptor
+    # is adopted, so the runtime does not close it when its owner dies:
+    # `terminate/2` is the only close it gets.
     if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     :ok
   catch
-    # Already gone, or did not stop in time. Either way the descriptor is
-    # released by the runtime, and saying so beats raising out of a destroy that
-    # has released everything else.
+    # Already gone, or did not stop in time. An acceptor that died without
+    # running `terminate/2` keeps its adopted descriptors, and logging that beats
+    # raising out of a destroy that has released everything else.
     :exit, reason ->
       Logger.warning("egress: could not stop acceptor #{inspect(pid)} (#{inspect(reason)})")
       :ok
