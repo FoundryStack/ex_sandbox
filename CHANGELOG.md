@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed: a sandbox node starts under UTF-8
+
+The hardened launch sets `LANG=C.UTF-8` ahead of the granted pairs, so a granted `LANG`
+still wins. Elixir no longer warns about a latin1 name encoding on each launch.
+
 ### Changed: `ExSandbox.Gateway` is public
 
 The gateway server is listed in `priv/boundary.md`, so a host may start it in its own VM, as
