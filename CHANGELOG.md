@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed: a sandbox node starts under UTF-8
+
+The hardened launch sets `LANG=C.UTF-8` ahead of the granted pairs, so a granted `LANG`
+still wins. Elixir no longer warns about a latin1 name encoding on each launch.
+
 ### Changed: Docker lists only its owner's containers
 
 `ExSandbox.Mechanism.Docker` labels each container `ex_sandbox.owner=<owner>`, from

@@ -878,9 +878,13 @@ defmodule ExSandbox.Hardening.Linux do
     # other sandbox can reach. A shared HOME would put every sandbox's cookie in
     # one directory -- handing tenant code the credential `FR-003` relies on.
     #
-    # Neither is a hole in the allowlist. Both are entries in it: an allowlist
+    # LANG is a default, set before the granted pairs so a granted LANG wins.
+    # Without it Elixir starts under latin1 and warns on every launch.
+    #
+    # None is a hole in the allowlist. Each is an entry in it: an allowlist
     # with nothing in it does not boot, and the question is only what goes in.
-    ["env", "-i" | pairs] ++ ["BINDIR=#{bindir()}", "HOME=#{storage_path(sandbox)}"]
+    ["env", "-i", "LANG=C.UTF-8" | pairs] ++
+      ["BINDIR=#{bindir()}", "HOME=#{storage_path(sandbox)}"]
   end
 
   # -- Guards ---------------------------------------------------------------

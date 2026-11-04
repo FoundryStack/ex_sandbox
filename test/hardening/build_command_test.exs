@@ -70,6 +70,16 @@ defmodule ExSandbox.Hardening.BuildCommandTest do
       assert "LANG=C.UTF-8" in args
     end
 
+    test "LANG defaults to UTF-8 and a granted LANG overrides it" do
+      assert "LANG=C.UTF-8" in built_args(sandbox(), [])
+
+      args = built_args(sandbox(), [{"LANG", "en_US.UTF-8"}])
+      langs = Enum.filter(args, &String.starts_with?(&1, "LANG="))
+
+      assert List.last(langs) == "LANG=en_US.UTF-8",
+             "a granted LANG must come after the default so `env` keeps it"
+    end
+
     test "BINDIR is always present" do
       # Without it the runtime cannot locate `erlexec` and the node never boots
       # (peer.erl:1214-1221). A fully empty environment is not a valid sandbox.
