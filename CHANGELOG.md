@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed: Docker lists only its owner's containers
+
+`ExSandbox.Mechanism.Docker` labels each container `ex_sandbox.owner=<owner>`, from
+`config :ex_sandbox, :docker, owner:` (`"default"` unset), and `list_running/0` reports only
+that owner's. Two hosts on one daemon no longer reconcile, and terminate, each other's
+sandboxes. A container created before this release carries no owner and is not listed.
+
+### Added: `ExSandbox.Sandbox.listed`
+
+`listed: false` keeps a sandbox out of `list_running/0` under Docker and Beam, for a caller
+that destroys its own sandbox and records it nowhere. Default `true`.
+
 ## 1.10.0 — 2026-10-27
 
 ### Added: a sandbox VM sized to its CPU limit

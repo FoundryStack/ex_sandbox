@@ -78,6 +78,11 @@ defmodule ExSandbox.Mechanism.Docker do
   @mechanism_label "ex_sandbox.mechanism=docker"
   @id_label "ex_sandbox.sandbox_id"
 
+  # Which host created the container, so `list_running/0` reports only that
+  # host's: two hosts on one daemon each reconcile against their own records,
+  # and a container one of them never recorded is not the other's orphan.
+  @owner_label "ex_sandbox.owner"
+
   @default_image "alpine:3"
 
   # PID 1 has to outlive `provision/1` or there is nothing to `docker exec`
@@ -332,18 +337,7 @@ defmodule ExSandbox.Mechanism.Docker do
     # Prefix-matching in the host is not the fix. The host would be reimplementing
     # a mechanism's id format, which is the coupling `FR-004` forbids, and a
     # 12-character prefix is only unique until it is not.
-    args = [
-      "ps",
-      "--no-trunc",
-      "--filter",
-      "label=#{@mechanism_label}",
-      "--filter",
-      "status=running",
-      "--format",
-      "{{.ID}}"
-    ]
-
-    case docker(args) do
+    case docker(list_args()) do
       {:ok, output} -> {:ok, output |> String.split("\n", trim: true) |> Enum.map(&String.trim/1)}
       {:error, reason} -> {:error, reason}
     end
@@ -650,12 +644,39 @@ defmodule ExSandbox.Mechanism.Docker do
       "--label",
       "#{@id_label}=#{sandbox.id}"
     ] ++
+      owner_args(sandbox) ++
       limit_args(sandbox) ++
       network_args(sandbox) ++
       workspace_args(sandbox.workspace_path) ++
       user_args(sandbox.user) ++
       [image(sandbox) | @keepalive]
   end
+
+  @doc false
+  def list_args do
+    [
+      "ps",
+      "--no-trunc",
+      "--filter",
+      "label=#{@mechanism_label}",
+      "--filter",
+      "label=#{@owner_label}=#{owner()}",
+      "--filter",
+      "status=running",
+      "--format",
+      "{{.ID}}"
+    ]
+  end
+
+  @doc """
+  The owner stamped on every listed container and filtered on by
+  `list_running/0`: `config :ex_sandbox, :docker, owner:`, or `"default"`.
+  """
+  @spec owner() :: String.t()
+  def owner, do: Keyword.get(Application.get_env(:ex_sandbox, :docker, []), :owner, "default")
+
+  defp owner_args(%Sandbox{listed: false}), do: []
+  defp owner_args(%Sandbox{}), do: ["--label", "#{@owner_label}=#{owner()}"]
 
   # ⚠️ `:disk_quota_mb` is deliberately not translated. See the moduledoc: on
   # this host `--storage-opt size` is accepted and ignored, and passing a flag
