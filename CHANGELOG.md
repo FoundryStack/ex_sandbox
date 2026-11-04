@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed: a sandbox crosses the gateway socket as a versioned map
+
+Gateway wire version 3. `ExSandbox.Gateway.Wire` writes a sandbox as a string-keyed map and
+reads one back, ignoring a key it does not know and giving a missing key the struct's default,
+so a field added to `ExSandbox.Sandbox` no longer needs the gateway and the product deployed in
+one step. The gateway speaks 3 and 2 (version 1 is dropped) and rebuilds a version 2 peer's
+struct with the fields it lacked at their defaults. The client offers 3 alone; against a
+gateway that does not speak it, every request answers
+`{:error, {:gateway_version, %{client: 3, gateway: [2, 1]}}}` at once and one log line names
+both sides, instead of `:bad_frame`, a timeout or a raised `KeyError`.
+
 ### Fixed: a sandbox node starts under UTF-8
 
 The hardened launch sets `LANG=C.UTF-8` ahead of the granted pairs, so a granted `LANG`

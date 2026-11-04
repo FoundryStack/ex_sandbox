@@ -6,7 +6,11 @@ defmodule ExSandbox.Mechanism.Gateway do
   One client process holds the connection, reconnects when it drops, and
   sends `hello` before anything else. A request made while no gateway is
   connected waits up to `:connect_wait_ms` (default 30 s) for one, then
-  answers `{:error, :host_unreachable}`.
+  answers `{:error, :host_unreachable}`. A gateway that does not speak
+  `ExSandbox.Gateway.Protocol.client_version/0` answers every request at
+  once with `{:error, {:gateway_version, %{client: 3, gateway: [2, 1]}}}`,
+  and the client keeps reconnecting until the gateway is switched
+  (`hosting/FR-002`).
 
   The consumer starts the client in its own tree (`{ExSandbox.Mechanism.Gateway,
   socket_path: path}`), after whatever `:on_hello` needs. `:on_hello` is `{module, function, args}`, run in a
@@ -168,6 +172,7 @@ defmodule ExSandbox.Mechanism.Gateway do
       config_keys: Keyword.get(opts, :config_keys, [:beam, :egress]),
       socket: nil,
       ready?: false,
+      refused_by: nil,
       next_id: 1,
       pending: %{},
       waiting: []
@@ -182,6 +187,11 @@ defmodule ExSandbox.Mechanism.Gateway do
   @impl GenServer
   def handle_call({:request, verb, args, _wait}, from, %{ready?: true} = state) do
     {:noreply, send_request(state, verb, args, from)}
+  end
+
+  def handle_call({:request, _verb, _args, _wait}, _from, %{refused_by: versions} = state)
+      when is_list(versions) do
+    {:reply, version_error(versions), state}
   end
 
   def handle_call({:request, verb, args, wait}, from, state) do
@@ -227,7 +237,7 @@ defmodule ExSandbox.Mechanism.Gateway do
     case :gen_tcp.connect({:local, state.path}, 0, [:binary, packet: 4, active: :once], 5_000) do
       {:ok, socket} ->
         hello = %{
-          versions: Protocol.versions(),
+          versions: [Protocol.client_version()],
           config:
             for key <- state.config_keys do
               entries = Application.get_env(:ex_sandbox, key, [])
@@ -276,7 +286,7 @@ defmodule ExSandbox.Mechanism.Gateway do
 
   defp hello_answered(state, {:ok, info}) do
     run_on_hello(state.on_hello, info)
-    state = %{state | ready?: true}
+    state = %{state | ready?: true, refused_by: nil}
 
     Enum.reduce(state.waiting, %{state | waiting: []}, fn {from, verb, args, timer}, acc ->
       Process.cancel_timer(timer)
@@ -284,11 +294,32 @@ defmodule ExSandbox.Mechanism.Gateway do
     end)
   end
 
+  defp hello_answered(state, {:error, {:unsupported_versions, versions}})
+       when is_list(versions) do
+    if versions != state.refused_by do
+      Logger.error(
+        "ex_sandbox gateway: the client speaks #{Protocol.client_version()}, the gateway " <>
+          "speaks #{inspect(versions)}; switch the gateway first (the deploy's gateway step)"
+      )
+    end
+
+    for {from, _verb, _args, timer} <- state.waiting do
+      Process.cancel_timer(timer)
+      GenServer.reply(from, version_error(versions))
+    end
+
+    :gen_tcp.close(state.socket)
+    disconnected(%{state | refused_by: versions, waiting: []})
+  end
+
   defp hello_answered(state, refused) do
     Logger.error("ex_sandbox gateway refused hello: #{inspect(refused)}")
     :gen_tcp.close(state.socket)
     disconnected(state)
   end
+
+  defp version_error(versions),
+    do: {:error, {:gateway_version, %{client: Protocol.client_version(), gateway: versions}}}
 
   defp run_on_hello({module, function, args}, info) do
     Task.start(fn -> apply(module, function, [info | args]) end)

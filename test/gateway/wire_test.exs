@@ -1,13 +1,16 @@
 defmodule ExSandbox.Gateway.WireTest do
   @moduledoc """
   How a sandbox crosses the gateway socket across wire versions
-  (`hosting/FR-002`): the version 3 map at both ends and the version 2 struct
-  an older peer still sends.
+  (`hosting/FR-002`): the version 3 map at both ends, the version 2 struct an
+  older peer still sends, and the named refusal when the gateway speaks
+  neither.
 
   Not async: `ExSandbox.Mechanism.Gateway` is one named process per VM, and
   `ExSandbox.GatewayTest` starts it too.
   """
   use ExUnit.Case, async: false
+
+  import ExUnit.CaptureLog
 
   alias ExSandbox.Gateway.Protocol
   alias ExSandbox.Gateway.Wire
@@ -242,6 +245,32 @@ defmodule ExSandbox.Gateway.WireTest do
   end
 
   describe "the client" do
+    defp refusing_gateway(path, test) do
+      _ = File.rm(path)
+
+      {:ok, listen} =
+        :gen_tcp.listen(0, [:binary, ifaddr: {:local, path}, packet: 4, active: false])
+
+      spawn_link(fn -> refuse_loop(listen, test) end)
+      on_exit(fn -> File.rm(path) end)
+    end
+
+    defp refuse_loop(listen, test) do
+      {:ok, socket} = :gen_tcp.accept(listen)
+      {:ok, frame} = :gen_tcp.recv(socket, 0, 5_000)
+      {:ok, {:request, id, :hello, hello}} = Protocol.decode(frame)
+      send(test, {:hello, hello})
+
+      :ok =
+        :gen_tcp.send(
+          socket,
+          Protocol.encode({:reply, id, {:error, {:unsupported_versions, [2, 1]}}})
+        )
+
+      :gen_tcp.close(socket)
+      refuse_loop(listen, test)
+    end
+
     test "a sandbox set off its defaults arrives at the mechanism as set" do
       path = socket_path()
       start_gateway(path)
@@ -251,6 +280,29 @@ defmodule ExSandbox.Gateway.WireTest do
       assert {:ok, %Sandbox{} = started} = ExSandbox.Mechanism.Gateway.start(sb)
       assert started == sb
       assert RecordingMechanism.received(sb.id) == sb
+    end
+
+    test "a gateway that speaks versions 2 and 1 refuses by name, at once (S3)" do
+      path = socket_path()
+      refusing_gateway(path, self())
+
+      log =
+        capture_log(fn ->
+          start_supervised!({ExSandbox.Mechanism.Gateway, socket_path: path})
+          assert_receive {:hello, %{versions: [3]}}, 5_000
+          Process.sleep(1_200)
+
+          {elapsed_us, result} =
+            :timer.tc(fn -> ExSandbox.Mechanism.Gateway.status(sandbox()) end)
+
+          assert result == {:error, {:gateway_version, %{client: 3, gateway: [2, 1]}}}
+          assert elapsed_us < 5_000_000
+        end)
+
+      assert log =~ "client speaks 3"
+      assert log =~ "gateway speaks [2, 1]"
+      assert log =~ "gateway step"
+      assert length(String.split(log, "gateway speaks [2, 1]")) == 2
     end
   end
 end
