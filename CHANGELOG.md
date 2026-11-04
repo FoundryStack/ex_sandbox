@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.10.0 — 2026-11-04
+## 1.11.0 — 2026-11-04
 
 ### Fixed: a sandbox node starts under UTF-8
 
