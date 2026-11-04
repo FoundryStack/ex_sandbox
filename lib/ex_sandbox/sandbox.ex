@@ -37,6 +37,7 @@ defmodule ExSandbox.Sandbox do
           service_port: :inet.port_number() | nil,
           extra_service_ports: [:inet.port_number()],
           user: String.t() | nil,
+          listed: boolean(),
           context: term()
         }
 
@@ -115,6 +116,11 @@ defmodule ExSandbox.Sandbox do
     # for Docker, at launch for Beam. A port added to this list afterwards is
     # not published by the running sandbox.
     extra_service_ports: [],
+    # Whether `c:ExSandbox.Mechanism.list_running/0` reports this sandbox, and
+    # so whether a host's reconciliation may claim or terminate it. A caller
+    # that destroys its own sandbox when done and records it nowhere sets
+    # `false`, or the next reconciliation takes it for an orphan.
+    listed: true,
     context: nil
   ]
 end

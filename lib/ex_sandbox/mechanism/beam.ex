@@ -147,7 +147,7 @@ defmodule ExSandbox.Mechanism.Beam do
     # refusal to surface before anything believes the sandbox exists.
     case NodeLauncher.launch(sandbox) do
       {:ok, launched} ->
-        store(sandbox.id, launched)
+        store(sandbox.id, Map.put(launched, :listed, sandbox.listed))
 
         # Announced rather than written: `012-FR-001` forbids this library from
         # referencing a host module, so a host that tracks placements attaches a
@@ -433,7 +433,7 @@ defmodule ExSandbox.Mechanism.Beam do
     ids =
       table()
       |> :ets.tab2list()
-      |> Enum.reject(fn {_id, launched} -> launched[:stopped] end)
+      |> Enum.reject(fn {_id, launched} -> launched[:stopped] or launched[:listed] == false end)
       |> Enum.map(fn {id, _launched} -> id end)
 
     {:ok, ids}
@@ -475,7 +475,7 @@ defmodule ExSandbox.Mechanism.Beam do
   defp relaunch(%Sandbox{} = sandbox, _stopped) do
     case NodeLauncher.launch(sandbox) do
       {:ok, launched} ->
-        store(sandbox.id, launched)
+        store(sandbox.id, Map.put(launched, :listed, sandbox.listed))
         {:ok, %{sandbox | mechanism_ref: sandbox.id, context: context_for(sandbox)}}
 
       {:error, reason} ->
