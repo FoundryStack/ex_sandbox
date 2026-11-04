@@ -5,19 +5,29 @@ defmodule ExSandbox.Gateway.Protocol do
 
   A request is `{:request, id, verb, args}` and its answer
   `{:reply, id, result}`. Replies may arrive in any order; the id pairs them.
-  From version 2 every result after `hello` is `opaque/1`, so a result naming
-  an atom the client has not loaded still reaches its caller.
+  Every result after `hello` is `opaque/1`, so a result naming an atom the
+  client has not loaded still reaches its caller. From version 3 a sandbox
+  crosses as `ExSandbox.Gateway.Wire` writes it (`hosting/FR-002`).
+
+  The client offers `client_version/0` alone; the gateway speaks `versions/0`,
+  its own and the one before, so a gateway is switched before the release
+  that needs it and still serves the release that did not.
   """
 
-  @versions [1, 2]
+  @client_version 3
+  @versions [@client_version, @client_version - 1]
   @verbs [:hello, :start, :stop, :status, :list, :call, :allowlist, :sample]
 
   @type id :: non_neg_integer()
   @type verb :: :hello | :start | :stop | :status | :list | :call | :allowlist | :sample
 
-  @doc "The protocol versions this side speaks, newest first."
+  @doc "The one version a client offers."
+  @spec client_version() :: pos_integer()
+  def client_version, do: @client_version
+
+  @doc "The protocol versions a gateway speaks, newest first."
   @spec versions() :: [pos_integer()]
-  def versions, do: Enum.sort(@versions, :desc)
+  def versions, do: @versions
 
   @doc "The verbs a request may name."
   @spec verbs() :: [verb()]
@@ -54,11 +64,6 @@ defmodule ExSandbox.Gateway.Protocol do
   end
 
   def unwrap(term), do: term
-
-  @doc "A reply's result as `version` carries it."
-  @spec result(pos_integer() | nil, term()) :: term()
-  def result(version, result) when is_integer(version) and version >= 2, do: opaque(result)
-  def result(_version, result), do: result
 
   @doc "Decodes one frame, refusing new atoms and external funs."
   @spec decode(binary()) :: {:ok, term()} | {:error, :bad_frame}

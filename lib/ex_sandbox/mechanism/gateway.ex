@@ -23,6 +23,7 @@ defmodule ExSandbox.Mechanism.Gateway do
 
   alias ExSandbox.Gateway.ContextFuns
   alias ExSandbox.Gateway.Protocol
+  alias ExSandbox.Gateway.Wire
   alias ExSandbox.Sandbox
 
   @connect_wait_ms 30_000
@@ -131,6 +132,7 @@ defmodule ExSandbox.Mechanism.Gateway do
         try do
           client
           |> GenServer.call({:request, verb, outbound(args), wait}, wait + timeout)
+          |> inbound()
           |> ContextFuns.import(&request(:call, &1))
         catch
           :exit, {:timeout, _} -> {:error, :timeout}
@@ -140,10 +142,21 @@ defmodule ExSandbox.Mechanism.Gateway do
   end
 
   defp outbound(args) when is_tuple(args) do
-    args |> Tuple.to_list() |> Enum.map(&ContextFuns.strip/1) |> List.to_tuple()
+    args
+    |> Tuple.to_list()
+    |> Enum.map(&ContextFuns.strip/1)
+    |> List.to_tuple()
+    |> Wire.outbound(Protocol.client_version())
   end
 
   defp outbound(args), do: args
+
+  defp inbound(result) do
+    case Wire.inbound(result) do
+      {:ok, read} -> read
+      {:error, _refusal} = error -> error
+    end
+  end
 
   defp config, do: Application.get_env(:ex_sandbox, :gateway_client, [])
 

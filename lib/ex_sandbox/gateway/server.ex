@@ -13,6 +13,7 @@ defmodule ExSandbox.Gateway.Server do
   alias ExSandbox.Gateway.ContextFuns
   alias ExSandbox.Gateway.PeerCred
   alias ExSandbox.Gateway.Protocol
+  alias ExSandbox.Gateway.Wire
 
   @config_keys [:beam, :egress]
 
@@ -111,7 +112,7 @@ defmodule ExSandbox.Gateway.Server do
         serve(socket, handle_frame(socket, frame, conn))
 
       {:reply, id, result} ->
-        _ = reply(socket, id, Protocol.result(conn.version, result))
+        _ = reply(socket, id, Protocol.opaque(result))
         serve(socket, conn)
 
       {:tcp_closed, ^socket} ->
@@ -202,7 +203,12 @@ defmodule ExSandbox.Gateway.Server do
 
   @doc false
   def run(verb, args, conn) do
-    verb |> dispatch(ContextFuns.restore(args, conn.funs), conn) |> ContextFuns.export(conn.funs)
+    with {:ok, args} <- Wire.inbound(args) do
+      verb
+      |> dispatch(ContextFuns.restore(args, conn.funs), conn)
+      |> ContextFuns.export(conn.funs)
+      |> Wire.outbound(conn.version)
+    end
   rescue
     error -> {:error, {:gateway_raised, Exception.message(error)}}
   catch

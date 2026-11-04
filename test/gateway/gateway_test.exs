@@ -7,6 +7,7 @@ defmodule ExSandbox.GatewayTest do
 
   alias ExSandbox.Gateway.PeerCred
   alias ExSandbox.Gateway.Protocol
+  alias ExSandbox.Gateway.Wire
   alias ExSandbox.Sandbox
 
   defmodule LocalMechanism do
@@ -59,6 +60,8 @@ defmodule ExSandbox.GatewayTest do
       template_ref: "t"
     }
 
+  defp wire, do: Wire.to_wire(sandbox())
+
   defp socket_path, do: "/tmp/exsg-#{System.unique_integer([:positive])}.sock"
 
   defp start_gateway(path, opts \\ []) do
@@ -86,8 +89,8 @@ defmodule ExSandbox.GatewayTest do
   end
 
   defp hello(socket) do
-    send_request(socket, 0, :hello, %{versions: Protocol.versions()})
-    assert {:reply, 0, {:ok, %{version: 2}}} = recv(socket)
+    send_request(socket, 0, :hello, %{versions: [Protocol.client_version()]})
+    assert {:reply, 0, {:ok, %{version: 3}}} = recv(socket)
     socket
   end
 
@@ -102,17 +105,13 @@ defmodule ExSandbox.GatewayTest do
       assert Atom.to_string(Protocol.unwrap(carried)) == name
     end
 
-    test "a version 1 client still gets plain results" do
+    test "a version 2 client is served, a version 1 client is not" do
       path = socket_path()
       start_gateway(path)
       socket = connect(path)
 
       send_request(socket, 0, :hello, %{versions: [1]})
-      assert {:reply, 0, {:ok, %{version: 1}}} = recv(socket)
-
-      send_request(socket, 1, :list, nil)
-      {:ok, frame} = :gen_tcp.recv(socket, 0, 5_000)
-      assert Protocol.decode(frame) == {:ok, {:reply, 1, {:ok, ["local-a"]}}}
+      assert {:reply, 0, {:error, {:unsupported_versions, [3, 2]}}} = recv(socket)
 
       send_request(socket, 0, :hello, %{versions: [2, 1]})
       assert {:reply, 0, {:ok, %{version: 2}}} = recv(socket)
@@ -130,7 +129,7 @@ defmodule ExSandbox.GatewayTest do
       assert recv(socket) == {:reply, 1, {:error, :hello_first}}
 
       send_request(socket, 2, :hello, %{versions: [99]})
-      assert {:reply, 2, {:error, {:unsupported_versions, [2, 1]}}} = recv(socket)
+      assert {:reply, 2, {:error, {:unsupported_versions, [3, 2]}}} = recv(socket)
 
       hello(socket)
       send_request(socket, 3, :list, nil)
@@ -141,7 +140,7 @@ defmodule ExSandbox.GatewayTest do
       path = socket_path()
       start_gateway(path)
       socket = hello(connect(path))
-      sb = sandbox()
+      sb = wire()
 
       for round <- 1..20 do
         requests =
@@ -196,7 +195,7 @@ defmodule ExSandbox.GatewayTest do
       {:opaque, template} = Protocol.opaque({Function, :identity, [String.to_atom(placeholder)]})
       mfa = {:opaque, :binary.replace(template, placeholder, name)}
 
-      send_request(socket, 1, :call, {:call, sandbox(), mfa, 5_000})
+      send_request(socket, 1, :call, {:call, wire(), mfa, 5_000})
       assert {:reply, 1, {:opaque, _} = result} = recv(socket)
       assert Protocol.unwrap(result) == {:ok, String.to_existing_atom(name)}
     end
@@ -221,8 +220,8 @@ defmodule ExSandbox.GatewayTest do
         egress: [Protocol.encode({known, "kept"}), :binary.replace(template, placeholder, name)]
       ]
 
-      send_request(socket, 1, :hello, %{versions: Protocol.versions(), config: config})
-      assert {:reply, 1, {:ok, %{version: 2}}} = recv(socket)
+      send_request(socket, 1, :hello, %{versions: [Protocol.client_version()], config: config})
+      assert {:reply, 1, {:ok, %{version: 3}}} = recv(socket)
       assert Application.get_env(:ex_sandbox, :egress)[known] == "kept"
       assert_raise ArgumentError, fn -> String.to_existing_atom(name) end
     end
@@ -250,8 +249,7 @@ defmodule ExSandbox.GatewayTest do
         socket,
         1,
         :call,
-        {:call, sandbox(), Protocol.opaque({__MODULE__, :notify_after, [200, self(), :done]}),
-         5_000}
+        {:call, wire(), Protocol.opaque({__MODULE__, :notify_after, [200, self(), :done]}), 5_000}
       )
 
       :ok = :gen_tcp.close(socket)
@@ -266,7 +264,7 @@ defmodule ExSandbox.GatewayTest do
       socket = hello(connect(path))
       sb = sandbox()
 
-      send_request(socket, 1, :allowlist, {sb, [{:public, 443}]})
+      send_request(socket, 1, :allowlist, {Wire.to_wire(sb), [{:public, 443}]})
       assert {:reply, 1, {:ok, _}} = recv(socket)
       assert ExSandbox.Gateway.AllowlistStore.get(store, sb.id) == {:ok, [{:public, 443}]}
     end
