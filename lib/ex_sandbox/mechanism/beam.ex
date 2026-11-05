@@ -208,7 +208,13 @@ defmodule ExSandbox.Mechanism.Beam do
   def stop(%Sandbox{} = sandbox) do
     case lookup_sandbox(sandbox) do
       {:ok, launched} ->
-        NodeLauncher.terminate(launched.peer)
+        if launched[:peer], do: NodeLauncher.terminate(launched.peer)
+
+        # ⚠️ The egress is released here, not left for `relaunch/2`: a relaunch
+        # acquires a fresh binding and overwrites the row, so a binding kept
+        # through stop was never returned. Every idle stop and cold start cost
+        # one /30 until the pool refused every launch with `:pool_exhausted`.
+        release_egress(launched)
 
         # ⚠️ The row is **retained**, marked stopped, rather than forgotten.
         # `forget/1` here made stop a destroy: `status/1` answered `:absent`,
@@ -221,7 +227,11 @@ defmodule ExSandbox.Mechanism.Beam do
         # reach this with a struct whose `id` was never stored -- and writing
         # under that id would leave the original row running while creating a
         # second, stopped one for the same sandbox.
-        store(registry_key(sandbox), Map.merge(launched, %{stopped: true, peer: nil}))
+        store(
+          registry_key(sandbox),
+          Map.merge(launched, %{stopped: true, peer: nil, binding: nil, acceptor_pid: nil})
+        )
+
         {:ok, sandbox}
 
       # Idempotent, per `003`: a sandbox that is already not running is in the
@@ -250,17 +260,8 @@ defmodule ExSandbox.Mechanism.Beam do
         # on a host with no egress path, so the absence is ordinary rather than
         # exceptional. `Binding.release/2` is itself idempotent (`003-FR-013`),
         # which is what makes a second destroy safe.
-        if launched[:binding], do: :ok = ExSandbox.Egress.Binding.release(launched.binding)
+        release_egress(launched)
 
-        # ⚠️ The acceptor does NOT die with the namespace it serves, and that is
-        # measured rather than assumed: after `kill -9` on the namespace holder
-        # the acceptor was still alive and `/proc/<acc>/ns/net` still named the
-        # same namespace -- so it was keeping a dead netns open. Without this,
-        # every destroy leaks one process and one namespace, forever.
-        #
-        # Idempotent like `Binding.release/2` (`003-FR-013`): killing a pid that
-        # is already gone is not an error, and a second destroy must be safe.
-        if launched[:acceptor_pid], do: NodeLauncher.stop_acceptor(launched.acceptor_pid)
         # The key the row was found under -- see `stop/1`. Forgetting
         # `sandbox.id` for a ref-resolved struct would terminate the node and
         # leave its row behind, which reconciliation would then see as an orphan
@@ -1439,6 +1440,16 @@ defmodule ExSandbox.Mechanism.Beam do
       :undefined -> :ets.new(@registry, [:named_table, :public, :set])
       tid -> tid
     end
+  end
+
+  # ⚠️ The acceptor does NOT die with the namespace it serves: after `kill -9`
+  # on the namespace holder it was still alive and kept the dead netns open.
+  # Both releases are idempotent (`003-FR-013`), so a second stop or destroy is
+  # safe.
+  defp release_egress(launched) do
+    if launched[:binding], do: :ok = ExSandbox.Egress.Binding.release(launched.binding)
+    if launched[:acceptor_pid], do: NodeLauncher.stop_acceptor(launched.acceptor_pid)
+    :ok
   end
 
   defp store(id, launched), do: :ets.insert(table(), {id, launched})
