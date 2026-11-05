@@ -95,7 +95,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
          # namespace does not exist until `pasta` starts the tenant in it -- so
          # it is closed by failing toward termination instead. See `police/2`.
          {:ok, acceptor_pid} <- police_or_terminate(plan, launched, binding, sandbox),
-         :ok <- verify_or_terminate(launched, sandbox) do
+         :ok <- verify_releasing(launched, sandbox, binding, acceptor_pid) do
       {:ok,
        launched
        |> Map.put(:binding, binding)
@@ -678,6 +678,14 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
   defp via_releasing(exec, exec_via, binding) do
     with {:error, _reason} = error <- via(exec, exec_via) do
+      if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
+      error
+    end
+  end
+
+  defp verify_releasing(launched, sandbox, binding, acceptor_pid) do
+    with {:error, _reason} = error <- verify_or_terminate(launched, sandbox) do
+      stop_acceptor(acceptor_pid)
       if binding, do: :ok = ExSandbox.Egress.Binding.release(binding)
       error
     end
