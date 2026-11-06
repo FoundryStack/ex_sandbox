@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed: an allowlist set on a stopped Beam sandbox is kept for the next start
+
+`ExSandbox.update_egress/4` on a stopped Beam sandbox answered `{:error, :no_live_policy}` once
+`stop/1` began releasing the binding. It now records the list in the sandbox's context, and the
+next start launches with it.
+
 ### Changed: a sandbox crosses the gateway socket as a versioned map
 
 Gateway wire version 3. `ExSandbox.Gateway.Wire` writes a sandbox as a string-keyed map and

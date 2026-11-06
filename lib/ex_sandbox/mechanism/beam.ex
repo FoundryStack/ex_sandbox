@@ -1346,6 +1346,10 @@ defmodule ExSandbox.Mechanism.Beam do
   defp rebind(%{binding: %ExSandbox.Egress.Binding{} = binding}, allowed),
     do: ExSandbox.Egress.Binding.rebind(binding, allowed)
 
+  # A stopped sandbox gave its binding back at `stop/1`. The list is recorded
+  # in the context below, and the next start launches with it.
+  defp rebind(%{stopped: true}, _allowed), do: :ok
+
   defp rebind(_launched, _allowed), do: {:error, :no_live_policy}
 
   # Where `NodeLauncher.egress_allowlist/1` reads it, so a stopped sandbox
