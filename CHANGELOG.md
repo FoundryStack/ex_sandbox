@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.12.0 — 2026-11-08
 
 ### Fixed: stopping a Beam sandbox gives back its egress binding
 
