@@ -31,6 +31,15 @@ defmodule ExSandbox.Egress.DecisionTest do
     assert Decision.decide(@source, {"evil.example.com", 443}, r) == {:refused, :not_permitted}
   end
 
+  test "port 25 is refused even when the allowlist grants it", %{registry: r} do
+    granted = [{"smtp.example.com", 25}, {"smtp.example.com", 587}, {"smtp.example.com", 465}]
+    :ok = Registry.assign(Policy.source_key(@source), granted, r)
+
+    assert Decision.decide(@source, {"smtp.example.com", 25}, r) == {:refused, :not_permitted}
+    assert Decision.decide(@source, {"smtp.example.com", 587}, r) == :permitted
+    assert Decision.decide(@source, {"smtp.example.com", 465}, r) == :permitted
+  end
+
   test "an unregistered source is refused, distinguishably", %{registry: r} do
     # ⚠️ Distinguished for diagnosis, but it must still REFUSE. An unknown
     # source is a sandbox whose policy was never registered or was already

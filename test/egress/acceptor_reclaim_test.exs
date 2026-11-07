@@ -16,9 +16,10 @@ defmodule ExSandbox.Egress.AcceptorReclaimTest do
   ## The acceptor is now a process on this node (2026-08-29)
 
   It holds a descriptor for a socket inside the sandbox's namespace rather than
-  living in that namespace itself, so the *shape* of the old leak is gone: the
-  runtime closes a dead process's descriptors, and there is no OS process left
-  to outlive anything.
+  living in that namespace itself, so there is no OS process left to outlive
+  anything. The descriptor is adopted, so the runtime does not close it when the
+  process dies; the keeper `NetnsSocket.adopt/3` starts does
+  (`adopted_descriptor_test.exs`).
 
   What is NOT gone is the wiring question. `destroy/1` must still stop it, and
   the four defects this file was written against were all correct code that

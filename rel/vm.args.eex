@@ -1,0 +1,4 @@
+## The gateway release's VM flags, measured by test/gateway/budget_test.exs.
++S 2:2
++SDcpu 2:2
++SDio 2

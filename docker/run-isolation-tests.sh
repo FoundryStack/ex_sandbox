@@ -43,7 +43,7 @@ echo "== host facilities =="
 echo "kernel:        $(uname -sr)"
 echo "cgroup:        $(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo MISSING)"
 echo "storage fs:    $(stat -f -c %T "$ISOLATION_STORAGE_DIR" 2>/dev/null || echo MISSING)"
-for bin in systemd-run setpriv bwrap pasta nsenter; do
+for bin in systemd-run setpriv bwrap nft nsenter; do
   printf '%-14s %s\n' "$bin:" "$(command -v "$bin" || echo MISSING)"
 done
 

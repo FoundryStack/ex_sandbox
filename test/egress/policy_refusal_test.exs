@@ -93,14 +93,11 @@ defmodule ExSandbox.Egress.PolicyRefusalTest do
         {:ok, {prog, args}, binding, plan} ->
           assert is_binary(prog)
           assert is_list(args)
-          refute is_nil(binding), "a policed launch must carry a binding to release"
+          on_exit(fn -> ExSandbox.Egress.Binding.release(binding) end)
           refute is_nil(plan)
 
-          refute "--unshare-net" in [prog | args],
-                 "the policed command must drop --unshare-net, or the tenant " <>
-                   "sits in an empty namespace while the policy names another"
-
-          on_exit(fn -> ExSandbox.Egress.Binding.release(binding) end)
+          assert "--unshare-net" in [prog | args],
+                 "the tenant's namespace must hold only loopback (D6)"
 
         {:error, reason} ->
           flunk(

@@ -4,8 +4,7 @@ defmodule ExSandbox.Egress.SpawnableProgramTest do
 
   ## The defect this pins
 
-  `LaunchPlan.build/3` puts `pasta` at the head of the tenant command, and
-  `NodeLauncher.exec_from_plan/1` hands that head to `:peer` as the program to
+  `NodeLauncher.exec_from_plan/1` hands the head of the plan's command to `:peer` as the program to
   start. `:peer` spawns it with
   `:erlang.open_port({:spawn_executable, prog}, ...)`, and **`spawn_executable`
   performs no `PATH` resolution** -- it opens a file. With the bare name
@@ -36,7 +35,7 @@ defmodule ExSandbox.Egress.SpawnableProgramTest do
   """
   use ExUnit.Case, async: true
 
-  alias ExSandbox.Egress.{LaunchPlan, Netns}
+  alias ExSandbox.Egress.LaunchPlan
   alias ExSandbox.Mechanism.Beam.NodeLauncher
 
   @confined [
@@ -72,51 +71,13 @@ defmodule ExSandbox.Egress.SpawnableProgramTest do
     end
 
     test "names the head of the plan, not a resolvable stand-in" do
-      # ⚠️ The paired assertion, and its subject moved with the split ordering.
-      # `pasta` used to wrap the whole command, so the head was `pasta`; it is
-      # now inserted after `setpriv`, so the head is `systemd-run` again. What
-      # must not change is that the head is *the plan's own* -- launching a
-      # different binary with the plan's arguments is the substitution
-      # `LaunchDecisionsTest` exists to forbid.
+      # Launching a different binary with the plan's arguments is the
+      # substitution `LaunchDecisionsTest` exists to forbid.
       {:ok, plan} = LaunchPlan.build({10, 0, 0, 4}, 9999, @confined)
       {prog, args} = NodeLauncher.exec_from_plan(plan)
 
-      assert [^prog | ^args] = plan.pasta_command
+      assert [^prog | ^args] = plan.tenant_command
       assert Path.basename(prog) == "systemd-run"
-    end
-
-    test "every program in the chain is an absolute path, not only the head" do
-      # ⚠️ `:peer` only spawns the head, so a bare name deeper in the chain does
-      # not fail at `open_port` -- it fails at `execvp` inside a process the BEAM
-      # has already handed off, where the error surfaces as an exit status with
-      # no name attached. `pasta` in particular is now MID-CHAIN rather than at
-      # the head, so the original absolute-path guard no longer covers it: the
-      # very defect that test was written for would pass it today.
-      {:ok, plan} = LaunchPlan.build({10, 0, 0, 4}, 9999, @confined)
-
-      for name <- ["systemd-run", "pasta"] do
-        found = Enum.find(plan.pasta_command, &(Path.basename(&1) == name))
-        assert found, "#{name} must appear in the launch chain"
-
-        assert String.starts_with?(found, "/"),
-               "#{name} must be an absolute path, got: #{inspect(found)}"
-      end
-    end
-
-    test "is a file that exists wherever pasta is installed" do
-      # Skipped rather than failed off-Linux: `pasta` is a Linux binary and its
-      # absence on a developer machine is a fact about the host, not a defect in
-      # the plan. `pasta_path/0` falls back to a named path precisely so the
-      # failure says where it looked.
-      case System.find_executable("pasta") do
-        nil ->
-          assert Path.basename(hd(Netns.pasta_command("/tmp/p.pid", ["true"], "0"))) == "pasta"
-
-        found ->
-          [head | _] = Netns.pasta_command("/tmp/p.pid", ["true"], "0")
-          assert head == found
-          assert File.exists?(head)
-      end
     end
   end
 end

@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: stopping a Beam sandbox gives back its egress binding
+
+`stop/1` on a Beam sandbox releases its `/30` and stops its acceptor, as `destroy/1` does.
+Before, the stopped row kept both and the next start acquired a fresh pair, so each stop and
+start leaked one `/30` until every launch was refused with `:pool_exhausted`. A launch whose
+hardening check failed leaked its binding the same way. A second `stop/1` is safe.
+
+### Fixed: an allowlist set on a stopped Beam sandbox is kept for the next start
+
+`ExSandbox.update_egress/4` on a stopped Beam sandbox answered `{:error, :no_live_policy}` once
+`stop/1` began releasing the binding. It now records the list in the sandbox's context, and the
+next start launches with it.
+
+### Changed: a sandbox crosses the gateway socket as a versioned map
+
+Gateway wire version 3. `ExSandbox.Gateway.Wire` writes a sandbox as a string-keyed map and
+reads one back, ignoring a key it does not know and giving a missing key the struct's default,
+so a field added to `ExSandbox.Sandbox` no longer needs the gateway and the product deployed in
+one step. The gateway speaks 3 and 2 (version 1 is dropped) and rebuilds a version 2 peer's
+struct with the fields it lacked at their defaults. The client offers 3 alone; against a
+gateway that does not speak it, every request answers
+`{:error, {:gateway_version, %{client: 3, gateway: [2, 1]}}}` at once and one log line names
+both sides, instead of `:bad_frame`, a timeout or a raised `KeyError`.
+
+### Changed: `ExSandbox.Gateway` is public
+
+The gateway server is listed in `priv/boundary.md`, so a host may start it in its own VM, as
+its tests do, under the same compatibility promise as the client.
+
+### Fixed: an inbound forward no longer leaks a descriptor
+
+A socket adopted with `{:fd, fd}` keeps its descriptor when it closes, so every inbound forward
+left one behind, refused or relayed, and a relayed connection never reached the tenant as a close.
+A liveness check once a minute took the gateway to its 1024 soft limit in about a day. Each stopped
+acceptor also left its listener and resolver sockets. Each adopted descriptor now belongs to a
+process that closes it once its socket closes, on every route, including a relay or an acceptor
+killed before its own cleanup runs.
+
+### Fixed: an `:emfile` from accept no longer floods the log or stops the gateway
+
+A failing accept retried with no delay, and so did a failing receive on the resolver socket. Both
+now wait from 100 ms up to 30 s. The gateway's accept exited on any error, and on `:emfile` the
+restart failed too, which shut down the application and the node. It now waits and keeps serving.
+
+### Fixed: a relayed connection closes when idle, not after two minutes
+
+The relay's 120 s idle window capped every forwarded connection's whole life, so a websocket
+through the inbound forward that heartbeated every 25 s was cut between 125 s and 150 s, and a
+stream carrying bytes one way was cut once the quiet direction's read timed out. The window
+now restarts on traffic in either direction; a connection with no bytes either way for the
+window still closes at both ends.
+
+### Fixed: a refused inbound forward is no longer an egress warning
+
+A connection to a sandbox's published port while its application does not listen logged
+`egress: permitted destination 127.0.0.1:<port> unreachable` at `warning`, once a minute per
+idle or unbuilt sandbox under a liveness check. It now logs at `debug` as an inbound refusal,
+and the egress warning means an outbound destination again.
+
+### Fixed: a gateway reply the client cannot read no longer vanishes
+
+Gateway protocol version 2 carries every result after `hello` as
+`ExSandbox.Gateway.Protocol.opaque/1`. A client
+that had not loaded the module naming an atom in a result (a release `eval`, which loads
+modules lazily) refused the whole frame under `[:safe]` and dropped it, so the caller waited out
+its full timeout with nothing logged. A version 1 peer still gets plain results. The client now
+logs a frame it cannot read and a reply to no request.
+
+### Fixed: the gateway release ships `crypto`
+
+`ex_sandbox_gateway` ships only the applications the app spec reaches, and `:crypto` was not
+among them, so every launch through it raised `module :crypto is not available`. A test now
+holds the app spec to every OTP application ex_sandbox's modules import.
+
+### Fixed: a sandbox launched through the gateway release boots
+
+A sandbox node runs the release's own `erlexec` with no `-boot`, so it looks for
+`$ROOT/bin/start.boot`, which a release does not have; every launch exited with
+`cannot get bootfile`. The release now writes a kernel-and-stdlib boot there.
+
 ## 1.11.0 — 2026-11-04
 
 ### Fixed: a sandbox node starts under UTF-8

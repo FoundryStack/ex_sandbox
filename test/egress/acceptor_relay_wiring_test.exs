@@ -36,18 +36,18 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
 
   ## How the path is made reachable off Linux
 
-  `init/1` is called with `listen: false` and two fields of the resulting state
-  are then rewritten in this process:
+  `init/1` is called with `listen: false` and `destination_reader` is then
+  rewritten in this process, because `SO_ORIGINAL_DST` does not exist on macOS.
 
-    * `destination_reader`, because `SO_ORIGINAL_DST` does not exist on macOS.
-    * `netns`, because entering one needs a namespace and `CAP_NET_ADMIN`, and
-      `nil` is the relay's documented "there is no namespace" case rather than a
-      fallback for one that could not be entered.
+  `netns` is left as `init/1` set it. A permitted connection is dialled from the
+  gateway's own namespace (D6 of `let-sandboxes-outlive-a-deploy`), so the
+  permitted test passes only while `handle_connection/2` does not enter the
+  sandbox's namespace for the upstream.
 
   Everything downstream is the real code: the real `verdict/3`, the real
   registry, the real `Decision.decide/3`, the real relay.
 
-  ⚠️ Neither field is settable through `start_link/1`, and that is deliberate
+  ⚠️ The reader is not settable through `start_link/1`, and that is deliberate
   rather than incidental. A host able to substitute the destination reader could
   name any destination and have the policy evaluated against that rather than
   against the kernel's record, which is the forgeable claim `OriginalDst` exists
@@ -84,7 +84,7 @@ defmodule ExSandbox.Egress.AcceptorRelayWiringTest do
         listen: false
       )
 
-    %{state | netns: nil, destination_reader: fn _socket -> destination_read end}
+    %{state | destination_reader: fn _socket -> destination_read end}
   end
 
   # ⚠️ Mirrors `accept_loop/1`'s ownership handshake rather than calling the

@@ -144,6 +144,19 @@ defmodule ExSandbox.Egress.RelayTest do
     Task.shutdown(relay, :brutal_kill)
   end
 
+  test "an inbound forward to a port nothing listens on is not an egress warning" do
+    {client, sandbox_side} = client_pair()
+
+    log =
+      ExUnit.CaptureLog.capture_log([level: :warning], fn ->
+        assert {:error, :econnrefused} =
+                 Relay.splice(sandbox_side, {{127, 0, 0, 1}, 1}, inbound: true)
+      end)
+
+    assert {:error, :closed} = :gen_tcp.recv(client, 0, 5_000)
+    refute log =~ "egress"
+  end
+
   test "closing the destination closes the sandbox side" do
     # ⚠️ Without this the sandbox holds a socket to a destination that is gone,
     # and the pool holds the other end forever -- a descriptor leak whose only
@@ -183,5 +196,113 @@ defmodule ExSandbox.Egress.RelayTest do
            "splice/3 did not return after the sandbox closed; one leaked process per connection"
 
     Task.shutdown(echo, :brutal_kill)
+  end
+
+  # A destination that runs `serve` on its accepted socket. Unlike
+  # `echo_server/0` it never times out a read of its own, so a closed
+  # connection is the relay's doing.
+  defp destination(serve) do
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+    {:ok, port} = :inet.port(listener)
+
+    task =
+      Task.async(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener, 5_000)
+        :gen_tcp.close(listener)
+        serve.(socket)
+      end)
+
+    {port, task}
+  end
+
+  describe "idle_timeout_ms bounds silence, not a connection's life" do
+    # A websocket heartbeating every 25 s was cut at 120 s: the window
+    # capped the whole connection however much traffic crossed it.
+    @idle 200
+
+    test "a connection carrying traffic both ways outlives the window" do
+      {dest_port, echo} = echo_server()
+      {client, sandbox_side} = client_pair()
+
+      relay =
+        Task.async(fn ->
+          Relay.splice(sandbox_side, {{127, 0, 0, 1}, dest_port}, idle_timeout_ms: @idle)
+        end)
+
+      for beat <- 1..20 do
+        Process.sleep(div(@idle, 4))
+        assert :ok = :gen_tcp.send(client, "beat #{beat}")
+
+        assert :gen_tcp.recv(client, 0, 5_000) == {:ok, "beat #{beat}"},
+               "the relay closed a connection that carried traffic every #{div(@idle, 4)} ms"
+      end
+
+      :gen_tcp.close(client)
+      Task.shutdown(relay, :brutal_kill)
+      Task.shutdown(echo, :brutal_kill)
+    end
+
+    test "traffic in one direction alone keeps the connection open" do
+      {dest_port, pusher} =
+        destination(fn socket ->
+          for _ <- 1..20 do
+            Process.sleep(div(@idle, 4))
+            :ok = :gen_tcp.send(socket, "tick")
+          end
+
+          :gen_tcp.recv(socket, 0)
+        end)
+
+      {client, sandbox_side} = client_pair()
+
+      relay =
+        Task.async(fn ->
+          Relay.splice(sandbox_side, {{127, 0, 0, 1}, dest_port}, idle_timeout_ms: @idle)
+        end)
+
+      for _ <- 1..20 do
+        assert :gen_tcp.recv(client, 4, 5_000) == {:ok, "tick"},
+               "the relay closed a connection whose destination kept sending"
+      end
+
+      :gen_tcp.close(client)
+      Task.shutdown(relay, :brutal_kill)
+      Task.shutdown(pusher, :brutal_kill)
+    end
+
+    test "silence both ways past the window closes both ends and the copiers" do
+      test_process = self()
+
+      {dest_port, _destination} =
+        destination(fn socket ->
+          {:ok, data} = :gen_tcp.recv(socket, 0, 5_000)
+          :ok = :gen_tcp.send(socket, data)
+          send(test_process, {:destination_read, :gen_tcp.recv(socket, 0)})
+        end)
+
+      {client, sandbox_side} = client_pair()
+
+      relay =
+        Task.async(fn ->
+          Relay.splice(sandbox_side, {{127, 0, 0, 1}, dest_port}, idle_timeout_ms: @idle)
+        end)
+
+      assert :ok = :gen_tcp.send(client, "hello")
+      assert {:ok, "hello"} = :gen_tcp.recv(client, 0, 5_000)
+
+      {:links, links} = Process.info(relay.pid, :links)
+      copiers = for pid when is_pid(pid) <- links -- [self()], do: Process.monitor(pid)
+      assert length(copiers) == 2
+
+      assert {:error, :closed} = :gen_tcp.recv(client, 0, 5_000)
+      assert_receive {:destination_read, {:error, :closed}}, 5_000
+      assert {:ok, :ok} = Task.yield(relay, 5_000)
+
+      for copier <- copiers do
+        assert_receive {:DOWN, ^copier, :process, _, _}, 5_000
+      end
+    end
   end
 end

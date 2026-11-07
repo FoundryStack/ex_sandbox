@@ -53,7 +53,8 @@ defmodule ExSandbox.Egress.Relay do
 
   # Bounded rather than `:infinity`: a destination that accepts the connection
   # and then never speaks would otherwise pin one process and two descriptors
-  # per connection for the lifetime of the node.
+  # per connection for the lifetime of the node. The idle window bounds
+  # silence in both directions at once, never a connection's whole life.
   @connect_timeout_ms 5_000
   @idle_timeout_ms 120_000
 
@@ -90,22 +91,31 @@ defmodule ExSandbox.Egress.Relay do
         # reason denials are: at `debug` it is filtered out by every config
         # this project ships, and a permitted destination that cannot be
         # reached is precisely the event an operator needs to see.
-        Logger.warning(
-          "egress: permitted destination #{:inet.ntoa(address)}:#{port} unreachable (#{inspect(reason)})"
-        )
+        log_unreachable(Keyword.get(opts, :inbound, false), address, port, reason)
 
         :gen_tcp.close(sandbox_socket)
         {:error, reason}
     end
   end
 
+  # An inbound forward refused is a sandbox whose application does not listen,
+  # which an idle or unbuilt project does by design; it is not egress.
+  defp log_unreachable(true, _address, port, reason),
+    do: Logger.debug("inbound: nothing listens on sandbox port #{port} (#{inspect(reason)})")
+
+  defp log_unreachable(false, address, port, reason) do
+    Logger.warning(
+      "egress: permitted destination #{:inet.ntoa(address)}:#{port} unreachable (#{inspect(reason)})"
+    )
+  end
+
   # ⚠️ **`SO_MARK`, and without it the permitted half of the allowlist cannot
   # work at all.**
   #
-  # This connect happens *inside the sandbox's own network namespace*, which is
-  # the namespace whose `nat output` hook redirects **all** outbound TCP to this
-  # very acceptor. So the relay's upstream connect is caught by the redirect it
-  # exists to serve, and the acceptor talks to itself.
+  # A connect made *inside the sandbox's own network namespace* (the inbound
+  # forward's leg to the tenant's port) passes the `nat output` hook that
+  # redirects **all** outbound TCP to the acceptor; unmarked, it is caught by
+  # that redirect and the acceptor talks to itself.
   #
   # `Netns.redirect_commands/2` already installs the exemption --
   # `meta mark 42 return`, placed first so it is evaluated before the redirect --
@@ -161,9 +171,15 @@ defmodule ExSandbox.Egress.Relay do
   # unmarked socket, so an unmarked upstream is unrepresentable rather than
   # merely unlikely.
   defp upstream_connect(address, port, netns, timeout) when is_binary(netns) do
-    case NetnsSocket.socket(netns, upstream_mark()) do
-      {:ok, fd} ->
-        :gen_tcp.connect(address, port, [:binary, {:active, false}, {:fd, fd}], timeout)
+    open = fn -> NetnsSocket.socket(netns, upstream_mark()) end
+    connect = &:gen_tcp.connect(address, port, [:binary, {:active, false}, {:fd, &1}], timeout)
+
+    case NetnsSocket.adopt(open, :gen_tcp, connect) do
+      {:ok, socket} ->
+        {:ok, socket}
+
+      {:error, {:adopt, reason}} ->
+        {:error, reason}
 
       {:error, :unsupported} ->
         {:error, :netns_sockets_unavailable}
@@ -173,13 +189,9 @@ defmodule ExSandbox.Egress.Relay do
     end
   end
 
-  # ⚠️ `nil` is not a fallback for a namespace that could not be entered -- it
-  # is "there is no namespace", which is only true on a host with no sandbox
-  # netns at all. No redirect exists there, so there is nothing for a mark to
-  # escape and setting one would be cargo. The production caller always supplies
-  # a namespace; a caller that could silently pass `nil` instead would turn a
-  # missing namespace into a host-namespace connection, which is the
-  # enforcement-point-that-enforces-nothing shape this subsystem keeps finding.
+  # `nil` dials from the gateway's own namespace: a permitted egress
+  # destination (D6 of `let-sandboxes-outlive-a-deploy`). The sandbox's
+  # namespace holds only loopback, so nothing reaches out from inside it.
   defp upstream_connect(address, port, nil, timeout) do
     :gen_tcp.connect(address, port, [:binary, {:active, false}], timeout)
   end
@@ -197,19 +209,13 @@ defmodule ExSandbox.Egress.Relay do
   defp pump(sandbox_socket, destination_socket, idle_timeout) do
     parent = self()
 
-    outbound =
-      spawn_link(fn -> copy(sandbox_socket, destination_socket, idle_timeout, parent) end)
-
-    inbound = spawn_link(fn -> copy(destination_socket, sandbox_socket, idle_timeout, parent) end)
+    outbound = spawn_link(fn -> copy(sandbox_socket, destination_socket, parent) end)
+    inbound = spawn_link(fn -> copy(destination_socket, sandbox_socket, parent) end)
 
     # Either direction ending ends the connection. Waiting for *both* would hold
     # the pair open while one side is already gone, which is the descriptor leak
     # described in the moduledoc.
-    receive do
-      {:copy_done, _which} -> :ok
-    after
-      idle_timeout -> :ok
-    end
+    await_end(idle_timeout)
 
     Process.unlink(outbound)
     Process.unlink(inbound)
@@ -222,16 +228,35 @@ defmodule ExSandbox.Egress.Relay do
     :ok
   end
 
+  # ⚠️ The window restarts on every chunk in EITHER direction. It used to be a
+  # single `after` here plus a `recv` timeout in each copier, so it capped the
+  # connection's total life: a websocket heartbeating every 25 s through the
+  # inbound forward was cut at 120 s, and a stream flowing one way was cut once
+  # the quiet direction's `recv` timed out.
+  defp await_end(idle_timeout) do
+    receive do
+      :traffic -> await_end(idle_timeout)
+      {:copy_done, _which} -> :ok
+    after
+      idle_timeout -> :ok
+    end
+  end
+
   # ⚠️ No catch-all that continues. Every non-`{:ok, data}` outcome -- a closed
-  # socket, a timeout, an unexpected error -- ends this direction and therefore
-  # the connection. A `_ -> copy(...)` clause here would keep a connection alive
+  # socket, an unexpected error -- ends this direction and therefore the
+  # connection. A `_ -> copy(...)` clause here would keep a connection alive
   # through errors nobody enumerated, which is the "forwards on an error path"
   # shape the moduledoc rules out.
-  defp copy(from, to, idle_timeout, parent) do
-    case :gen_tcp.recv(from, 0, idle_timeout) do
+  #
+  # The `recv` has no timeout of its own: one direction falling quiet is not
+  # idle while the other carries bytes, and `await_end/1` owns the window.
+  defp copy(from, to, parent) do
+    case :gen_tcp.recv(from, 0) do
       {:ok, data} ->
+        send(parent, :traffic)
+
         case :gen_tcp.send(to, data) do
-          :ok -> copy(from, to, idle_timeout, parent)
+          :ok -> copy(from, to, parent)
           {:error, reason} -> send(parent, {:copy_done, reason})
         end
 

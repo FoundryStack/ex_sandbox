@@ -79,7 +79,6 @@ defmodule ExSandbox.Hardening do
   # precisely because it runs `unshare` and `bwrap`.
   @lsm_path "/sys/kernel/security/lsm"
   @status_path "/proc/self/status"
-  @tun_path "/dev/net/tun"
 
   @doc """
   What this host can actually enforce, as one sentence fit to be **recorded**
@@ -107,13 +106,11 @@ defmodule ExSandbox.Hardening do
       which is the conservative direction: it under-claims enforcement.
     * `#{@status_path}`'s `Seccomp:` field -- `0` is disabled, anything else is
       a filter loaded.
-    * `pasta` on `PATH` and `#{@tun_path}` present -- the two facts
-      `ExSandbox.Hardening.Linux`'s network probe needs a *device* and a binary
-      for, and the two whose absence made `pasta --config-net` fail outright
-      when it was measured (2026-08-17).
+    * `bwrap` and `nft` on `PATH` -- the binaries that confine the tenant in a
+      loopback-only namespace and redirect its traffic to the acceptor.
 
   ⚠️ **The network clause says "enforceable", not "enforced", and the gap is
-  deliberate.** These two facts say the apparatus this host would police egress
+  deliberate.** These say the apparatus this host would police egress
   with is present; they do not say the sandbox being recorded was launched
   through it -- a sandbox with an empty allowlist takes the unpoliced branch.
   Writing "enforced" here would be the over-claim that
@@ -168,7 +165,7 @@ defmodule ExSandbox.Hardening do
   end
 
   defp network_clause do
-    if not is_nil(System.find_executable("pasta")) and File.exists?(@tun_path) do
+    if Enum.all?(~w[bwrap nft], &System.find_executable/1) do
       "network layer enforceable"
     else
       "network layer not enforceable"

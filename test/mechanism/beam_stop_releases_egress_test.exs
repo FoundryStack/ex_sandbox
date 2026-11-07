@@ -6,6 +6,7 @@ defmodule ExSandbox.Mechanism.BeamStopReleasesEgressTest do
   """
   use ExUnit.Case, async: false
 
+  alias ExSandbox.Egress.Allocator
   alias ExSandbox.Egress.Binding
   alias ExSandbox.Egress.Registry, as: EgressRegistry
   alias ExSandbox.Mechanism.Beam
@@ -46,4 +47,37 @@ defmodule ExSandbox.Mechanism.BeamStopReleasesEgressTest do
     assert {:ok, _} = Beam.stop(sandbox)
     assert {:ok, _} = Beam.stop(sandbox)
   end
+
+  test "stop and relaunch more times than the pool holds", %{sandbox: sandbox} do
+    assert {:ok, _} = Beam.stop(sandbox)
+    held_before = held()
+    pool = held_before + length(:sys.get_state(Allocator).free)
+
+    for cycle <- 1..(pool + 2) do
+      {:ok, binding} = Binding.acquire([{"example.com", 443}])
+      {:ok, acceptor} = Agent.start(fn -> :listening end)
+
+      :ets.insert(
+        Beam.registry_table(),
+        {sandbox.id, %{peer: nil, binding: binding, acceptor_pid: acceptor, forward: nil}}
+      )
+
+      assert held() == held_before + 1, "cycle #{cycle} holds #{held() - held_before} /30s"
+      assert {:ok, _} = Beam.stop(sandbox)
+      refute Process.alive?(acceptor), "cycle #{cycle} left the acceptor running"
+    end
+
+    assert held() == held_before
+  end
+
+  test "an allowlist set while stopped is recorded for the next start", %{sandbox: sandbox} do
+    assert {:ok, _} = Beam.stop(sandbox)
+
+    assert {:ok, updated} =
+             ExSandbox.update_egress(Beam, sandbox, ["b.example.com:443"], host_aliases: [])
+
+    assert updated.context.network_allowlist == [{"b.example.com", 443}]
+  end
+
+  defp held, do: MapSet.size(:sys.get_state(Allocator).held)
 end

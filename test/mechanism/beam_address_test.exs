@@ -1,7 +1,7 @@
 defmodule ExSandbox.Mechanism.BeamAddressTest do
   @moduledoc """
   A launched sandbox that names a service port is addressed at the host
-  loopback port `pasta` publishes it on; any other sandbox says it has no
+  loopback port the acceptor publishes it on; any other sandbox says it has no
   address, rather than offering the handle it has (design D13).
 
   `ExSandbox.Mechanism.Beam` publishes `"peer:<id>"` as its conformance context
@@ -48,7 +48,7 @@ defmodule ExSandbox.Mechanism.BeamAddressTest do
   end
 
   describe "a launched row" do
-    test "with a forward is addressed at the host loopback port pasta publishes" do
+    test "with a forward is addressed at the host loopback port the acceptor publishes" do
       assert Beam.address_of(%{forward: {52_111, 4000}}) == "127.0.0.1:52111"
     end
 
