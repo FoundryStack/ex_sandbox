@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.12.1 — 2026-11-08
+
+### Fixed: `list_running/0` lists a running Beam sandbox
+
+The Beam mechanism's `list_running/0` raised `BadBooleanError` whenever a launched sandbox
+had not been stopped, because its entry carries no `:stopped` key and the filter read
+`launched[:stopped] or ...`. Every reconciliation of a host running a Beam sandbox failed, and
+records of sandboxes that had died stayed `running`. The filter compares to `true`.
+
 ## 1.12.0 — 2026-11-08
 
 ### Fixed: stopping a Beam sandbox gives back its egress binding
