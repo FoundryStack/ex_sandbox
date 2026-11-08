@@ -434,7 +434,9 @@ defmodule ExSandbox.Mechanism.Beam do
     ids =
       table()
       |> :ets.tab2list()
-      |> Enum.reject(fn {_id, launched} -> launched[:stopped] or launched[:listed] == false end)
+      |> Enum.reject(fn {_id, launched} ->
+        launched[:stopped] == true or launched[:listed] == false
+      end)
       |> Enum.map(fn {id, _launched} -> id end)
 
     {:ok, ids}
