@@ -425,10 +425,14 @@ defmodule ExSandbox.Hardening.Linux do
     storage = storage_path(sandbox)
 
     [
-      "bwrap"
+      "bwrap",
       # FR-010: the sandbox sees the runtime read-only and its own storage
       # read-write. Everything else -- including every other sandbox's storage
       # and the platform's own files -- is simply not in its mount view.
+      # A private /tmp, first so a later bind beneath it still lands; its pages
+      # count against the sandbox's memory limit.
+      "--tmpfs",
+      "/tmp"
     ] ++
       runtime_ro_binds() ++
       resolv_conf_bind() ++

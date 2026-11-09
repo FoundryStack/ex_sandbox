@@ -145,6 +145,18 @@ defmodule ExSandbox.Hardening.BuildCommandTest do
     end
   end
 
+  describe "a private /tmp" do
+    test "the sandbox gets a tmpfs /tmp before any bind" do
+      args = built_args(sandbox(%{workspace_path: "/tmp/ws"}), [])
+
+      tmpfs = Enum.find_index(Enum.chunk_every(args, 2, 1), &(&1 == ["--tmpfs", "/tmp"]))
+      assert tmpfs, "a tool that writes to /tmp finds no directory"
+
+      first_bind = Enum.find_index(args, &(&1 in ["--bind", "--ro-bind"]))
+      assert tmpfs < first_bind, "a bind under /tmp placed before the tmpfs is hidden by it"
+    end
+  end
+
   defp validate_only(sandbox) do
     # Reaches the limits check directly: on this host `build_command/2` refuses
     # for unavailability first, which would mask the case under test.

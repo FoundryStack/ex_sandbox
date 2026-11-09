@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.12.2 — 2026-11-09
+
+### Fixed: a Linux sandbox has a `/tmp`
+
+The bwrap mount view had no `/tmp`, and the launch clears `TMPDIR`, so a tool that unpacks
+or writes scratch files there failed. The Tailwind v4 CLI could not load its file watcher
+(`ERR_DLOPEN_FAILED`), so a hosted app built no stylesheet. The sandbox now gets a private
+tmpfs at `/tmp`, mounted before any bind; its pages count against the memory limit.
+
 ## 1.12.1 — 2026-11-08
 
 ### Fixed: `list_running/0` lists a running Beam sandbox
