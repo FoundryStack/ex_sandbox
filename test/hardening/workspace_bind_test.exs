@@ -64,6 +64,20 @@ defmodule ExSandbox.Hardening.WorkspaceBindTest do
                Linux.workspace_handoff(["lib", ".git", ".slots"], "/ws", 4242, [".git", ".slots"])
     end
 
+    test "a file that vanished mid-walk is no failure; any other error is" do
+      vanished =
+        "chown: cannot access '/ws/_build/dev/lib/x/ebin': No such file or directory\n"
+
+      assert Linux.only_vanished?(vanished)
+      assert Linux.only_vanished?(vanished <> vanished)
+
+      refute Linux.only_vanished?(
+               vanished <> "chown: changing ownership of '/ws/a': Read-only file system\n"
+             )
+
+      refute Linux.only_vanished?("")
+    end
+
     test "runs nothing for a workspace holding only .git" do
       assert Linux.workspace_handoff([".git"], "/ws", 4242) == nil
       assert Linux.workspace_handoff([], "/ws", 4242) == nil

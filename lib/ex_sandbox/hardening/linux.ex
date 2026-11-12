@@ -791,10 +791,19 @@ defmodule ExSandbox.Hardening.Linux do
   # Same rule as `chown/2`: an unprivileged caller (tests, a developer's
   # machine) cannot hand anything over, and that is not this function's failure
   # to report.
+  # A file removed while the walk ran (a build swapping a directory in) needs
+  # no hand-off either.
   defp handoff_failure(output, status) do
-    if String.contains?(output, "Operation not permitted"),
+    if String.contains?(output, "Operation not permitted") or only_vanished?(output),
       do: :ok,
       else: {:error, {:workspace_handoff, status, output}}
+  end
+
+  @doc false
+  @spec only_vanished?(String.t()) :: boolean()
+  def only_vanished?(output) do
+    lines = output |> String.split("\n", trim: true)
+    lines != [] and Enum.all?(lines, &String.contains?(&1, "No such file or directory"))
   end
 
   # ⚠️ The `chmod` binary, not `File.chmod/2`: MEASURED 2026-09-22 on macOS,

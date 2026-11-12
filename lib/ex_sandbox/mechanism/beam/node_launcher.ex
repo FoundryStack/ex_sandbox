@@ -677,9 +677,27 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   # Failure is not propagated. `reset-failed` on a name that was never used is a
   # no-op, and on a host without systemd there is no scope to clear; letting
   # either abort a launch would break hosts that this never concerned.
+  #
+  # A scope still active under the name (a boot that timed out while its node
+  # kept running, a stop that raced a boot) is stopped first: `reset-failed`
+  # does not touch an active unit, and the launch would fail with "Unit ... was
+  # already loaded".
   defp clear_stale_scope(sandbox) do
     if function_exported?(hardening(), :scope_unit_name, 1) do
+      _ = System.cmd("systemctl", stop_scope_args(sandbox), stderr_to_stdout: true)
       _ = System.cmd("systemctl", reset_failed_args(sandbox), stderr_to_stdout: true)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # A boot that failed leaves the scope's processes running. Stop only: no
+  # `reset-failed` here, which would erase the verdict a later launch reads.
+  defp stop_scope(sandbox) do
+    if function_exported?(hardening(), :scope_unit_name, 1) do
+      _ = System.cmd("systemctl", stop_scope_args(sandbox), stderr_to_stdout: true)
     end
 
     :ok
@@ -689,8 +707,14 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
 
   @doc false
   @spec reset_failed_args(ExSandbox.Sandbox.t()) :: [String.t()]
-  def reset_failed_args(sandbox) do
-    args = ["reset-failed", hardening().scope_unit_name(sandbox)]
+  def reset_failed_args(sandbox), do: scope_args("reset-failed", sandbox)
+
+  @doc false
+  @spec stop_scope_args(ExSandbox.Sandbox.t()) :: [String.t()]
+  def stop_scope_args(sandbox), do: scope_args("stop", sandbox)
+
+  defp scope_args(verb, sandbox) do
+    args = [verb, hardening().scope_unit_name(sandbox)]
 
     if function_exported?(hardening(), :systemctl_args, 1),
       do: hardening().systemctl_args(args),
@@ -767,6 +791,7 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
     catch
       :exit, reason ->
         Logger.error("sandbox node failed to boot: #{inspect(reason)}")
+        stop_scope(sandbox)
         {:error, :mechanism_error}
     end
   end

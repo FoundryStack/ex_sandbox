@@ -109,4 +109,20 @@ defmodule ExSandbox.Hardening.ScopeKindTest do
     assert ExSandbox.Mechanism.Beam.NodeLauncher.reset_failed_args(sb) ==
              ["reset-failed", Linux.scope_unit_name(sb)]
   end
+
+  test "an active user scope left by a failed boot is stopped in the user manager" do
+    seed(:user)
+    sb = sandbox()
+
+    assert ExSandbox.Mechanism.Beam.NodeLauncher.stop_scope_args(sb) ==
+             ["--user", "stop", Linux.scope_unit_name(sb)]
+  end
+
+  test "an active system scope is stopped in the system manager" do
+    seed(:system)
+    sb = sandbox()
+
+    assert ExSandbox.Mechanism.Beam.NodeLauncher.stop_scope_args(sb) ==
+             ["stop", Linux.scope_unit_name(sb)]
+  end
 end

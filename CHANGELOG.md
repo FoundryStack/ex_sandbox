@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.12.3 — 2026-11-12
+
+### Fixed: a boot that timed out no longer blocks the next launch
+
+A sandbox whose node did not answer within `wait_boot` (a loaded host) kept its scope and
+processes running, and every later launch failed with "Unit sandbox-<id>.scope was already
+loaded". A failed boot now stops its scope, and a launch stops any scope still active under
+its name before `reset-failed`.
+
+### Fixed: a file vanishing during the workspace hand-off is no failure
+
+`chown -R` over a workspace while a build swapped a directory in reported "No such file or
+directory" and failed the launch. Output made only of such lines is now tolerated.
+
 ## 1.12.2 — 2026-11-09
 
 ### Fixed: a Linux sandbox has a `/tmp`
