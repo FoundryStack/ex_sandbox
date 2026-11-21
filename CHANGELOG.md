@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.13.0 — 2026-11-21
+
+### Added: one gateway client per host
+
+Several `ExSandbox.Mechanism.Gateway` clients may run, each under its own `:name`, one per
+gateway host. `config :ex_sandbox, :gateway_client, route: {module, function, args}` names the
+client a sandbox's requests go to (called with the sandbox id first; `nil` means the default
+client), and `clients: {module, function, args}` names the others. `request_on/4` sends one
+request through a named client. Context functions answer through the client that served the
+request, and `list_running/0` lists the sandboxes of every client, failing when any one fails.
+Without `route` and `clients`, the client behaves as in 1.12.3.
+
 ## 1.12.3 — 2026-11-12
 
 ### Fixed: a boot that timed out no longer blocks the next launch
