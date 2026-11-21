@@ -18,6 +18,14 @@ defmodule ExSandbox.Mechanism.Gateway do
   `args`. `:config_keys` lists the `:ex_sandbox` keys sent with `hello`
   (default `[:beam, :egress]`), so the gateway runs sandboxes as this
   consumer configured them.
+
+  Several clients may run, each started with its own `:name`, one per gateway
+  host. `config :ex_sandbox, :gateway_client, route: {module, function, args}`
+  names the client a sandbox's requests go to: it is called with the sandbox
+  id prepended to `args` and answers a client name, or `nil` for the default
+  client. `clients: {module, function, args}` answers the other clients'
+  names, and `list_running/0` lists the sandboxes of all of them, failing when
+  any one fails.
   """
   @behaviour ExSandbox.Mechanism
 
@@ -58,7 +66,15 @@ defmodule ExSandbox.Mechanism.Gateway do
   def status(%Sandbox{} = sandbox), do: request(:status, {:status, sandbox})
 
   @impl ExSandbox.Mechanism
-  def list_running, do: request(:list, nil)
+  def list_running do
+    [__MODULE__ | other_clients()]
+    |> Enum.reduce_while({:ok, []}, fn name, {:ok, acc} ->
+      case request_on(name, :list, nil) do
+        {:ok, listed} -> {:cont, {:ok, acc ++ listed}}
+        error -> {:halt, error}
+      end
+    end)
+  end
 
   @impl ExSandbox.Mechanism
   def usage(%Sandbox{} = sandbox), do: request(:sample, {:usage, sandbox})
@@ -123,10 +139,15 @@ defmodule ExSandbox.Mechanism.Gateway do
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
-  @doc "Sends one request and waits for its reply."
+  @doc "Sends one request to the client its sandbox routes to and waits for its reply."
   @spec request(Protocol.verb(), term(), timeout()) :: term()
-  def request(verb, args, timeout \\ @op_timeout_ms) do
-    case GenServer.whereis(__MODULE__) do
+  def request(verb, args, timeout \\ @op_timeout_ms),
+    do: request_on(client_for(args), verb, args, timeout)
+
+  @doc "Sends one request through the client `name` and waits for its reply."
+  @spec request_on(GenServer.name(), Protocol.verb(), term(), timeout()) :: term()
+  def request_on(name, verb, args, timeout \\ @op_timeout_ms) do
+    case GenServer.whereis(name) do
       nil ->
         {:error, :host_unreachable}
 
@@ -137,7 +158,7 @@ defmodule ExSandbox.Mechanism.Gateway do
           client
           |> GenServer.call({:request, verb, outbound(args), wait}, wait + timeout)
           |> inbound()
-          |> ContextFuns.import(&request(:call, &1))
+          |> ContextFuns.import(&request_on(name, :call, &1))
         catch
           :exit, {:timeout, _} -> {:error, :timeout}
           :exit, _ -> {:error, :host_unreachable}
@@ -159,6 +180,25 @@ defmodule ExSandbox.Mechanism.Gateway do
     case Wire.inbound(result) do
       {:ok, read} -> read
       {:error, _refusal} = error -> error
+    end
+  end
+
+  defp client_for(args) when is_tuple(args) do
+    with %Sandbox{id: id} <- args |> Tuple.to_list() |> Enum.find(&is_struct(&1, Sandbox)),
+         {module, function, extra} <- Keyword.get(config(), :route),
+         name when name != nil <- apply(module, function, [id | extra]) do
+      name
+    else
+      _default -> __MODULE__
+    end
+  end
+
+  defp client_for(_args), do: __MODULE__
+
+  defp other_clients do
+    case Keyword.get(config(), :clients) do
+      {module, function, args} -> apply(module, function, args)
+      nil -> []
     end
   end
 
