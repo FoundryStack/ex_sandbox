@@ -161,7 +161,8 @@ defmodule ExSandbox.Gateway.Server do
       {:ok, version} ->
         apply_config(Map.get(args, :config, []))
 
-        {{:ok, %{version: version, verbs: Protocol.verbs(), vsn: vsn()}},
+        {{:ok,
+          %{version: version, verbs: Enum.map(Protocol.verbs(), &Atom.to_string/1), vsn: vsn()}},
          %{conn | version: version}}
 
       :error ->

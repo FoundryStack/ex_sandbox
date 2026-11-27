@@ -118,6 +118,12 @@ defmodule ExSandbox.Gateway.WireTest do
     {:reply, id, Protocol.unwrap(result)}
   end
 
+  defp atoms(term) when is_atom(term), do: [term]
+  defp atoms(term) when is_tuple(term), do: term |> Tuple.to_list() |> atoms()
+  defp atoms(term) when is_list(term), do: Enum.flat_map(term, &atoms/1)
+  defp atoms(%{} = term), do: term |> Map.to_list() |> atoms()
+  defp atoms(_term), do: []
+
   defp hello(socket, versions) do
     send_frame(socket, {:request, 0, :hello, %{versions: versions}})
     assert {:reply, 0, {:ok, %{version: version}}} = recv(socket)
@@ -152,6 +158,20 @@ defmodule ExSandbox.Gateway.WireTest do
   end
 
   describe "the gateway at version 3" do
+    test "the hello reply names only atoms every client knows, so a new verb reaches an old client's safe decode" do
+      path = socket_path()
+      start_gateway(path)
+      socket = connect(path)
+      send_frame(socket, {:request, 0, :hello, %{versions: [2, 1]}})
+
+      {:ok, frame} = :gen_tcp.recv(socket, 0, 5_000)
+      {:ok, reply} = Protocol.decode(frame)
+
+      assert {:reply, 0, {:ok, %{verbs: verbs}}} = reply
+      assert "workspace" in verbs
+      assert atoms(reply) -- [:reply, :ok, :version, :verbs, :vsn] == []
+    end
+
     test "a field the gateway does not know reaches the mechanism without it (S1)" do
       path = socket_path()
       start_gateway(path)

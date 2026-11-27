@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.14.1 — 2026-11-28
+
+### Fixed: a client from before 1.14.0 hung on its first call to a 1.14.0 gateway
+
+The hello reply listed the gateway's verbs as atoms, and 1.14.0 added `:workspace`. A client
+that never had that atom refused the reply in its safe decode, so its hello never finished and
+every call it made timed out. The reply now lists the verbs as strings; no client reads them.
+hosting/FR-002/S4.
+
 ## 1.14.0 — 2026-11-27
 
 ### Added: the workspace hand-off of a sandbox on another host's gateway
