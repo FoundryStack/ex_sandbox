@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.14.0 — 2026-11-27
 
 ### Added: the workspace hand-off of a sandbox on another host's gateway
 
