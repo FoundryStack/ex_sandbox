@@ -33,6 +33,11 @@ defmodule ExSandbox.Gateway.RoutingTest do
     def execute(_sandbox, _command, _opts \\ []), do: {:error, :not_supported}
     @impl true
     def update_egress(sandbox, _allowed), do: {:ok, sandbox}
+
+    def hand_off_workspace(%{id: id, workspace_path: path}) do
+      send(:routing_test, {:handed_off_here, id, path})
+      if String.ends_with?(path, "/refused"), do: {:error, :eperm}, else: :ok
+    end
   end
 
   defmodule There do
@@ -57,7 +62,7 @@ defmodule ExSandbox.Gateway.RoutingTest do
     @impl true
     def usage(_sandbox), do: {:ok, %{memory_mb: 1}}
     @impl true
-    def execute(_sandbox, _command, _opts \\ []), do: {:error, :not_supported}
+    def execute(_sandbox, _command, _opts \\ []), do: {:ok, :ran_there}
     @impl true
     def update_egress(sandbox, _allowed), do: {:ok, sandbox}
   end
@@ -106,6 +111,45 @@ defmodule ExSandbox.Gateway.RoutingTest do
 
     assert {:ok, provisioned} = Gateway.provision(sandbox("there-2"))
     assert provisioned.context.host.() == :there
+  end
+
+  describe "sandbox/FR-343: a remote sandbox's workspace is handed off by the default gateway" do
+    setup do
+      Process.register(self(), :routing_test)
+      :ok
+    end
+
+    defp with_workspace(id, path), do: %{sandbox(id) | workspace_path: path}
+
+    test "before its launch and before each command" do
+      assert {:ok, _} = Gateway.provision(with_workspace("there-3", "/w/there-3"))
+      assert_received {:handed_off_here, "there-3", "/w/there-3"}
+
+      assert {:ok, _} = Gateway.start(with_workspace("there-3", "/w/there-3"))
+      assert_received {:handed_off_here, "there-3", "/w/there-3"}
+
+      assert {:ok, :ran_there} =
+               Gateway.execute(with_workspace("there-3", "/w/there-3"), {"true", []})
+
+      assert_received {:handed_off_here, "there-3", "/w/there-3"}
+    end
+
+    test "a refused hand-off stops the start and the command" do
+      assert {:error, {:workspace_handoff, :eperm}} =
+               Gateway.provision(with_workspace("there-4", "/w/refused"))
+
+      assert {:error, {:workspace_handoff, :eperm}} =
+               Gateway.start(with_workspace("there-4", "/w/refused"))
+
+      assert {:error, {:could_not_run, {:workspace, :eperm}}} =
+               Gateway.execute(with_workspace("there-4", "/w/refused"), {"true", []})
+    end
+
+    test "a sandbox of the default gateway and one with no workspace are left to their gateway" do
+      assert {:ok, _} = Gateway.start(with_workspace("here-2", "/w/here-2"))
+      assert {:ok, _} = Gateway.start(sandbox("there-5"))
+      refute_received {:handed_off_here, _, _}
+    end
   end
 
   test "the running sandboxes of every client are listed" do

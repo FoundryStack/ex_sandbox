@@ -949,8 +949,18 @@ defmodule ExSandbox.Mechanism.Beam.NodeLauncher do
   @doc false
   # Public because `Beam.execute/3` repeats it before every command: the
   # platform writes into the workspace between commands, and a file it wrote is
-  # one the sandbox cannot read until it is handed over.
-  def prepare_workspace(sandbox), do: optional_hardening(:prepare_workspace, sandbox)
+  # one the sandbox cannot read until it is handed over. Skipped where
+  # `config :ex_sandbox, :beam, workspace_handoff: :elsewhere` says the
+  # workspace's own host hands it over (`hand_off_workspace/1` there).
+  def prepare_workspace(sandbox) do
+    case Application.get_env(:ex_sandbox, :beam, []) |> Keyword.get(:workspace_handoff) do
+      :elsewhere -> :ok
+      _here -> hand_off_workspace(sandbox)
+    end
+  end
+
+  @doc false
+  def hand_off_workspace(sandbox), do: optional_hardening(:prepare_workspace, sandbox)
 
   defp optional_hardening(function, sandbox) do
     module = hardening()

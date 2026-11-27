@@ -47,6 +47,8 @@ defmodule ExSandbox.Hardening.Linux do
   neither substitutes for the other.
   """
 
+  require Logger
+
   @type capability_map :: %{
           resource_limits: boolean(),
           privilege_separation: boolean(),
@@ -713,7 +715,8 @@ defmodule ExSandbox.Hardening.Linux do
          {:ok, entries} <- File.ls(path),
          :ok <- chgrp(path, uid),
          :ok <- chmod(path, 0o770),
-         :ok <- run_handoff(workspace_handoff(entries, path, uid, [".git" | List.wrap(slots)])) do
+         :ok <-
+           run_handoff(workspace_handoff(entries, path, uid, [".git" | List.wrap(slots)]), uid) do
       prepare_slots(slots && Path.join(path, slots), platform, uid)
     end
   end
@@ -771,7 +774,8 @@ defmodule ExSandbox.Hardening.Linux do
       {:ok, %{type: :directory, inode: inode}} ->
         run_handoff(
           {"sh",
-           ["-c", @slots_handoff, "slots", "#{platform}", "#{uid}", "#{inode}", Path.expand(dir)]}
+           ["-c", @slots_handoff, "slots", "#{platform}", "#{uid}", "#{inode}", Path.expand(dir)]},
+          uid
         )
 
       _ ->
@@ -779,24 +783,68 @@ defmodule ExSandbox.Hardening.Linux do
     end
   end
 
-  defp run_handoff(nil), do: :ok
+  defp run_handoff(nil, _uid), do: :ok
 
-  defp run_handoff({cmd, args}) do
+  defp run_handoff({cmd, args}, uid) do
     case System.cmd(cmd, args, stderr_to_stdout: true) do
       {_, 0} -> :ok
-      {output, status} -> handoff_failure(output, status)
+      {output, status} -> handoff_failure(output, status, uid)
     end
   end
 
-  # Same rule as `chown/2`: an unprivileged caller (tests, a developer's
-  # machine) cannot hand anything over, and that is not this function's failure
-  # to report.
   # A file removed while the walk ran (a build swapping a directory in) needs
-  # no hand-off either.
-  defp handoff_failure(output, status) do
-    if String.contains?(output, "Operation not permitted") or only_vanished?(output),
-      do: :ok,
-      else: {:error, {:workspace_handoff, status, output}}
+  # no hand-off. A refusal is tolerated, since an unprivileged caller (tests, a
+  # developer's machine) cannot hand anything over, but it is logged as an
+  # error where this process maps the sandbox's uid and should have succeeded.
+  defp handoff_failure(output, status, uid) do
+    cond do
+      only_vanished?(output) ->
+        :ok
+
+      String.contains?(output, "Operation not permitted") ->
+        refused(uid, output)
+
+      true ->
+        {:error, {:workspace_handoff, status, output}}
+    end
+  end
+
+  defp refused(uid, detail) do
+    if hand_off_expected?(uid) do
+      Logger.error(
+        "ex_sandbox: the workspace hand-off to uid #{uid} was refused although this process " <>
+          "maps that uid; the sandbox will not own its files: #{String.slice(detail, 0, 500)}"
+      )
+    end
+
+    :ok
+  end
+
+  defp hand_off_expected?(uid) do
+    with {:ok, map} <- File.read("/proc/self/uid_map"),
+         {:ok, status} <- File.read("/proc/self/status") do
+      hand_off_expected?(map, status, uid)
+    else
+      _no_proc -> false
+    end
+  end
+
+  @doc false
+  @spec hand_off_expected?(String.t(), String.t(), non_neg_integer()) :: boolean()
+  def hand_off_expected?(uid_map, proc_status, uid) do
+    root? = Regex.match?(~r/^Uid:\s+\d+\s+0\s/m, proc_status)
+
+    mapped? =
+      uid_map
+      |> String.split("\n", trim: true)
+      |> Enum.any?(fn line ->
+        case line |> String.split() |> Enum.map(&Integer.parse/1) do
+          [{inside, ""}, {_outside, ""}, {count, ""}] -> uid >= inside and uid < inside + count
+          _other -> false
+        end
+      end)
+
+    root? and mapped? and uid != 0
   end
 
   @doc false
@@ -824,7 +872,7 @@ defmodule ExSandbox.Hardening.Linux do
   defp chgrp(path, gid) do
     case File.chgrp(path, gid) do
       :ok -> :ok
-      {:error, :eperm} -> :ok
+      {:error, :eperm} -> refused(gid, "chgrp #{path}: eperm")
       {:error, reason} -> {:error, reason}
     end
   end

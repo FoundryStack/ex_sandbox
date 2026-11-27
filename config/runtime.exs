@@ -22,4 +22,8 @@ if System.get_env("RELEASE_NAME") == "ex_sandbox_gateway" do
              System.get_env("EX_SANDBOX_GATEWAY_STORE") ||
                Path.join([System.user_home!(), ".local", "state", "ex-sandbox", "allowlists"])
          ] ++ if(uids, do: [allowed_uids: uids], else: [])
+
+  if System.get_env("EX_SANDBOX_WORKSPACE_HANDOFF") == "elsewhere" do
+    config :ex_sandbox, :beam, workspace_handoff: :elsewhere
+  end
 end

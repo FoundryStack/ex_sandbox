@@ -276,6 +276,13 @@ defmodule ExSandbox.Gateway.Server do
   end
 
   defp dispatch(:sample, {:usage, sandbox}, conn), do: ExSandbox.usage(conn.mechanism, sandbox)
+
+  defp dispatch(:workspace, {:hand_off, sandbox}, conn) do
+    if function_exported?(conn.mechanism, :hand_off_workspace, 1),
+      do: conn.mechanism.hand_off_workspace(sandbox),
+      else: {:error, :not_supported}
+  end
+
   defp dispatch(verb, _args, _conn), do: {:error, {:unknown_verb, verb}}
 
   defp stored_allowlist(%{id: id} = sandbox, conn) when is_binary(id) do

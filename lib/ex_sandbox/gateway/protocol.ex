@@ -16,10 +16,11 @@ defmodule ExSandbox.Gateway.Protocol do
 
   @client_version 3
   @versions [@client_version, @client_version - 1]
-  @verbs [:hello, :start, :stop, :status, :list, :call, :allowlist, :sample]
+  @verbs [:hello, :start, :stop, :status, :list, :call, :allowlist, :sample, :workspace]
 
   @type id :: non_neg_integer()
-  @type verb :: :hello | :start | :stop | :status | :list | :call | :allowlist | :sample
+  @type verb ::
+          :hello | :start | :stop | :status | :list | :call | :allowlist | :sample | :workspace
 
   @doc "The one version a client offers."
   @spec client_version() :: pos_integer()

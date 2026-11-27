@@ -1158,6 +1158,13 @@ defmodule ExSandbox.Mechanism.Beam do
     end
   end
 
+  @doc """
+  Hands `sandbox`'s workspace to its uid on this host without running it, for
+  a sandbox another gateway runs over a shared workspace.
+  """
+  @spec hand_off_workspace(Sandbox.t()) :: :ok | {:error, term()}
+  def hand_off_workspace(%Sandbox{} = sandbox), do: NodeLauncher.hand_off_workspace(sandbox)
+
   @impl true
   def execute(%Sandbox{} = sandbox, {cmd, args}, opts \\ [])
       when is_binary(cmd) and is_list(args) and is_list(opts) do

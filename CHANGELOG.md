@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added: the workspace hand-off of a sandbox on another host's gateway
+
+A sandbox the client routes to another host's gateway shares this host's workspace over a
+network mount, where `chown` needs the server's root. Before `provision/1`, `start/1` and `execute/3` of such
+a sandbox the client now asks the default gateway to hand the workspace over (the new
+`:workspace` verb, `ExSandbox.Mechanism.Beam.hand_off_workspace/1`); a refusal fails the start
+with `{:error, {:workspace_handoff, reason}}` and the command with `{:could_not_run,
+{:workspace, reason}}`. `config :ex_sandbox, :beam, workspace_handoff: :elsewhere`, set by the
+gateway release from `EX_SANDBOX_WORKSPACE_HANDOFF=elsewhere`, makes the remote gateway skip
+its own hand-off. A default gateway older than this release answers `{:unknown_verb,
+:workspace}`, so a remote sandbox does not start until the default gateway is switched.
+
+### Changed: a refused hand-off is logged where it should have worked
+
+The hand-off still tolerates `EPERM`, since an unprivileged caller cannot hand anything over,
+but logs an error when the process is root of a user namespace that maps the sandbox's uid,
+where the refusal means the sandbox will not own its files.
+
 ## 1.13.0 — 2026-11-21
 
 ### Added: one gateway client per host

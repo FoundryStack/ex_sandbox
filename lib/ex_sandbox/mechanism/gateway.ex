@@ -51,10 +51,20 @@ defmodule ExSandbox.Mechanism.Gateway do
   def constructed_capabilities, do: []
 
   @impl ExSandbox.Mechanism
-  def provision(%Sandbox{} = sandbox), do: request(:start, {:provision, sandbox})
+  def provision(%Sandbox{} = sandbox) do
+    case hand_off_here(sandbox) do
+      :ok -> request(:start, {:provision, sandbox})
+      {:error, reason} -> {:error, {:workspace_handoff, reason}}
+    end
+  end
 
   @impl ExSandbox.Mechanism
-  def start(%Sandbox{} = sandbox), do: request(:start, {:start, sandbox})
+  def start(%Sandbox{} = sandbox) do
+    case hand_off_here(sandbox) do
+      :ok -> request(:start, {:start, sandbox})
+      {:error, reason} -> {:error, {:workspace_handoff, reason}}
+    end
+  end
 
   @impl ExSandbox.Mechanism
   def stop(%Sandbox{} = sandbox), do: request(:stop, {:stop, sandbox})
@@ -82,7 +92,11 @@ defmodule ExSandbox.Mechanism.Gateway do
   @impl ExSandbox.Mechanism
   def execute(%Sandbox{} = sandbox, command, opts \\ []) do
     timeout = Keyword.get(opts, :timeout_ms, @op_timeout_ms) + 5_000
-    request(:call, {:execute, sandbox, command, opts}, timeout)
+
+    case hand_off_here(sandbox) do
+      :ok -> request(:call, {:execute, sandbox, command, opts}, timeout)
+      {:error, reason} -> {:error, {:could_not_run, {:workspace, reason}}}
+    end
   end
 
   @impl ExSandbox.Mechanism
@@ -194,6 +208,18 @@ defmodule ExSandbox.Mechanism.Gateway do
   end
 
   defp client_for(_args), do: __MODULE__
+
+  # A sandbox routed to another host's gateway shares this host's workspace,
+  # which only this host's gateway can hand over (the other one reaches it
+  # over a network mount, where `chown` needs the server's root).
+  defp hand_off_here(%Sandbox{workspace_path: path} = sandbox) when is_binary(path) do
+    case client_for({sandbox}) do
+      __MODULE__ -> :ok
+      _elsewhere -> request_on(__MODULE__, :workspace, {:hand_off, sandbox})
+    end
+  end
+
+  defp hand_off_here(_sandbox), do: :ok
 
   defp other_clients do
     case Keyword.get(config(), :clients) do
